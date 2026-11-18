@@ -123,6 +123,7 @@ def main():
     publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
     gate = RelayGate(_monotonic())
     pending = b""
+    motion_acknowledged = False
     sys.stdout.write("READY\n")
     sys.stdout.flush()
     try:
@@ -149,6 +150,10 @@ def main():
             message.linear.x = linear
             message.angular.z = angular
             publisher.publish(message)
+            if not motion_acknowledged and (linear or angular) and publisher.get_num_connections() > 0:
+                sys.stdout.write("MOTION_ACK {}\n".format(gate.last_sequence))  # noqa: UP032 - Python 2
+                sys.stdout.flush()
+                motion_acknowledged = True
             if gate.stopped:
                 break
     finally:

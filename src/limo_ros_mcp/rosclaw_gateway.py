@@ -107,6 +107,10 @@ class RosclawGateway:
         result = self._result(await self._runtime().get_action_status(action_id))
         return self._result(_public_control_result(result))
 
+    async def cancel_action(self, action_id: str) -> dict[str, Any]:
+        result = self._result(await self._runtime().cancel_action(action_id))
+        return self._result(_public_control_result(result))
+
     async def execution_receipt(self, action_id: str) -> dict[str, Any]:
         result = self._result(
             await asyncio.to_thread(self._daemon().get_execution_receipt, action_id)

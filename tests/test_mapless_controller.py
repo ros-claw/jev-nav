@@ -16,11 +16,14 @@ def sensors(stamp):
         "front": 3.0,
         "left": 2.0,
         "right": 2.0,
+        "rear": 2.0,
         "depth_min": 1.0,
         "depth_valid_ratio": 0.2,
         "error_code": 0,
         "motion_mode": 0,
         "battery_voltage": 12.0,
+        "linear_x_mps": 0.0,
+        "angular_z_radps": 0.0,
     }
 
 
@@ -52,3 +55,60 @@ def test_expired_or_replayed_decision_does_not_replace_newer_decision():
     assert not controller.set_decision("left", observed_at=10.0, now=10.2)
     assert not controller.set_decision("left", observed_at=10.2, now=19.0)
     assert controller.tick(sensors(19.0), now=19.0) == (0.0, 0.0)
+
+
+def test_direction_reversal_checks_the_previous_turn_direction():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("left", observed_at=10.0, now=10.0)
+    for now in (10.2, 10.4, 10.6):
+        linear, angular = controller.tick(sensors(now), now=now)
+    assert linear > 0 and angular > 0
+    assert controller.set_decision("right", observed_at=10.61, now=10.61)
+    observation = sensors(10.65)
+    observation["left"] = 0.2
+    observation["angular_z_radps"] = angular
+    assert controller.tick(observation, now=10.65) == (0.0, 0.0)
+
+
+def test_front_obstacle_does_not_keep_forward_command_during_a_turn():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    assert controller.tick(sensors(10.2), now=10.2)[0] > 0
+    assert controller.set_decision("left", observed_at=10.21, now=10.21)
+    observation = sensors(10.25)
+    observation["front"] = 0.3
+    observation["linear_x_mps"] = 0.06
+    assert controller.tick(observation, now=10.25) == (0.0, 0.0)
+
+
+def test_turn_requires_clearance_behind_the_body():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("left", observed_at=10.0, now=10.0)
+    observation = sensors(10.2)
+    observation["rear"] = 0.2
+    assert controller.tick(observation, now=10.2) == (0.0, 0.0)
+
+
+def test_forward_requires_clearance_at_the_front_corners():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    observation = sensors(10.2)
+    observation["left"] = 0.2
+    assert controller.tick(observation, now=10.2) == (0.0, 0.0)
+
+
+def test_turn_does_not_sweep_through_a_close_front_obstacle():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("left", observed_at=10.0, now=10.0)
+    observation = sensors(10.2)
+    observation["front"] = 0.18
+    assert controller.tick(observation, now=10.2) == (0.0, 0.0)
+
+
+def test_unexpected_measured_speed_stops_the_controller():
+    for key, value in (("linear_x_mps", 0.5), ("angular_z_radps", 1.0)):
+        controller = module.MaplessController(started_at=10.0, deadline=30.0)
+        assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+        observation = sensors(10.2)
+        observation[key] = value
+        assert controller.tick(observation, now=10.2) == (0.0, 0.0)

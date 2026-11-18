@@ -75,20 +75,25 @@ class MaplessController(object):  # noqa: UP004 - Python 2 ROS worker
         if direction == "stop":
             self.linear, self.angular = 0.0, 0.0
             return self.linear, self.angular
+        front_blocked = front <= 0.6 or depth <= 0.4
+        if front_blocked:
+            self.linear, self.angular = 0.0, 0.0
+            return self.linear, self.angular
         if direction == "forward":
-            if front <= 0.6 or depth <= 0.4:
-                self.linear, self.angular = 0.0, 0.0
-                return self.linear, self.angular
             target_linear, target_angular = 0.1, 0.0
         else:
-            side = observation[direction]
-            if not _finite(side) or side <= 0.5:
+            target_linear = 0.07
+            target_angular = 0.25 if direction == "left" else -0.25
+        next_linear = _approach(self.linear, target_linear, 0.3 * dt)
+        next_angular = _approach(self.angular, target_angular, 0.8 * dt)
+        angular_motion = (self.angular, next_angular, observation["angular_z_radps"])
+        turning = any(abs(v) > 1e-6 for v in angular_motion)
+        for side in ("left", "right", "rear"):
+            required = turning or (side != "rear" and next_linear > 0)
+            if required and (not _finite(observation.get(side)) or observation[side] <= 0.5):
                 self.linear, self.angular = 0.0, 0.0
                 return self.linear, self.angular
-            target_linear = 0.07 if front > 0.6 and depth > 0.4 else 0.0
-            target_angular = 0.25 if direction == "left" else -0.25
-        self.linear = _approach(self.linear, target_linear, 0.3 * dt)
-        self.angular = _approach(self.angular, target_angular, 0.8 * dt)
+        self.linear, self.angular = next_linear, next_angular
         return self.linear, self.angular
 
     @staticmethod
@@ -104,7 +109,14 @@ class MaplessController(object):  # noqa: UP004 - Python 2 ROS worker
             stamp = observation.get(key)
             if not _finite(stamp) or not 0 <= now - stamp <= limit:
                 return False
-        for key in ("front", "depth_min", "depth_valid_ratio", "battery_voltage"):
+        for key in (
+            "front",
+            "depth_min",
+            "depth_valid_ratio",
+            "battery_voltage",
+            "linear_x_mps",
+            "angular_z_radps",
+        ):
             if not _finite(observation.get(key)):
                 return False
         return (
@@ -116,4 +128,6 @@ class MaplessController(object):  # noqa: UP004 - Python 2 ROS worker
             and type(observation.get("motion_mode")) is int
             and observation["motion_mode"] == 0
             and observation["battery_voltage"] >= 10
+            and abs(observation["linear_x_mps"]) <= 0.2
+            and abs(observation["angular_z_radps"]) <= 0.6
         )

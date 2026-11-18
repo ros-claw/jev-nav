@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -56,6 +57,7 @@ class Twist(object):
         self.angular = type("Vector", (), {"z": 0.0})()
 class Publisher(object):
     def __init__(self, *args, **kwargs): pass
+    def get_num_connections(self): return 1
     def publish(self, message):
         with open(sys.argv[2], "a") as output:
             output.write(json.dumps([message.linear.x, message.angular.z]) + "\\n")
@@ -81,6 +83,8 @@ sys.exit(m.main())
         assert process.stdout.readline() == b"READY\n"
         process.stdin.write((json.dumps(frame(1, time.monotonic())) + "\n").encode())
         process.stdin.flush()
+        assert select.select([process.stdout], [], [], 2.0)[0]
+        assert process.stdout.readline() == b"MOTION_ACK 1\n"
         time.sleep(0.08)
         process.stdin.close()
         assert process.wait(timeout=4) == 0

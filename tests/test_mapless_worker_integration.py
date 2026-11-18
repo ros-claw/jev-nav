@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -22,14 +23,19 @@ def load(name):
     return module
 
 
-@pytest.mark.parametrize("matching_depth", [True, False])
-def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matching_depth):
+@pytest.mark.parametrize(
+    "matching_depth,decisions_continue", [(True, True), (False, True), (True, False)]
+)
+def test_continuous_worker_wiring_with_synthetic_ros(
+    monkeypatch, tmp_path, matching_depth, decisions_continue
+):
     worker = load("limo_mapless_worker")
     controller = load("limo_mapless_controller")
     relay_module = load("limo_mapless_relay")
     clock = [100.0]
     subscriptions = []
     frames = []
+    decision_calls = []
 
     def stamp():
         captured = clock[0]
@@ -42,9 +48,9 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
         if name == "scan":
             return SimpleNamespace(
                 header=header("laser"),
-                ranges=[3.0, 3.0, 3.0],
-                angle_min=-1.0,
-                angle_increment=1.0,
+                ranges=[3.0] * 360,
+                angle_min=-math.pi,
+                angle_increment=math.pi / 180,
                 range_min=0.1,
                 range_max=12.0,
             )
@@ -89,7 +95,14 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
             self.process = process
 
         def write(self, data):
-            frames.append(json.loads(data))
+            frame = json.loads(data)
+            frames.append(frame)
+            if (frame["linear"] or frame["angular"]) and not self.process.acknowledged:
+                self.process.acknowledged = True
+                position = self.process.stdout.tell()
+                self.process.stdout.seek(0, io.SEEK_END)
+                self.process.stdout.write(("MOTION_ACK {}\n".format(frame["sequence"])).encode())
+                self.process.stdout.seek(position)
 
         def flush(self):
             pass
@@ -100,6 +113,7 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
     class RelayProcess:
         def __init__(self):
             self.finished = False
+            self.acknowledged = False
             self.stdin = RelayInput(self)
             self.stdout = io.BytesIO(b"READY\n")
 
@@ -135,6 +149,9 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
 
         def start(self):
             self.target(*self.args)
+
+        def join(self, timeout=None):
+            pass
 
     def fake_module(name, **attrs):
         result = ModuleType(name)
@@ -197,18 +214,45 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
         worker, "pwd", SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_uid=999))
     )
     monkeypatch.setattr(
-        worker, "select", SimpleNamespace(select=lambda readers, *_: (readers, [], []))
+        worker,
+        "select",
+        SimpleNamespace(
+            select=lambda readers, *_: (
+                [reader for reader in readers if reader.tell() < len(reader.getvalue())],
+                [],
+                [],
+            )
+        ),
     )
     monkeypatch.setattr(worker, "subprocess", SimpleNamespace(Popen=popen, PIPE=-1))
+
+    def decision_response(command, evidence, **kwargs):
+        decision_calls.append(evidence)
+        if not decisions_continue and len(decision_calls) > 1:
+            return {"ok": False}
+        return json.loads(DecisionProcess().communicate(json.dumps(evidence).encode())[0])
+
+    monkeypatch.setattr(worker, "run_decision_process", decision_response)
     monkeypatch.setattr(
-        worker, "threading", SimpleNamespace(Lock=threading.Lock, Thread=InlineThread)
+        worker,
+        "threading",
+        SimpleNamespace(Lock=threading.Lock, Event=threading.Event, Thread=InlineThread),
     )
     monkeypatch.setattr(worker, "time", SimpleNamespace(sleep=sleep))
 
-    result = worker.execute({"duration_sec": 1.0, "action_id": "test"})
+    result = worker.execute(
+        {
+            "duration_sec": 1.0 if decisions_continue else 10.0,
+            "action_id": "test",
+            "daemon_pid": 123,
+        }
+    )
     assert any(frame["linear"] > 0 for frame in frames) is matching_depth
-    assert result["ok"] is matching_depth
+    assert result["ok"] is (matching_depth and decisions_continue)
+    assert result["relay_acknowledged"] is matching_depth
     assert result["physical_stop_verified"] is False
     assert result["stopped_odometry"]["samples"] >= 3
     if not matching_depth:
         assert result["reason"] == "no_compatible_observation"
+    elif not decisions_continue:
+        assert result["reason"] == "model_decision_expired"

@@ -16,15 +16,17 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 try:
     STRING_TYPES = (basestring,)  # noqa: F821
-    NUMBER_TYPES = (int, long, float)  # noqa: F821
+    INTEGER_TYPES = (int, long)  # noqa: F821
 except NameError:
     STRING_TYPES = (str,)
-    NUMBER_TYPES = (int, float)
+    INTEGER_TYPES = (int,)
+NUMBER_TYPES = INTEGER_TYPES + (float,)
 
 PROTOCOL = "rosclaw.limo.worker.v1"
 _cancel = False
@@ -49,6 +51,7 @@ def validate_request(value):
             "body_id",
             "body_snapshot_hash",
             "duration_sec",
+            "daemon_pid",
         ]
     )
     if not isinstance(value, dict) or set(value) != fields:
@@ -65,6 +68,9 @@ def validate_request(value):
         or not re.match(r"^[0-9a-f]{64}\Z", value["body_snapshot_hash"])
         or not _finite(duration)
         or not 1 <= duration <= 30
+        or isinstance(value["daemon_pid"], bool)
+        or not isinstance(value["daemon_pid"], INTEGER_TYPES)
+        or value["daemon_pid"] <= 1
     ):
         raise ValueError("invalid exploration request")
     return dict(value)
@@ -85,6 +91,34 @@ def depth_metadata_matches(image, info):
         return False
 
 
+def summarize_depth(array, encoding):
+    import numpy as np
+
+    if len(array.shape) != 2 or not array.size:
+        raise ValueError("invalid depth image")
+    region = array.astype("float32")
+    if encoding == "16UC1":
+        region = region * 0.001
+    elif encoding != "32FC1":
+        raise ValueError("unsupported depth encoding")
+    valid = np.isfinite(region) & (region > 0.05) & (region <= 20.0)
+    ratio = float(np.count_nonzero(valid)) / float(region.size)
+    minimum = float(np.min(region[valid])) if np.any(valid) else None
+    return minimum, ratio
+
+
+def sensor_stamps_current(stamps, ros_now):
+    limits = {"scan": 0.5, "odom": 0.5, "status": 1.2, "depth": 0.8, "color": 0.8}
+    if not isinstance(stamps, dict) or not _finite(ros_now):
+        return False
+    for name, max_age in limits.items():
+        stamp = stamps.get(name)
+        if not _finite(stamp) or not -0.1 <= ros_now - stamp <= max_age:
+            return False
+    values = [stamps[name] for name in limits]
+    return max(values) - min(values) <= 0.75
+
+
 class StoppedOdomVerifier(object):  # noqa: UP004 - Python 2 ROS worker
     """Require repeated new low-speed odometry after the stop request."""
 
@@ -94,6 +128,8 @@ class StoppedOdomVerifier(object):  # noqa: UP004 - Python 2 ROS worker
         self.last_at = stop_requested_at
         self.last_source = stop_requested_ros
         self.samples = 0
+        self.first_at = None
+        self.first_source = None
         self.linear = None
         self.angular = None
 
@@ -101,7 +137,7 @@ class StoppedOdomVerifier(object):  # noqa: UP004 - Python 2 ROS worker
         if not all(
             _finite(value) for value in (x, y, angular, observed_at, now, source_stamp, source_now)
         ):
-            self.samples = 0
+            self.invalidate()
             return False
         if (
             observed_at == self.last_at
@@ -116,17 +152,28 @@ class StoppedOdomVerifier(object):  # noqa: UP004 - Python 2 ROS worker
             or not 0 <= now - observed_at <= 0.3
             or not 0 <= source_now - source_stamp <= 0.3
         ):
-            self.samples = 0
+            self.invalidate()
             return False
+        if self.samples and (observed_at - self.last_at > 0.3 or source_stamp - self.last_source > 0.3):
+            self.invalidate()
         self.last_at = observed_at
         self.last_source = source_stamp
         self.linear = math.hypot(x, y)
         self.angular = abs(angular)
         if self.linear > 0.01 or self.angular > 0.03:
-            self.samples = 0
+            self.invalidate()
             return False
+        if self.samples == 0:
+            self.first_at = observed_at
+            self.first_source = source_stamp
         self.samples += 1
-        return self.samples >= 3
+        return (self.samples >= 3 and observed_at - self.first_at >= 0.2 - 1e-9
+                and source_stamp - self.first_source >= 0.2 - 1e-9)
+
+    def invalidate(self):
+        self.samples = 0
+        self.first_at = None
+        self.first_source = None
 
 
 def summarize_scan(ranges, angle_min, angle_increment, range_min, range_max, tx, ty, yaw):
@@ -140,22 +187,39 @@ def summarize_scan(ranges, angle_min, angle_increment, range_min, range_max, tx,
         or not 1 <= len(ranges) <= 10000
     ):
         raise ValueError("invalid laser ranges")
-    sectors = {"front": [], "left": [], "right": []}
+    sectors = {"front": [], "left": [], "right": [], "rear": []}
+    coverage = {name: [[0, 0] for _ in range(4)] for name in sectors}
+
+    def sector_and_bin(angle):
+        angle = math.atan2(math.sin(angle), math.cos(angle))
+        if -0.55 <= angle <= 0.55:
+            name, offset, width = "front", angle + 0.55, 1.1
+        elif 0.55 < angle <= 2.1:
+            name, offset, width = "left", angle - 0.55, 1.55
+        elif -2.1 <= angle < -0.55:
+            name, offset, width = "right", angle + 2.1, 1.55
+        else:
+            name, offset, width = "rear", (angle if angle > 0 else angle + 2 * math.pi) - 2.1, 2 * math.pi - 4.2
+        return name, min(3, max(0, int(4 * offset / width)))
+
     for index, distance in enumerate(ranges):
+        angle = angle_min + index * angle_increment + yaw
+        ray_sector, ray_bin = sector_and_bin(angle)
+        coverage[ray_sector][ray_bin][0] += 1
         if not _finite(distance) or not range_min <= distance <= range_max:
             continue
-        angle = angle_min + index * angle_increment + yaw
+        coverage[ray_sector][ray_bin][1] += 1
         x = tx + distance * math.cos(angle)
         y = ty + distance * math.sin(angle)
         bearing = math.atan2(y, x)
         measured = math.hypot(x, y)
-        if -0.55 <= bearing <= 0.55:
-            sectors["front"].append(measured)
-        elif 0.55 < bearing <= 2.1:
-            sectors["left"].append(measured)
-        elif -2.1 <= bearing < -0.55:
-            sectors["right"].append(measured)
-    return {name: min(values) if values else None for name, values in sectors.items()}
+        endpoint_sector, _ = sector_and_bin(bearing)
+        sectors[endpoint_sector].append(measured)
+    return {
+        name: min(values) if values and all(total >= 2 and valid * 2 >= total
+                                             for total, valid in coverage[name]) else None
+        for name, values in sectors.items()
+    }
 
 
 def motion_delta(initial, current):
@@ -165,6 +229,64 @@ def motion_delta(initial, current):
     yaw_difference = current[2] - initial[2]
     rotation = abs(math.atan2(math.sin(yaw_difference), math.cos(yaw_difference)))
     return translation, rotation
+
+
+class MotionEvidence(object):  # noqa: UP004 - Python 2 ROS worker
+    def __init__(self):
+        self.baseline = None
+        self.max_translation = 0.0
+        self.max_rotation = 0.0
+
+    def acknowledge(self, pose):
+        motion_delta(pose, pose)
+        if self.baseline is None:
+            self.baseline = pose
+
+    def observe(self, pose):
+        if self.baseline is not None:
+            translation, rotation = motion_delta(self.baseline, pose)
+            self.max_translation = max(self.max_translation, translation)
+            self.max_rotation = max(self.max_rotation, rotation)
+
+
+def decision_pose_current(observed_pose, current_pose):
+    try:
+        translation, rotation = motion_delta(observed_pose, current_pose)
+        return translation <= 0.15 and rotation <= 0.35
+    except (ValueError, TypeError):
+        return False
+
+
+def run_decision_process(command, evidence, cancelled, clock, timeout=6.0):
+    """Bound helper wall time and reap it on shutdown or timeout."""
+    payload = json.dumps(evidence, allow_nan=False).encode("utf-8")
+    if len(payload) > 3 * 1024 * 1024 or cancelled():
+        return None
+    with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as sink, open(os.devnull, "w") as errors:
+        source.write(payload)
+        source.seek(0)
+        process = subprocess.Popen(
+            command, stdin=source, stdout=sink, stderr=errors, close_fds=True
+        )
+        deadline = clock() + timeout
+        while process.poll() is None and not cancelled() and clock() < deadline:
+            time.sleep(0.05)
+        if process.poll() is None:
+            process.terminate()
+            grace = clock() + 0.3
+            while process.poll() is None and clock() < grace:
+                time.sleep(0.05)
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            return None
+        if cancelled() or clock() >= deadline or process.returncode != 0:
+            return None
+        sink.seek(0)
+        output = sink.read(65537)
+        if len(output) > 65536:
+            return None
+        return json.loads(output)
 
 
 def _metadata(message):
@@ -182,13 +304,14 @@ def _signal_cancel(_signum, _frame):
 
 
 def execute(request):
+    if os.getppid() != request["daemon_pid"]:
+        raise ValueError("daemon parent is no longer present")
     import cv2
-    import numpy as np
     import rospy
     import tf
     from cv_bridge import CvBridge
     from limo_base.msg import LimoStatus
-    from limo_mapless_controller import MaplessController
+    from limo_mapless_controller import DECISION_TTL, MaplessController
     from limo_mapless_relay import _monotonic
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import CameraInfo, Image, LaserScan
@@ -204,7 +327,9 @@ def execute(request):
     lock = threading.Lock()
     controller_lock = threading.Lock()
     records = {}
-    decision = {"running": False, "count": 0}
+    decision = {"running": False, "count": 0, "pose": None, "expired": False}
+    decision_shutdown = threading.Event()
+    decision_thread = None
 
     def callback(message, name):
         with lock:
@@ -228,8 +353,10 @@ def execute(request):
     ]
     started = _monotonic()
     controller = MaplessController(started, started + request["duration_sec"])
-    parent_pid = os.getppid()
+    parent_pid = request["daemon_pid"]
     directory = os.path.dirname(os.path.abspath(__file__))
+    if os.getppid() != parent_pid:
+        raise ValueError("daemon parent is no longer present")
     relay = subprocess.Popen(
         [sys.executable, os.path.join(directory, "limo_mapless_relay.py")],
         stdin=subprocess.PIPE,
@@ -238,12 +365,12 @@ def execute(request):
         close_fds=True,
     )
     commanded = False
+    relay_acknowledged = False
+    acknowledged_at = None
     saw_observation = False
     reason = "duration_elapsed"
     stopped_odometry = None
-    start_pose = None
-    max_translation = 0.0
-    max_rotation = 0.0
+    movement = MotionEvidence()
 
     def snapshot():
         with lock:
@@ -266,10 +393,16 @@ def execute(request):
         ):
             return None
         ros_now = rospy.Time.now().to_sec()
-        for message in (scan, odom, status, depth, color):
-            age = ros_now - message.header.stamp.to_sec()
-            if not -0.2 <= age <= 1.5:
-                return None
+        mono_now = _monotonic()
+        source_stamps = {name: message.header.stamp.to_sec() for name, message in
+                         (("scan", scan), ("odom", odom), ("status", status), ("depth", depth), ("color", color))}
+        if not sensor_stamps_current(source_stamps, ros_now):
+            return None
+        scan_at = min(scan_at, mono_now - (ros_now - source_stamps["scan"]))
+        odom_at = min(odom_at, mono_now - (ros_now - source_stamps["odom"]))
+        status_at = min(status_at, mono_now - (ros_now - source_stamps["status"]))
+        depth_at = min(depth_at, mono_now - (ros_now - source_stamps["depth"]))
+        color_at = min(color_at, mono_now - (ros_now - source_stamps["color"]))
         try:
             trans, rot = listener.lookupTransform(
                 "base_link", scan.header.frame_id, scan.header.stamp
@@ -288,15 +421,7 @@ def execute(request):
                 yaw,
             )
             depth_array = bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
-            width = depth_array.shape[1]
-            region = depth_array[:, width // 3 : 2 * width // 3].astype("float32")
-            if depth.encoding == "16UC1":
-                region = region * 0.001
-            elif depth.encoding != "32FC1":
-                return None
-            valid = np.isfinite(region) & (region > 0.05) & (region <= 20.0)
-            ratio = float(np.count_nonzero(valid)) / float(region.size)
-            minimum = float(np.min(region[valid])) if np.any(valid) else None
+            minimum, ratio = summarize_depth(depth_array, depth.encoding)
             pose = odom.pose.pose
             orientation = pose.orientation
             odom_yaw = tf.transformations.euler_from_quaternion(
@@ -310,6 +435,7 @@ def execute(request):
                 "front": sectors["front"],
                 "left": sectors["left"],
                 "right": sectors["right"],
+                "rear": sectors["rear"],
                 "depth_min": minimum,
                 "depth_valid_ratio": ratio,
                 "error_code": int(status.error_code),
@@ -341,6 +467,7 @@ def execute(request):
                     "front_min_m": sample["front"],
                     "left_min_m": sample["left"],
                     "right_min_m": sample["right"],
+                    "rear_min_m": sample["rear"],
                 },
                 "base": {
                     "linear_x_mps": sample["linear_x_mps"],
@@ -348,21 +475,38 @@ def execute(request):
                     "battery_voltage": sample["battery_voltage"],
                 },
             }
-            process = subprocess.Popen(
+            response = run_decision_process(
                 ["/usr/bin/python3", os.path.join(directory, "limo_mapless_decision.py")],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
+                evidence,
+                cancelled=lambda: _cancel or decision_shutdown.is_set(),
+                clock=_monotonic,
             )
-            output, _ = process.communicate(json.dumps(evidence, allow_nan=False).encode("utf-8"))
-            response = json.loads(output)
-            if process.returncode == 0 and response.get("ok") is True:
+            if (isinstance(response, dict) and not decision_shutdown.is_set()
+                    and response.get("ok") is True and response.get("captured_at") == captured):
+                with lock:
+                    latest = records.get("odom")
+                if latest is None:
+                    return
+                latest_odom, latest_at = latest
+                now = _monotonic()
+                ros_now = rospy.Time.now().to_sec()
+                if (not 0 <= now - latest_at <= 0.5
+                        or not 0 <= ros_now - latest_odom.header.stamp.to_sec() <= 0.5
+                        or latest_odom.header.frame_id.lstrip("/") != "odom"
+                        or latest_odom.child_frame_id.lstrip("/") != "base_link"):
+                    return
+                pose = latest_odom.pose.pose
+                q = pose.orientation
+                yaw = tf.transformations.euler_from_quaternion((q.x, q.y, q.z, q.w))[2]
+                current_pose = (float(pose.position.x), float(pose.position.y), yaw)
+                if not decision_pose_current(sample["pose"], current_pose):
+                    return
                 with controller_lock:
                     if controller.set_decision(
                         response.get("choice"), response.get("captured_at"), _monotonic()
                     ):
                         decision["count"] += 1
+                        decision["pose"] = sample["pose"]
         except Exception:  # noqa: BLE001 - network/model errors leave the old decision to expire
             pass
         finally:
@@ -384,18 +528,33 @@ def execute(request):
             now = _monotonic()
             if sample is not None:
                 saw_observation = True
-                if start_pose is None:
-                    start_pose = sample["pose"]
-                translation, rotation = motion_delta(start_pose, sample["pose"])
-                max_translation = max(max_translation, translation)
-                max_rotation = max(max_rotation, rotation)
+                if relay_acknowledged and movement.baseline is None:
+                    if sample["odom_at"] > acknowledged_at:
+                        movement.acknowledge(sample["pose"])
+                else:
+                    movement.observe(sample["pose"])
             with controller_lock:
-                linear, angular = controller.tick(sample, now)
-            if linear or angular:
-                commanded = True
+                if decision["count"] and now >= controller.observed_at + DECISION_TTL:
+                    decision["expired"] = True
+                current_sample = sample
+                if sample is not None and decision["pose"] is not None and not decision_pose_current(decision["pose"], sample["pose"]):
+                    current_sample = None
+                linear, angular = controller.tick(current_sample, now)
             frame = {"sequence": sequence, "stamp": now, "linear": linear, "angular": angular}
             relay.stdin.write((json.dumps(frame, allow_nan=False) + "\n").encode("utf-8"))
             relay.stdin.flush()
+            if linear or angular:
+                commanded = True
+            if not relay_acknowledged:
+                readable, _, _ = select.select([relay.stdout], [], [], 0.0)
+                if readable:
+                    acknowledgement = relay.stdout.readline().strip()
+                    match = re.match(br"^MOTION_ACK ([0-9]+)$", acknowledgement)
+                    if not match or int(match.group(1)) > sequence or not commanded:
+                        reason = "invalid_relay_acknowledgement"
+                        break
+                    relay_acknowledged = True
+                    acknowledged_at = _monotonic()
             sequence += 1
             if sample is not None and now >= next_query:
                 with lock:
@@ -403,14 +562,17 @@ def execute(request):
                     if launch:
                         decision["running"] = True
                 if launch:
-                    thread = threading.Thread(target=query_model, args=(sample,))
-                    thread.daemon = True
-                    thread.start()
+                    decision_thread = threading.Thread(target=query_model, args=(sample,))
+                    decision_thread.daemon = True
+                    decision_thread.start()
                     next_query = now + 1.0
             time.sleep(0.05)
         if _cancel:
             reason = "cancelled"
+        elif rospy.is_shutdown():
+            reason = "ros_shutdown"
     finally:
+        decision_shutdown.set()
         stop_requested_at = _monotonic()
         stop_requested_ros = rospy.Time.now().to_sec()
         try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
@@ -428,6 +590,8 @@ def execute(request):
         if relay.poll() is None:
             relay.kill()
         relay.wait()
+        if decision_thread is not None:
+            decision_thread.join(1.0)
         verifier = StoppedOdomVerifier(stop_requested_at, stop_requested_ros)
         feedback_deadline = _monotonic() + 2.0
         while _monotonic() < feedback_deadline:
@@ -435,6 +599,10 @@ def execute(request):
                 latest_odom = records.get("odom")
             if latest_odom is not None:
                 odom, observed_at = latest_odom
+                if odom.header.frame_id.lstrip("/") != "odom" or odom.child_frame_id.lstrip("/") != "base_link":
+                    verifier.invalidate()
+                    time.sleep(0.05)
+                    continue
                 twist = odom.twist.twist
                 if verifier.observe(
                     twist.linear.x,
@@ -460,21 +628,28 @@ def execute(request):
             reason = "no_compatible_observation"
         elif not decision["count"]:
             reason = "no_fresh_model_decision"
+        elif decision["expired"]:
+            reason = "model_decision_expired"
         elif not commanded:
             reason = "no_motion_commanded"
+        elif not relay_acknowledged:
+            reason = "no_relay_acknowledgement"
         elif not stopped_odometry:
             reason = "stopped_odometry_unverified"
-        elif max_translation < 0.01 and max_rotation < 0.03:
+        elif movement.max_translation < 0.01 and movement.max_rotation < 0.03:
             reason = "odometry_motion_not_observed"
+    if _cancel:
+        reason = "cancelled"
 
     # Requesting zero is not evidence that the physical base stopped.
     return {
         "ok": bool(
             reason == "duration_elapsed"
             and commanded
+            and relay_acknowledged
             and decision["count"]
             and stopped_odometry
-            and (max_translation >= 0.01 or max_rotation >= 0.03)
+            and (movement.max_translation >= 0.01 or movement.max_rotation >= 0.03)
         ),
         "protocol": PROTOCOL,
         "operation": "MAPLESS_EXPLORE",
@@ -482,10 +657,11 @@ def execute(request):
         "reason": reason,
         "decisions_accepted": decision["count"],
         "motion_commanded": commanded,
+        "relay_acknowledged": relay_acknowledged,
         "stopped_odometry": stopped_odometry,
         "motion_evidence": {
-            "odom_translation_m": max_translation,
-            "odom_rotation_rad": max_rotation,
+            "odom_translation_m": movement.max_translation,
+            "odom_rotation_rad": movement.max_rotation,
             "physical_motion_independently_observed": False,
         },
         "physical_stop_verified": False,

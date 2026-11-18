@@ -6,6 +6,9 @@ from limo_ros_mcp.rosclaw_gateway import RosclawGateway
 
 
 class _Runtime:
+    async def cancel_action(self, action_id: str):
+        return {"action_id": action_id, "cancelled": False, "state": "RUNNING"}
+
     async def get_action_status(self, action_id: str):
         return {
             "action_id": action_id,
@@ -31,6 +34,12 @@ class _Daemon:
                 }
             },
         }
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_forwarded_to_the_daemon_runtime() -> None:
+    result = await RosclawGateway(runtime_client=_Runtime()).cancel_action("action-1")
+    assert result == {"action_id": "action-1", "cancelled": False, "state": "RUNNING"}
 
 
 @pytest.mark.asyncio

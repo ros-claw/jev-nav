@@ -8,6 +8,8 @@ The current real-robot interface verification and patrol preflight findings are 
 [`docs/ROS_INSPECTION_READINESS.md`](docs/ROS_INSPECTION_READINESS.md).
 The USB, audio, display, touchscreen, camera-health, and Jetson evidence contract is documented in
 [`docs/PERIPHERAL_INSPECTION.md`](docs/PERIPHERAL_INSPECTION.md).
+The unverified mapless exploration candidate and its outstanding work are documented in
+[`docs/MAPLESS_EXPLORATION_CANDIDATE.md`](docs/MAPLESS_EXPLORATION_CANDIDATE.md).
 
 [中文说明](README.zh.md)
 
