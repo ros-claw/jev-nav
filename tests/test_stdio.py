@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -16,6 +17,9 @@ from mcp.client.stdio import stdio_client
 async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
     env = os.environ.copy()
     env["ROSCLAW_PROJECT_ROOT"] = os.getcwd()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[1] / "src"), env.get("PYTHONPATH", "")]
+    )
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "limo_ros_mcp.server"],
@@ -28,7 +32,12 @@ async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
                 await session.initialize()
                 listed = await session.list_tools()
                 names = {tool.name for tool in listed.tools}
-                assert len(names) == 35
+                assert len(names) == 40
+                assert "limo_capture_planar_scan" in names
+                assert "limo_capture_calibration_diagnostic" in names
+                assert "limo_get_dabai_camera_parameters" in names
+                assert "limo_get_depth_summary" in names
+                assert "limo_capture_local_observation" in names
                 assert "limo_get_context" in names
                 assert "limo_get_readiness" in names
                 assert "limo_observe" in names
@@ -58,6 +67,9 @@ async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
 async def test_limo_mcp_stdio_explicit_core_profile_remains_bounded() -> None:
     env = os.environ.copy()
     env["ROSCLAW_PROJECT_ROOT"] = os.getcwd()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[1] / "src"), env.get("PYTHONPATH", "")]
+    )
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "limo_ros_mcp.server", "--profile", "core"],

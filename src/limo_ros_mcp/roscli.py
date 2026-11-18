@@ -21,6 +21,10 @@ import yaml
 
 _READINESS_WORKER_PROTOCOL = "rosclaw.limo.readiness-worker.v1"
 _CAMERA_WORKER_PROTOCOL = "rosclaw.limo.camera-capture-worker.v1"
+_DEPTH_WORKER_PROTOCOL = "rosclaw.limo.depth-summary-worker.v1"
+_LOCAL_OBSERVATION_PROTOCOL = "rosclaw.limo.local-observation.v1"
+_CALIBRATION_DIAGNOSTIC_PROTOCOL = "rosclaw.limo.calibration-diagnostic.v1"
+_PLANAR_SCAN_PROTOCOL = "rosclaw.limo.planar-scan-diagnostic.v1"
 _ROBOT_POSE_WORKER_PROTOCOL = "rosclaw.limo.robot-pose-worker.v1"
 _READINESS_WORKER_TOPICS = {
     ("/move_base/global_costmap/costmap", "nav_msgs/OccupancyGrid"): "global_costmap",
@@ -247,6 +251,204 @@ class RosCliReadOnlyClient:
 
     def subscribe_once(self, topic: str, message_type: str) -> dict[str, Any]:
         return self.subscribe_many(topic, message_type, count=1)[0]
+
+    def local_observation(self) -> dict[str, Any]:
+        """Read one bounded fixed-topic local geometry observation bundle."""
+        worker = Path(__file__).resolve().parent / "workers" / "limo_local_observation_worker.py"
+        if not self.python2 or not worker.is_file():
+            raise RuntimeError("bounded ROS local observation worker is unavailable")
+        request = {"protocol": _LOCAL_OBSERVATION_PROTOCOL, "timeout_sec": self.timeout_sec}
+        result = subprocess.run(
+            [self.python2, str(worker)],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=json.dumps(request),
+            timeout=self.timeout_sec + 3.0,
+            env=self._environment,
+        )
+        if len(result.stdout.encode("utf-8")) > 3_500_000:
+            raise RuntimeError("ROS local observation output exceeds size limit")
+        try:
+            response = json.loads(result.stdout)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("ROS local observation worker returned invalid JSON") from exc
+        if (
+            not isinstance(response, dict)
+            or response.get("protocol") != _LOCAL_OBSERVATION_PROTOCOL
+        ):
+            raise RuntimeError("ROS local observation worker protocol mismatch")
+        if result.returncode != 0 or response.get("ok") is not True:
+            error = response.get("error")
+            raise RuntimeError(
+                str(error)[:300] if isinstance(error, str) else "ROS local observation failed"
+            )
+        scan, depth = response.get("scan"), response.get("depth")
+        if (
+            response.get("calibration_verified") is not False
+            or response.get("usable_for_real_execution") is not False
+            or not isinstance(scan, dict)
+            or not isinstance(depth, dict)
+            or not isinstance(scan.get("ranges"), list)
+            or not 1 <= len(scan["ranges"]) <= 10000
+        ):
+            raise RuntimeError("invalid ROS local observation metadata")
+        try:
+            width, height, step = depth["width"], depth["height"], depth["step"]
+            if any(type(n) is not int for n in (width, height, step)):
+                raise ValueError("invalid dimensions")
+            bpp = {"16UC1": 2, "32FC1": 4}[depth["encoding"]]
+            if not (
+                1 <= width <= 1280
+                and 1 <= height <= 720
+                and width * bpp <= step
+                and step * height <= 2 * 1024 * 1024
+            ):
+                raise ValueError("invalid dimensions")
+            raw = base64.b64decode(depth["data_base64"], validate=True)
+            if len(raw) != step * height:
+                raise ValueError("invalid depth size")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise RuntimeError("invalid bounded depth observation") from exc
+        return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
+
+    def calibration_diagnostic(self) -> dict[str, Any]:
+        """Capture unverified fixed-topic calibration data, never execution evidence."""
+        worker = (
+            Path(__file__).resolve().parent / "workers" / "limo_calibration_diagnostic_worker.py"
+        )
+        if not self.python2 or not worker.is_file():
+            raise RuntimeError("bounded calibration diagnostic worker is unavailable")
+        request = {"protocol": _CALIBRATION_DIAGNOSTIC_PROTOCOL, "timeout_sec": self.timeout_sec}
+        result = subprocess.run(
+            [self.python2, str(worker)],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=json.dumps(request),
+            timeout=self.timeout_sec + 3.0,
+            env=self._environment,
+        )
+        if len(result.stdout.encode("utf-8")) > 3_500_000:
+            raise RuntimeError("calibration diagnostic output exceeds bound")
+        try:
+            response = json.loads(result.stdout)
+            if (
+                not isinstance(response, dict)
+                or response.get("protocol") != _CALIBRATION_DIAGNOSTIC_PROTOCOL
+            ):
+                raise ValueError("protocol mismatch")
+            if result.returncode != 0 or response.get("ok") is not True:
+                raise RuntimeError(
+                    str(response.get("error", "calibration capture unavailable"))[:300]
+                )
+            scan, depth, info, transform = (
+                response[key] for key in ("scan", "depth", "camera_info", "transform")
+            )
+            if (
+                response.get("diagnostic_only") is not True
+                or response.get("calibration_verified") is not False
+                or response.get("transform_verified") is not False
+                or response.get("usable_for_real_execution") is not False
+                or response.get("deskewed") is not False
+                or not all(isinstance(x, dict) for x in (scan, depth, info, transform))
+                or depth.get("frame_id") != "camera_color_optical_frame"
+                or transform.get("source") != scan.get("frame_id")
+                or transform.get("target") != depth.get("frame_id")
+                or not isinstance(scan.get("ranges"), list)
+                or not 1 <= len(scan["ranges"]) <= 10000
+            ):
+                raise ValueError("invalid diagnostic metadata")
+            width, height, step = (depth[key] for key in ("width", "height", "step"))
+            if any(type(value) is not int for value in (width, height, step)):
+                raise ValueError("invalid dimensions")
+            bpp = {"16UC1": 2, "32FC1": 4}[depth["encoding"]]
+            if not (
+                1 <= width <= 1280
+                and 1 <= height <= 720
+                and width * bpp <= step
+                and step * height <= 2 * 1024 * 1024
+                and type(depth["is_bigendian"]) is bool
+            ):
+                raise ValueError("invalid dimensions")
+            if len(base64.b64decode(depth["data_base64"], validate=True)) != step * height:
+                raise ValueError("invalid depth data")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid calibration diagnostic payload") from exc
+        return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
+
+    def planar_scan(self) -> dict[str, Any]:
+        """Capture a fixed LiDAR scan and base TF with no camera dependency."""
+        worker = Path(__file__).resolve().parent / "workers" / "limo_planar_scan_worker.py"
+        if not self.python2 or not worker.is_file():
+            raise RuntimeError("planar scan worker is unavailable")
+        result = subprocess.run(
+            [self.python2, str(worker)],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=json.dumps({"protocol": _PLANAR_SCAN_PROTOCOL, "timeout_sec": self.timeout_sec}),
+            timeout=self.timeout_sec + 3.0,
+            env=self._environment,
+        )
+        if len(result.stdout.encode("utf-8")) > 1_000_000:
+            raise RuntimeError("planar scan output exceeds bound")
+        try:
+            response = json.loads(result.stdout)
+            if not isinstance(response, dict) or response.get("protocol") != _PLANAR_SCAN_PROTOCOL:
+                raise ValueError("protocol mismatch")
+            if result.returncode != 0 or response.get("ok") is not True:
+                raise RuntimeError(str(response.get("error", "planar scan unavailable"))[:300])
+            scan = response["scan"]
+            transform = scan["transform"]
+            if (
+                response.get("diagnostic_only") is not True
+                or response.get("transform_verified") is not False
+                or response.get("usable_for_real_execution") is not False
+                or response.get("deskewed") is not False
+                or not isinstance(scan, dict)
+                or not isinstance(transform, dict)
+                or transform.get("source") != scan.get("frame_id")
+                or transform.get("target") != "base_link"
+                or not isinstance(scan.get("ranges"), list)
+                or not 1 <= len(scan["ranges"]) <= 10000
+            ):
+                raise ValueError("invalid planar scan metadata")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid planar scan diagnostic payload") from exc
+        return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
+
+    def depth_summary(self) -> dict[str, Any]:
+        """Read optical depth statistics from the fixed ROS depth topic."""
+        worker = Path(__file__).resolve().parent / "workers" / "limo_depth_summary_worker.py"
+        if not self.python2 or not worker.is_file():
+            raise RuntimeError("bounded ROS depth summary worker is unavailable")
+        request = {"protocol": _DEPTH_WORKER_PROTOCOL, "timeout_sec": self.timeout_sec}
+        result = subprocess.run(
+            [self.python2, str(worker)],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=json.dumps(request),
+            timeout=self.timeout_sec + 3.0,
+            env=self._environment,
+        )
+        if len(result.stdout.encode("utf-8")) > 65536:
+            raise RuntimeError("ROS depth worker output exceeds size limit")
+        try:
+            response = json.loads(result.stdout)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("ROS depth worker returned invalid JSON") from exc
+        if (
+            result.returncode != 0
+            or not isinstance(response, dict)
+            or response.get("protocol") != _DEPTH_WORKER_PROTOCOL
+            or response.get("ok") is not True
+            or response.get("topic") != "/camera/depth/image_raw"
+            or response.get("safety_clearance_verified") is not False
+        ):
+            raise RuntimeError("ROS depth worker failed")
+        return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
 
     def capture_camera_frame(
         self,

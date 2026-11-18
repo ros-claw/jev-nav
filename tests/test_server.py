@@ -165,6 +165,10 @@ async def test_server_exposes_no_raw_ros_publish_tool() -> None:
 
     assert names == {
         "limo_get_base_state",
+        "limo_get_depth_summary",
+        "limo_capture_local_observation",
+        "limo_capture_calibration_diagnostic",
+        "limo_capture_planar_scan",
         "limo_capture_camera_frame",
         "limo_get_camera_state",
         "limo_get_contract",
@@ -172,6 +176,7 @@ async def test_server_exposes_no_raw_ros_publish_tool() -> None:
         "limo_get_audio_state",
         "limo_get_action_status",
         "limo_get_dabai_device_state",
+        "limo_get_dabai_camera_parameters",
         "limo_get_diagnostics",
         "limo_get_display_state",
         "limo_get_execution_receipt",

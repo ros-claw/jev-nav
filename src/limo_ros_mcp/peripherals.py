@@ -646,6 +646,44 @@ class PeripheralInspector:
             "command_dispatched": False,
         }
 
+    def dabai_camera_parameters(self) -> dict[str, Any]:
+        """Read fixed SDK parameter arrays for diagnostics, never as calibration proof."""
+        result: dict[str, Any] = {
+            "ok": False,
+            "schema_version": "limo.dabai-camera-parameters.v1",
+            "command_dispatched": False,
+            "calibration_verified": False,
+            "usable_for_real_execution": False,
+        }
+        try:
+            code, stdout, _stderr = self._text_runner(
+                ["rosservice", "call", "/camera/get_camera_params"], 5.0
+            )
+            if code != 0 or len(stdout) > 16384:
+                raise ValueError("camera parameter service unavailable or output exceeds bound")
+            payload = yaml.safe_load(stdout)
+            if not isinstance(payload, dict) or payload.get("success") is not True:
+                raise ValueError("camera parameter service did not report success")
+            fields = {"l_intr_p": 4, "r_intr_p": 4, "r2l_r": 9, "r2l_t": 3, "l_k": 5, "r_k": 5}
+            arrays: dict[str, list[float]] = {}
+            for key, length in fields.items():
+                value = payload.get(key)
+                if (
+                    not isinstance(value, list)
+                    or len(value) != length
+                    or any(
+                        type(item) not in (int, float) or not math.isfinite(item) for item in value
+                    )
+                ):
+                    raise ValueError("camera parameter array is malformed or nonfinite")
+                arrays[key] = [float(item) for item in value]
+            result.update(ok=True, parameters=arrays, trust_level="LIVE_ROS_SERVICE_OBSERVATION")
+        except (OSError, subprocess.SubprocessError, yaml.YAMLError, ValueError, OverflowError):
+            result.update(
+                error="camera parameter service unavailable or invalid", trust_level="UNAVAILABLE"
+            )
+        return result
+
     def platform_health(self) -> dict[str, Any]:
         thermal_zones: list[dict[str, Any]] = []
         thermal_root = self.sys_root / "class" / "thermal"

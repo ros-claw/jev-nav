@@ -272,6 +272,106 @@ def test_readiness_worker_rejects_mismatched_response(monkeypatch: Any) -> None:
         )
 
 
+def test_local_observation_uses_fixed_bounded_worker(monkeypatch: Any) -> None:
+    calls = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        assert json.loads(kwargs["input"]) == {
+            "protocol": "rosclaw.limo.local-observation.v1",
+            "timeout_sec": 5.0,
+        }
+        response = {
+            "ok": True,
+            "protocol": "rosclaw.limo.local-observation.v1",
+            "calibration_verified": False,
+            "usable_for_real_execution": False,
+            "scan": {"frame_id": "laser", "ranges": [1.0, None]},
+            "depth": {
+                "width": 3,
+                "height": 2,
+                "step": 6,
+                "encoding": "16UC1",
+                "data_base64": base64.b64encode(bytes(12)).decode(),
+            },
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    client = RosCliReadOnlyClient({})
+    assert client.local_observation()["calibration_verified"] is False
+    assert calls[0][0][1].endswith("workers/limo_local_observation_worker.py")
+    assert calls[0][1]["timeout"] == 8.0
+
+
+def test_local_observation_rejects_false_clearance_claim(monkeypatch: Any) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda command, **kw: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "protocol": "rosclaw.limo.local-observation.v1",
+                    "calibration_verified": True,
+                }
+            ),
+            stderr="",
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        RosCliReadOnlyClient({}).local_observation()
+
+
+def test_depth_summary_uses_fixed_read_only_worker(monkeypatch: Any) -> None:
+    calls = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        request = json.loads(kwargs["input"])
+        assert request == {"protocol": "rosclaw.limo.depth-summary-worker.v1", "timeout_sec": 5.0}
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "protocol": request["protocol"],
+                    "topic": "/camera/depth/image_raw",
+                    "stamp_sec": 12.0,
+                    "safety_clearance_verified": False,
+                    "sectors": {},
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    client = RosCliReadOnlyClient({})
+    assert client.depth_summary()["safety_clearance_verified"] is False
+    assert calls[0][0][1].endswith("workers/limo_depth_summary_worker.py")
+
+
+def test_depth_summary_rejects_wrong_protocol(monkeypatch: Any) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda command, **kw: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps({"ok": True, "protocol": "wrong"}), stderr=""
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        RosCliReadOnlyClient({}).depth_summary()
+
+
 def test_roscli_camera_capture_uses_fixed_read_only_worker(monkeypatch: Any) -> None:
     calls: list[tuple[list[str], dict[str, Any]]] = []
     png = b"\x89PNG\r\n\x1a\nfixture"

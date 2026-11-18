@@ -981,6 +981,111 @@ class LimoMCPService:
     ) -> dict[str, Any]:
         return self.observe("laser_scan", endpoint, timeout_sec, transport, False)
 
+    def depth_summary(self, timeout_sec: float = 5.0) -> dict[str, Any]:
+        """Read depth in image sectors; this does not certify free space."""
+        timeout_sec = self._validate_timeout(timeout_sec)
+        try:
+            client = RosCliReadOnlyClient(
+                dict(LIMO_OBSERVATION_TOPICS.values()), timeout_sec=timeout_sec
+            )
+            result = client.depth_summary()
+        except Exception:
+            return {
+                "ok": False,
+                "error_code": "LIMO_DEPTH_SUMMARY_UNAVAILABLE",
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+            }
+        return {
+            "ok": True,
+            "schema_version": "limo.depth_summary.v1",
+            "trust_level": "LIVE_ROS_TOPIC_OBSERVATION",
+            "command_dispatched": False,
+            "usable_for_real_execution": False,
+            **result,
+        }
+
+    def local_observation(self, timeout_sec: float = 5.0) -> dict[str, Any]:
+        """Capture a bounded fixed-topic sensor bundle without certifying calibration."""
+        timeout_sec = self._validate_timeout(timeout_sec)
+        try:
+            client = RosCliReadOnlyClient(
+                dict(LIMO_OBSERVATION_TOPICS.values()), timeout_sec=timeout_sec
+            )
+            result = client.local_observation()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error_code": "LIMO_LOCAL_OBSERVATION_UNAVAILABLE",
+                "error": str(exc)[:300],
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+            }
+        return {
+            **result,
+            "ok": True,
+            "schema_version": "limo.local_observation.v1",
+            "trust_level": "LIVE_ROS_TOPIC_OBSERVATION",
+            "command_dispatched": False,
+            "calibration_verified": False,
+            "usable_for_real_execution": False,
+        }
+
+    def calibration_diagnostic(self, timeout_sec: float = 5.0) -> dict[str, Any]:
+        """Capture mismatched metadata for offline diagnostics, with no control use."""
+        timeout_sec = self._validate_timeout(timeout_sec)
+        try:
+            client = RosCliReadOnlyClient(
+                dict(LIMO_OBSERVATION_TOPICS.values()), timeout_sec=timeout_sec
+            )
+            result = client.calibration_diagnostic()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error_code": "LIMO_CALIBRATION_DIAGNOSTIC_UNAVAILABLE",
+                "error": str(exc)[:300],
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+                "diagnostic_only": True,
+            }
+        return {
+            **result,
+            "ok": True,
+            "schema_version": "limo.calibration_diagnostic.v1",
+            "trust_level": "UNVERIFIED_DIAGNOSTIC",
+            "command_dispatched": False,
+            "calibration_verified": False,
+            "usable_for_real_execution": False,
+            "diagnostic_only": True,
+        }
+
+    def planar_scan(self, timeout_sec: float = 5.0) -> dict[str, Any]:
+        """Capture LiDAR and base TF without requiring a camera."""
+        timeout_sec = self._validate_timeout(timeout_sec)
+        try:
+            client = RosCliReadOnlyClient(
+                dict(LIMO_OBSERVATION_TOPICS.values()), timeout_sec=timeout_sec
+            )
+            result = client.planar_scan()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error_code": "LIMO_PLANAR_SCAN_UNAVAILABLE",
+                "error": str(exc)[:300],
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+                "diagnostic_only": True,
+            }
+        return {
+            **result,
+            "ok": True,
+            "schema_version": "limo.planar_scan.v1",
+            "trust_level": "UNVERIFIED_DIAGNOSTIC",
+            "command_dispatched": False,
+            "usable_for_real_execution": False,
+            "diagnostic_only": True,
+        }
+
     def localization_state(
         self,
         endpoint: str = "ws://127.0.0.1:9090",
@@ -1280,6 +1385,9 @@ class LimoMCPService:
 
     def dabai_device_state(self) -> dict[str, Any]:
         return self._peripheral_inspector.dabai_device_state()
+
+    def dabai_camera_parameters(self) -> dict[str, Any]:
+        return self._peripheral_inspector.dabai_camera_parameters()
 
     def platform_health(self) -> dict[str, Any]:
         return self._peripheral_inspector.platform_health()
@@ -2222,6 +2330,38 @@ def build_mcp_server(
         return [metadata, Image(data=png, format="png")]
 
     @mcp.tool(
+        description="Read bounded optical-depth statistics for image sectors; not verified collision clearance.",
+        annotations=READ_ONLY_TOOL,
+        meta={"physicalExecution": False},
+    )
+    async def limo_get_depth_summary(timeout_sec: float = 5.0) -> dict[str, Any]:
+        return await asyncio.to_thread(implementation.depth_summary, timeout_sec)
+
+    @mcp.tool(
+        description="Capture bounded synchronized depth, scan, matching calibration and TF; read-only, not safety verified.",
+        annotations=READ_ONLY_TOOL,
+        meta={"physicalExecution": False},
+    )
+    async def limo_capture_local_observation(timeout_sec: float = 5.0) -> dict[str, Any]:
+        return await asyncio.to_thread(implementation.local_observation, timeout_sec)
+
+    @mcp.tool(
+        description="Capture unverified synchronized camera and lidar data for offline calibration diagnostics only.",
+        annotations=READ_ONLY_TOOL,
+        meta={"physicalExecution": False},
+    )
+    async def limo_capture_calibration_diagnostic(timeout_sec: float = 5.0) -> dict[str, Any]:
+        return await asyncio.to_thread(implementation.calibration_diagnostic, timeout_sec)
+
+    @mcp.tool(
+        description="Capture fixed LiDAR scan and base TF for planar diagnostics; no camera required.",
+        annotations=READ_ONLY_TOOL,
+        meta={"physicalExecution": False},
+    )
+    async def limo_capture_planar_scan(timeout_sec: float = 5.0) -> dict[str, Any]:
+        return await asyncio.to_thread(implementation.planar_scan, timeout_sec)
+
+    @mcp.tool(
         description=(
             "Inventory documented LIMO peripherals against live USB, framebuffer, input, and "
             "ROS evidence without opening serial or motor interfaces."
@@ -2272,6 +2412,15 @@ def build_mcp_server(
     )
     async def limo_get_dabai_device_state() -> dict[str, Any]:
         return await asyncio.to_thread(implementation.dabai_device_state)
+
+    @mcp.tool(
+        description=(
+            "Read fixed Dabai SDK camera parameter arrays for diagnostics. "
+            "This does not verify calibration or authorize robot motion."
+        )
+    )
+    async def limo_get_dabai_camera_parameters() -> dict[str, Any]:
+        return await asyncio.to_thread(implementation.dabai_camera_parameters)
 
     @mcp.tool(
         description=(
