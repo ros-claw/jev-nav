@@ -88,24 +88,38 @@ def depth_metadata_matches(image, info):
 class StoppedOdomVerifier(object):  # noqa: UP004 - Python 2 ROS worker
     """Require repeated new low-speed odometry after the stop request."""
 
-    def __init__(self, stop_requested_at):
-        if not _finite(stop_requested_at):
+    def __init__(self, stop_requested_at, stop_requested_ros):
+        if not _finite(stop_requested_at) or not _finite(stop_requested_ros):
             raise ValueError("invalid stop request time")
         self.last_at = stop_requested_at
+        self.last_source = stop_requested_ros
         self.samples = 0
         self.linear = None
         self.angular = None
 
-    def observe(self, x, y, angular, observed_at, now):
-        if not all(_finite(value) for value in (x, y, angular, observed_at, now)):
+    def observe(self, x, y, angular, observed_at, now, source_stamp, source_now):
+        if not all(
+            _finite(value) for value in (x, y, angular, observed_at, now, source_stamp, source_now)
+        ):
             self.samples = 0
             return False
-        if observed_at == self.last_at and 0 <= now - observed_at <= 0.3:
+        if (
+            observed_at == self.last_at
+            and source_stamp == self.last_source
+            and 0 <= now - observed_at <= 0.3
+            and 0 <= source_now - source_stamp <= 0.3
+        ):
             return False
-        if observed_at < self.last_at or not 0 <= now - observed_at <= 0.3:
+        if (
+            observed_at <= self.last_at
+            or source_stamp <= self.last_source
+            or not 0 <= now - observed_at <= 0.3
+            or not 0 <= source_now - source_stamp <= 0.3
+        ):
             self.samples = 0
             return False
         self.last_at = observed_at
+        self.last_source = source_stamp
         self.linear = math.hypot(x, y)
         self.angular = abs(angular)
         if self.linear > 0.01 or self.angular > 0.03:
@@ -245,6 +259,11 @@ def execute(request):
         info, _ = current["info"]
         color, color_at = current["color"]
         if not depth_metadata_matches(_metadata(depth), _metadata(info)):
+            return None
+        if (
+            odom.header.frame_id.lstrip("/") != "odom"
+            or odom.child_frame_id.lstrip("/") != "base_link"
+        ):
             return None
         ros_now = rospy.Time.now().to_sec()
         for message in (scan, odom, status, depth, color):
@@ -393,6 +412,7 @@ def execute(request):
             reason = "cancelled"
     finally:
         stop_requested_at = _monotonic()
+        stop_requested_ros = rospy.Time.now().to_sec()
         try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
             relay.stdin.close()
         except (IOError, OSError):
@@ -408,7 +428,7 @@ def execute(request):
         if relay.poll() is None:
             relay.kill()
         relay.wait()
-        verifier = StoppedOdomVerifier(stop_requested_at)
+        verifier = StoppedOdomVerifier(stop_requested_at, stop_requested_ros)
         feedback_deadline = _monotonic() + 2.0
         while _monotonic() < feedback_deadline:
             with lock:
@@ -417,7 +437,13 @@ def execute(request):
                 odom, observed_at = latest_odom
                 twist = odom.twist.twist
                 if verifier.observe(
-                    twist.linear.x, twist.linear.y, twist.angular.z, observed_at, _monotonic()
+                    twist.linear.x,
+                    twist.linear.y,
+                    twist.angular.z,
+                    observed_at,
+                    _monotonic(),
+                    odom.header.stamp.to_sec(),
+                    rospy.Time.now().to_sec(),
                 ):
                     stopped_odometry = {
                         "linear_speed_mps": verifier.linear,

@@ -32,7 +32,8 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
     frames = []
 
     def stamp():
-        return SimpleNamespace(to_sec=lambda: clock[0])
+        captured = clock[0]
+        return SimpleNamespace(to_sec=lambda: captured)
 
     def header(frame):
         return SimpleNamespace(frame_id=frame, stamp=stamp())
@@ -62,6 +63,7 @@ def test_continuous_worker_wiring_with_synthetic_ros(monkeypatch, tmp_path, matc
             )
             return SimpleNamespace(
                 header=header("odom"),
+                child_frame_id="base_link",
                 twist=SimpleNamespace(twist=twist),
                 pose=SimpleNamespace(pose=pose),
             )

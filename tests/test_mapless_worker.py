@@ -48,13 +48,25 @@ def test_depth_frame_and_camera_info_must_match():
 
 
 def test_stop_requires_multiple_new_fresh_odometry_samples():
-    verifier = worker.StoppedOdomVerifier(stop_requested_at=10.0)
-    assert not verifier.observe(0.0, 0.0, 0.0, observed_at=10.0, now=10.0)
-    assert not verifier.observe(0.0, 0.0, 0.0, observed_at=10.1, now=10.1)
-    assert not verifier.observe(0.1, 0.0, 0.0, observed_at=10.2, now=10.2)
-    assert not verifier.observe(0.0, 0.0, 0.0, observed_at=10.3, now=10.3)
-    assert not verifier.observe(0.0, 0.0, 0.0, observed_at=10.4, now=10.4)
-    assert verifier.observe(0.0, 0.0, 0.0, observed_at=10.5, now=10.5)
+    verifier = worker.StoppedOdomVerifier(stop_requested_at=10.0, stop_requested_ros=100.0)
+    assert not verifier.observe(
+        0.0, 0.0, 0.0, observed_at=10.1, now=10.1, source_stamp=99.0, source_now=100.1
+    )
+    assert not verifier.observe(
+        0.0, 0.0, 0.0, observed_at=10.1, now=10.1, source_stamp=100.1, source_now=100.1
+    )
+    assert not verifier.observe(
+        0.1, 0.0, 0.0, observed_at=10.2, now=10.2, source_stamp=100.2, source_now=100.2
+    )
+    assert not verifier.observe(
+        0.0, 0.0, 0.0, observed_at=10.3, now=10.3, source_stamp=100.3, source_now=100.3
+    )
+    assert not verifier.observe(
+        0.0, 0.0, 0.0, observed_at=10.4, now=10.4, source_stamp=100.4, source_now=100.4
+    )
+    assert verifier.observe(
+        0.0, 0.0, 0.0, observed_at=10.5, now=10.5, source_stamp=100.5, source_now=100.5
+    )
 
 
 def test_motion_evidence_counts_translation_and_wrapped_yaw():
