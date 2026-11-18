@@ -14,6 +14,7 @@ import pwd
 import select
 import signal
 import sys
+import threading
 import time
 
 try:
@@ -25,6 +26,7 @@ HEARTBEAT_SEC = 0.2
 MAX_LINEAR = 0.12
 MAX_ANGULAR = 0.4
 MAX_PENDING_BYTES = 2048
+STATUS_MAX_AGE_SEC = 0.25
 _shutdown = False
 
 
@@ -105,6 +107,104 @@ def _request_shutdown(_signum, _frame):
     _shutdown = True
 
 
+class DriverStatus(object):  # noqa: UP004 - Python 2 ROS worker
+    """Require a fresh status and a completed zero after our first observation."""
+
+    def __init__(self, expected_publisher):
+        if not isinstance(expected_publisher, str) or not expected_publisher.startswith("/"):
+            raise ValueError("invalid relay publisher name")
+        self.lock = threading.Lock()
+        self.expected_publisher = expected_publisher
+        self.boot_id = None
+        self.initial_zero_writes = None
+        self.zero_writes = None
+        self.mode = None
+        self.primed = False
+        self.latched = True
+        self.received_at = None
+        self.generated_at = None
+        self.zero_publisher = None
+        self.fault = False
+        self.accepted_mode = None
+
+    def observe(self, data, now):
+        with self.lock:
+            try:
+                if not isinstance(data, str) or len(data) > 256 or not _number(now):
+                    raise ValueError("invalid status")
+                fields = data.split()
+                if len(fields) != 8 or fields[0] != "v1" or not fields[1]:
+                    raise ValueError("invalid status")
+                if not all(field.isdigit() for field in fields[2:6]):
+                    raise ValueError("invalid status")
+                count, mode, primed, latched = [int(value) for value in fields[2:6]]
+                generated_at = float(fields[7])
+                if (not _number(generated_at) or not 0 <= now - generated_at <= STATUS_MAX_AGE_SEC
+                        or (self.generated_at is not None and generated_at < self.generated_at)):
+                    raise ValueError("stale or reordered driver status")
+                if count > 18446744073709551615 or mode > 255 or primed > 1 or latched > 1:
+                    raise ValueError("invalid status")
+                if self.received_at is not None and now < self.received_at:
+                    raise ValueError("clock moved backwards")
+                if latched or (self.accepted_mode is not None and mode != self.accepted_mode):
+                    raise ValueError("driver latched or changed motion mode")
+                if (self.accepted_mode is not None and self.zero_writes is not None
+                        and count > self.zero_writes and fields[6] != self.expected_publisher):
+                    raise ValueError("zero command came from another publisher")
+                if self.boot_id is None:
+                    self.boot_id = fields[1]
+                    self.initial_zero_writes = count
+                elif fields[1] != self.boot_id or count < self.zero_writes:
+                    raise ValueError("driver restarted or counter regressed")
+                self.zero_writes = count
+                self.mode = mode
+                self.primed = primed == 1
+                self.latched = latched == 1
+                self.received_at = float(now)
+                self.generated_at = generated_at
+                self.zero_publisher = fields[6]
+            except (ValueError, OverflowError):
+                self.fault = True
+
+    def ready(self, now):
+        with self.lock:
+            ready = bool(
+                not self.fault and self.received_at is not None and _number(now)
+                and 0 <= now - self.received_at <= STATUS_MAX_AGE_SEC
+                and 0 <= now - self.generated_at <= STATUS_MAX_AGE_SEC
+                and self.zero_writes > self.initial_zero_writes
+                and self.zero_publisher == self.expected_publisher
+                and self.mode in (0, 1, 2) and self.primed and not self.latched
+            )
+            if ready and self.accepted_mode is None:
+                self.accepted_mode = self.mode
+            return ready
+
+
+def prime_connection(connected, publish_zero, clock, sleep, cancelled, driver_ready, timeout=3.0):
+    """Wait for a stable connection and a fresh completed-zero driver report."""
+    started = clock()
+    previous = started
+    stable_since = None
+    if not _number(started):
+        return False
+    while not cancelled():
+        now = clock()
+        if not _number(now) or now < previous or now - started >= timeout:
+            return False
+        previous = now
+        publish_zero()
+        if connected():
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= 0.2 and driver_ready():
+                return True
+        else:
+            stable_since = None
+        sleep(0.05)
+    return False
+
+
 def main():
     # This executable belongs to the daemon-side adapter, not the agent.
     try:
@@ -116,17 +216,33 @@ def main():
 
     import rospy
     from geometry_msgs.msg import Twist
+    from std_msgs.msg import String
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     rospy.init_node("rosclaw_limo_mapless_relay", anonymous=True, disable_signals=True)
     publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-    gate = RelayGate(_monotonic())
+    status = DriverStatus(rospy.get_name())
+    _status_subscriber = rospy.Subscriber(
+        "/rosclaw_limo/command_watchdog", String,
+        lambda msg: status.observe(msg.data, _monotonic()), queue_size=1)
     pending = b""
     motion_acknowledged = False
-    sys.stdout.write("READY\n")
-    sys.stdout.flush()
     try:
+        # The parent waits for READY before sending commands. A readable pipe
+        # here means it closed or violated that protocol, so cancel startup.
+        def cancelled():
+            return (_shutdown or rospy.is_shutdown() or
+                    bool(select.select([sys.stdin.fileno()], [], [], 0.0)[0]))
+
+        if not prime_connection(lambda: publisher.get_num_connections() > 0,
+                                lambda: publisher.publish(Twist()),
+                                _monotonic, time.sleep, cancelled,
+                                lambda: status.ready(_monotonic())):
+            return 1
+        gate = RelayGate(_monotonic())
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
         while not _shutdown and not rospy.is_shutdown():
             ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0.05)
             if ready:
@@ -146,6 +262,9 @@ def main():
                     if not gate.accept(frame, _monotonic()):
                         break
             linear, angular = gate.command(_monotonic())
+            if publisher.get_num_connections() <= 0 or not status.ready(_monotonic()):
+                gate.stopped = True
+                linear, angular = 0.0, 0.0
             message = Twist()
             message.linear.x = linear
             message.angular.z = angular

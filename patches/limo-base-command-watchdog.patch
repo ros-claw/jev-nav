@@ -1,0 +1,459 @@
+--- a/limo_base/CMakeLists.txt
++++ b/limo_base/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ 
+ find_package(catkin REQUIRED COMPONENTS
+   roscpp
++  std_msgs
+   geometry_msgs
+   tf
+   message_generation
+--- a/limo_base/package.xml
++++ b/limo_base/package.xml
+@@ -8,9 +8,11 @@
+ 
+   <buildtool_depend>catkin</buildtool_depend>
+   <build_depend>roscpp</build_depend>
++  <build_depend>std_msgs</build_depend>
+   <build_depend>geometry_msgs</build_depend>
+   <build_depend>tf</build_depend>
+   <exec_depend>roscpp</exec_depend>
++  <exec_depend>std_msgs</exec_depend>
+   <exec_depend>geometry_msgs</exec_depend>
+   <exec_depend>tf</exec_depend>
+ 
+--- a/limo_base/include/limo_driver.h
++++ b/limo_base/include/limo_driver.h
+@@ -33,15 +33,19 @@
+ 
+ #include <iostream>
+ #include <thread>
++#include <mutex>
++#include <atomic>
+ #include <memory.h>
+ #include <ros/ros.h>
+ #include <tf/transform_broadcaster.h>
+ #include <tf/tf.h>
+ #include <nav_msgs/Odometry.h>
+ #include <sensor_msgs/Imu.h>
++#include <std_msgs/String.h>
+ #include <limo_base/LimoStatus.h>
+ #include "serial_port.h"
+ #include "limo_protocol.h"
++#include "limo_command_watchdog.h"
+ 
+ namespace AgileX {
+ 
+@@ -55,8 +59,8 @@
+     void readData();
+     void processRxData(uint8_t data);
+     void parseFrame(const LimoFrame& frame);
+-    void sendFrame(const LimoFrame& frame);
+-    void setMotionCommand(double linear_vel, double steer_angle,
++    bool sendFrame(const LimoFrame& frame);
++    bool setMotionCommand(double linear_vel, double steer_angle,
+                           double lateral_vel, double angular_vel);
+     void enableCommandedMode();
+     void publishOdometry(double stamp, double linear_velocity,
+@@ -66,7 +70,10 @@
+                           double battery_voltage, uint16_t error_code, int8_t motion_mode);
+     void publishIMUData(double stamp);
+     void processErrorCode(uint16_t error_code);
+-    void twistCmdCallback(const geometry_msgs::Twist::ConstPtr &msg);
++    void twistCmdCallback(const ros::MessageEvent<geometry_msgs::Twist const>& event);
++    void commandWatchdogCallback(const ros::SteadyTimerEvent& event);
++    bool commandWatchdogModeFresh(double now) const;
++    void publishCommandWatchdogStatus(double now);
+     double normalizeAngle(double angle);
+     double degToRad(double deg);
+     double convertInnerAngleToCentral(double inner_angle);
+@@ -85,6 +92,12 @@
+     ros::Publisher status_publisher_;
+     ros::Publisher imu_publisher_;
+     ros::Subscriber motion_cmd_sub_;
++    std::mutex motion_command_mutex_;
++    std::unique_ptr<LimoCommandWatchdog> command_watchdog_;
++    ros::SteadyTimer command_watchdog_timer_;
++    ros::Publisher command_watchdog_status_publisher_;
++    std::string command_watchdog_boot_id_;
++    double last_mode_report_at_ = 0.0;  // protected by motion_command_mutex_
+     tf::TransformBroadcaster tf_broadcaster_;
+ 
+     double position_x_ = 0.0;
+@@ -97,7 +110,7 @@
+     double rad = 0.0;    
+ 
+     ImuData imu_data_;
+-    uint8_t motion_mode_;  // current motion type
++    std::atomic<uint8_t> motion_mode_{MODE_UNKNOWN};  // updated by the serial reader
+     
+     static constexpr double steer_angle_tolerance = 0.005;
+     static constexpr double max_inner_angle_ = 28.0;  // degree
+--- a/limo_base/src/limo_driver.cpp
++++ b/limo_base/src/limo_driver.cpp
+@@ -29,9 +29,15 @@
+  */
+ 
+ #include "limo_driver.h"
++#include <chrono>
++#include <unistd.h>
+ int flag=0; 
+ 
+ namespace AgileX {
++
++static double monotonicSeconds() {
++    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
+ 
+ LimoDriver::LimoDriver()  {
+     ros::NodeHandle nh;
+@@ -42,6 +48,18 @@
+     private_nh.param<std::string>("base_frame", base_frame_, std::string("base_link"));
+     private_nh.param<bool>("pub_odom_tf", pub_odom_tf_, false);
+     private_nh.param<bool>("use_mcnamu", use_mcnamu_, false);
++    bool command_watchdog_enabled = false;
++    double command_watchdog_timeout_sec = 0.3;
++    private_nh.param<bool>("command_watchdog_enabled", command_watchdog_enabled, false);
++    private_nh.param<double>("command_watchdog_timeout_sec", command_watchdog_timeout_sec, 0.3);
++    if (command_watchdog_enabled) {
++        command_watchdog_.reset(new LimoCommandWatchdog(command_watchdog_timeout_sec));
++        command_watchdog_boot_id_ = std::to_string(
++            std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
++            std::to_string(static_cast<long>(getpid()));
++        command_watchdog_status_publisher_ = nh.advertise<std_msgs::String>(
++            "/rosclaw_limo/command_watchdog", 1, false);
++    }
+ 
+     if(use_mcnamu_) {
+         motion_mode_ = MODE_MCNAMU;
+@@ -50,7 +68,8 @@
+     odom_publisher_ = nh.advertise<nav_msgs::Odometry>("/odom", 50, true);
+     status_publisher_ = nh.advertise<limo_base::LimoStatus>("/limo_status", 10, true);
+     imu_publisher_ = nh.advertise<sensor_msgs::Imu>("/imu", 10, true);
+-    motion_cmd_sub_ = nh.subscribe<geometry_msgs::Twist>("/cmd_vel", 5, &LimoDriver::twistCmdCallback, this);
++    motion_cmd_sub_ = nh.subscribe("/cmd_vel", command_watchdog_enabled ? 1 : 5,
++                                   &LimoDriver::twistCmdCallback, this);
+ 
+     // connect to the serial port
+     if (port_name.find("tty") != port_name.npos){
+@@ -59,10 +78,15 @@
+         enableCommandedMode();
+         ROS_INFO("open the serial port: %s", port_name.c_str());
+     }
++    if (command_watchdog_enabled) {
++        if (!port_) throw std::runtime_error("command watchdog requires an open base connection");
++        command_watchdog_timer_ = nh.createSteadyTimer(ros::WallDuration(0.05),
++                                                       &LimoDriver::commandWatchdogCallback, this);
++    }
+ }
+ 
+ LimoDriver::~LimoDriver() {
+-
++    command_watchdog_timer_.stop();
+ }
+ 
+ double LimoDriver::degToRad(double deg) {
+@@ -189,13 +213,25 @@
+             double battervyoltage = ((frame.data[3] & 0xff) | (frame.data[2] << 8)) * 0.1;
+             uint16_t error_code = ((frame.data[5] & 0xff) | (frame.data[4] << 8));
+ 
+-            if (!use_mcnamu_) {
+-                motion_mode_ = frame.data[6];
++            uint8_t reported_motion_mode;
++            const double mode_received_at = monotonicSeconds();
++            {
++                std::lock_guard<std::mutex> lock(motion_command_mutex_);
++                const double now = monotonicSeconds();
++                reported_motion_mode = use_mcnamu_ ? MODE_MCNAMU : frame.data[6];
++                if (command_watchdog_ &&
++                    (motion_mode_.load() != reported_motion_mode || !commandWatchdogModeFresh(now)) &&
++                    command_watchdog_->mode_changed()) {
++                    if (!setMotionCommand(0, 0, 0, 0))
++                        command_watchdog_->record_write(false, monotonicSeconds());
++                }
++                motion_mode_.store(reported_motion_mode);
++                last_mode_report_at_ = mode_received_at;
+             }
+ 
+             processErrorCode(error_code);
+             publishLimoState(frame.stamp, vehicle_state, control_mode,
+-                             battervyoltage, error_code, motion_mode_);
++                             battervyoltage, error_code, reported_motion_mode);
+             break;
+         }
+         case MSG_ACTUATOR1_HS_STATE_ID: {
+@@ -299,7 +335,7 @@
+     sendFrame(frame);
+ }
+ 
+-void LimoDriver::setMotionCommand(double linear_vel, double angular_vel,
++bool LimoDriver::setMotionCommand(double linear_vel, double angular_vel,
+                                   double lateral_velocity, double steering_angle) {
+     LimoFrame frame;
+     frame.id = MSG_MOTION_COMMAND_ID;
+@@ -316,10 +352,10 @@
+     frame.data[5] = static_cast<uint8_t>(lateral_cmd & 0x00ff);
+     frame.data[6] = static_cast<uint8_t>(steering_cmd >> 8);
+     frame.data[7] = static_cast<uint8_t>(steering_cmd & 0x00ff);
+-    sendFrame(frame);
+-}
+-
+-void LimoDriver::sendFrame(const LimoFrame& frame) {
++    return sendFrame(frame);
++}
++
++bool LimoDriver::sendFrame(const LimoFrame& frame) {
+     uint32_t checksum = 0;
+     uint8_t frame_len = 0x0e;
+     uint8_t data[14] = {0x55, frame_len};
+@@ -347,12 +383,40 @@
+                           "LIMO serial motion frame written: linear=%d angular=%d bytes=%d",
+                           linear_cmd, angular_cmd, written);
+     }
+-}
+-
+-void LimoDriver::twistCmdCallback(const geometry_msgs::TwistConstPtr& msg) {
+-    switch (motion_mode_) {
++    return written == frame_len;
++}
++
++void LimoDriver::twistCmdCallback(const ros::MessageEvent<geometry_msgs::Twist const>& event) {
++    const geometry_msgs::TwistConstPtr msg = event.getMessage();
++    std::lock_guard<std::mutex> lock(motion_command_mutex_);
++    const double now = monotonicSeconds();
++    const uint8_t motion_mode = motion_mode_.load();
++    const bool zero = msg->linear.x == 0.0 && msg->linear.y == 0.0 && msg->angular.z == 0.0;
++    const std::string caller = event.getPublisherName();
++    const bool supported_mode = commandWatchdogModeFresh(now) &&
++        (motion_mode == MODE_FOUR_DIFF || motion_mode == MODE_ACKERMANN || motion_mode == MODE_MCNAMU);
++    if (command_watchdog_ && !command_watchdog_->accept_source(caller, zero)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        ROS_ERROR_THROTTLE(1.0, "LIMO command watchdog rejected another publisher; zero requested");
++        return;
++    }
++    if (command_watchdog_ && !command_watchdog_->accept(
++            msg->linear.x, msg->linear.y, msg->angular.z, now, supported_mode)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        ROS_WARN_THROTTLE(1.0, "LIMO command watchdog is unprimed or latched; command rejected");
++        return;
++    }
++    if (command_watchdog_ && zero) {
++        const bool written = setMotionCommand(0, 0, 0, 0);
++        command_watchdog_->record_write(written, monotonicSeconds());
++        command_watchdog_->record_zero_source(caller);
++        if (command_watchdog_->is_latched()) setMotionCommand(0, 0, 0, 0);
++        return;
++    }
++    bool written = false;
++    switch (motion_mode) {
+         case MODE_FOUR_DIFF: {
+-            setMotionCommand(msg->linear.x, msg->angular.z, 0, 0);
++            written = setMotionCommand(msg->linear.x, msg->angular.z, 0, 0);
+             break;
+         }
+         case MODE_ACKERMANN: {
+@@ -380,17 +444,53 @@
+                 steering_angle = inner_angle / right_angle_scale_;
+             }
+ 
+-            setMotionCommand(msg->linear.x, 0, 0, steering_angle);
++            written = setMotionCommand(msg->linear.x, 0, 0, steering_angle);
+             break;
+         }
+         case MODE_MCNAMU: {
+-            setMotionCommand(msg->linear.x, msg->angular.z, msg->linear.y, 0);
++            written = setMotionCommand(msg->linear.x, msg->angular.z, msg->linear.y, 0);
+             break;
+         }
+         default:
+             ROS_INFO("motion mode not supported in receive cmd_vel");
+             break;
+     }
++    if (command_watchdog_) {
++        command_watchdog_->record_write(written, monotonicSeconds());
++        if (command_watchdog_->is_latched()) setMotionCommand(0, 0, 0, 0);
++    }
++}
++
++void LimoDriver::commandWatchdogCallback(const ros::SteadyTimerEvent& event) {
++    (void)event;
++    std::lock_guard<std::mutex> lock(motion_command_mutex_);
++    if (!command_watchdog_) return;
++    const double now = monotonicSeconds();
++    if (!commandWatchdogModeFresh(now)) command_watchdog_->mode_changed();
++    if (command_watchdog_->should_stop(now)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        if (command_watchdog_->is_latched()) {
++            ROS_ERROR_THROTTLE(1.0, "LIMO command watchdog timed out; zero command requested");
++        }
++    }
++    publishCommandWatchdogStatus(monotonicSeconds());
++}
++
++bool LimoDriver::commandWatchdogModeFresh(double now) const {
++    return last_mode_report_at_ > 0.0 && now >= last_mode_report_at_ && now - last_mode_report_at_ < 0.5;
++}
++
++void LimoDriver::publishCommandWatchdogStatus(double now) {
++    const uint8_t mode = commandWatchdogModeFresh(now) ? motion_mode_.load() : MODE_UNKNOWN;
++    std_msgs::String status;
++    status.data = "v1 " + command_watchdog_boot_id_ + " " +
++                  std::to_string(command_watchdog_->zero_writes()) + " " +
++                  std::to_string(static_cast<unsigned int>(mode)) + " " +
++                  (command_watchdog_->primed() ? "1" : "0") + " " +
++                  (command_watchdog_->is_latched() ? "1" : "0") + " " +
++                  (command_watchdog_->zero_source().empty() ? "none" : command_watchdog_->zero_source()) + " " +
++                  std::to_string(now);
++    command_watchdog_status_publisher_.publish(status);
+ }
+ 
+ void LimoDriver::publishIMUData(double stamp) {
+--- a/limo_base/launch/limo_base.launch
++++ b/limo_base/launch/limo_base.launch
+@@ -7,9 +7,13 @@
+     <arg name="base_frame" default="base_link" />
+     <arg name="use_mcnamu" default="false" />
+     <arg name="pub_odom_tf" default="" />
++    <arg name="command_watchdog_enabled" default="false" />
++    <arg name="command_watchdog_timeout_sec" default="0.3" />
+ 
+     <node name="limo_base_node" pkg="limo_base" type="limo_base_node" output="screen" >
+         <param name="port_name" value="$(arg port_name)" />
++        <param name="command_watchdog_enabled" value="$(arg command_watchdog_enabled)" />
++        <param name="command_watchdog_timeout_sec" value="$(arg command_watchdog_timeout_sec)" />
+         <param name="odom_frame" value="$(arg odom_frame)" />
+         <param name="base_frame" value="$(arg base_frame)" />
+         <param name="use_mcnamu" value="$(arg use_mcnamu)" />
+--- a/limo_bringup/launch/limo_start.launch
++++ b/limo_bringup/launch/limo_start.launch
+@@ -5,11 +5,15 @@
+     <arg name="port_name" default="ttyTHS1" />
+     <arg name="use_mcnamu" default="false" />
+     <arg name="pub_odom_tf" default="" />
++    <arg name="command_watchdog_enabled" default="false" />
++    <arg name="command_watchdog_timeout_sec" default="0.3" />
+ 
+     <include file="$(find limo_base)/launch/limo_base.launch">
+         <arg name="port_name" default="$(arg port_name)" />
+         <arg name="use_mcnamu" default="$(arg use_mcnamu)" />
+         <arg name="pub_odom_tf" default="$(arg pub_odom_tf)" />
++        <arg name="command_watchdog_enabled" value="$(arg command_watchdog_enabled)" />
++        <arg name="command_watchdog_timeout_sec" value="$(arg command_watchdog_timeout_sec)" />
+     </include>
+ 
+     <include file="$(find ydlidar_ros)/launch/X2L.launch" />
+--- /dev/null
++++ b/limo_base/include/limo_command_watchdog.h
+@@ -0,0 +1,112 @@
++#ifndef ROSCLAW_LIMO_COMMAND_WATCHDOG_H
++#define ROSCLAW_LIMO_COMMAND_WATCHDOG_H
++
++// Candidate driver-side timeout policy. No ROS or hardware access. Calls must
++// be serialized with the driver's motion-command writes by the caller.
++
++#include <cmath>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <string>
++
++class LimoCommandWatchdog {
++ public:
++  explicit LimoCommandWatchdog(double timeout_seconds)
++      : timeout_(timeout_seconds), last_(0.0), seen_(false), active_(false),
++        primed_(false), pending_(false), pending_zero_(false), prior_deadline_(0.0),
++        prior_active_(false), latched_(false), zero_writes_(0) {
++    if (!std::isfinite(timeout_) || timeout_ < 0.1 || timeout_ > 1.0) {
++      throw std::invalid_argument("command timeout must be between 0.1 and 1.0 seconds");
++    }
++  }
++
++  bool accept(double linear, double lateral, double angular, double now,
++              bool supported_mode = true) {
++    if (latched_) return false;
++    if (pending_ || !std::isfinite(linear) || !std::isfinite(lateral) || !std::isfinite(angular) ||
++        !std::isfinite(now) || (seen_ && (now < last_ || (active_ && now - last_ >= timeout_)))) {
++      latched_ = true;
++      return false;
++    }
++    const bool zero = linear == 0.0 && lateral == 0.0 && angular == 0.0;
++    if (!primed_ && !zero) return false;
++    if (!supported_mode && !zero) {
++      if (active_) latched_ = true;
++      return false;
++    }
++    prior_active_ = active_;
++    prior_deadline_ = last_ + timeout_;
++    last_ = now;
++    seen_ = true;
++    pending_ = true;
++    pending_zero_ = zero;
++    if (!zero) active_ = true;
++    return true;
++  }
++
++  void record_write(bool complete, double now) {
++    if (!complete || !pending_ || !std::isfinite(now) || now < last_ ||
++        now - last_ >= timeout_ || (prior_active_ && now >= prior_deadline_)) {
++      latched_ = true;
++    } else if (pending_zero_) {
++      if (zero_writes_ == std::numeric_limits<std::uint64_t>::max()) {
++        latched_ = true;
++      } else {
++        ++zero_writes_;
++        active_ = false;
++        primed_ = true;
++      }
++    }
++    pending_ = false;
++    pending_zero_ = false;
++  }
++
++  bool should_stop(double now) {
++    if (!std::isfinite(now) || (seen_ && (now < last_ || (active_ && now - last_ >= timeout_)))) {
++      latched_ = true;
++    }
++    return latched_ || !primed_;
++  }
++
++  bool is_latched() const { return latched_; }
++  bool primed() const { return primed_; }
++  std::uint64_t zero_writes() const { return zero_writes_; }
++  const std::string& zero_source() const { return zero_source_; }
++
++  bool accept_source(const std::string& source, bool zero) {
++    if (latched_) return false;
++    if (source.empty() || source[0] != '/' || source.size() > 80 ||
++        source.find_first_of(" \t\r\n") != std::string::npos ||
++        (primed_ && source != zero_source_ && (active_ || !zero))) {
++      latched_ = true;
++      return false;
++    }
++    return true;
++  }
++
++  void record_zero_source(const std::string& source) {
++    if (primed_ && !latched_) zero_source_ = source;
++  }
++
++  bool mode_changed() {
++    if (active_) latched_ = true;
++    return latched_;
++  }
++
++ private:
++  const double timeout_;
++  double last_;
++  bool seen_;
++  bool active_;
++  bool primed_;
++  bool pending_;
++  bool pending_zero_;
++  double prior_deadline_;
++  bool prior_active_;
++  bool latched_;
++  std::uint64_t zero_writes_;
++  std::string zero_source_;
++};
++
++#endif

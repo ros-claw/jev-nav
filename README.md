@@ -21,6 +21,7 @@ The unverified mapless exploration candidate and its outstanding work are docume
 - `limo_observe` returns a compact message summary by default; `include_raw=true` is available for bounded message-level debugging.
 - `limo_sample_topic` collects 1-10 messages and reports compact summaries plus an estimated message rate.
 - `limo_capture_synchronized_scene` captures color, optical depth, laser and base data in one ROS header-time window for advisory model input. It does not certify exposure synchronization, calibration, clearance or real execution.
+- The uninstalled base-driver timeout candidate and its limitations are documented in [`docs/DRIVER_WATCHDOG_CANDIDATE.md`](docs/DRIVER_WATCHDOG_CANDIDATE.md).
 - Images, point clouds, paths, laser arrays, and occupancy grids are reduced to useful metadata and statistics by default.
 - No MCP tool can advertise or publish a ROS topic. `/cmd_vel`, serial, CAN, and vendor SDK access are absent from the Agent process.
 - Navigation uses the high-level `/move_base` contract and is submitted through `rosclawd` only.

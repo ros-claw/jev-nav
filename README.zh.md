@@ -18,6 +18,7 @@ USB、音频、显示、触摸屏、相机健康与 Jetson 证据边界详见
 - `limo_observe` 默认返回紧凑摘要；消息级调试时可显式设置 `include_raw=true`。
 - `limo_sample_topic` 可采样 1-10 条消息，返回摘要和估算频率。
 - `limo_capture_synchronized_scene` 在同一 ROS 消息头时间窗口采集彩色、光学深度、雷达和底盘数据，供模型提出只读建议；它不验证相机曝光同步、标定、空间净空或实机执行条件。
+- 底盘命令超时保护候选和限制见 [`docs/DRIVER_WATCHDOG_CANDIDATE.md`](docs/DRIVER_WATCHDOG_CANDIDATE.md)；候选补丁尚未安装或实机验证。
 - 图像、点云、路径、激光数组和占用栅格默认只返回适合模型处理的统计量。
 - Agent 进程仍不提供 ROS advertise/publish、`/cmd_vel`、串口、CAN 或厂商 SDK 工具。
 - 导航只建模为高层 `/move_base` 能力，并经 `rosclawd` 的 `request_action` 路径提交。
