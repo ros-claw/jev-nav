@@ -1,6 +1,6 @@
 # limo-ros-mcp
 
-AgileX LIMO ROS 1 的独立巡检 MCP 服务。默认 `full` profile 暴露全部 35 个 ROS、RGB-D、音频、显示、Jetson 与受控控制面工具；需要更小工具面时可显式选择包含 11 个工具的 `core` profile。会改变机器人状态的请求仍全部交给 ROSClaw 守护进程。
+AgileX LIMO ROS 1 的独立巡检 MCP 服务。默认 `full` profile 暴露 ROS、RGB-D、音频、显示、Jetson 与受控控制面工具；需要更小工具面时可显式选择 `core` profile。会改变机器人状态的请求仍全部交给 ROSClaw 守护进程。
 
 本次真机接口验证、动态状态和巡检前置问题记录在
 [`docs/ROS_INSPECTION_READINESS.md`](docs/ROS_INSPECTION_READINESS.md)。
@@ -17,6 +17,7 @@ USB、音频、显示、触摸屏、相机健康与 Jetson 证据边界详见
   不接受任意 topic 或输出路径，只返回经过尺寸、字节数与 SHA-256 校验的单帧 PNG。
 - `limo_observe` 默认返回紧凑摘要；消息级调试时可显式设置 `include_raw=true`。
 - `limo_sample_topic` 可采样 1-10 条消息，返回摘要和估算频率。
+- `limo_capture_synchronized_scene` 在同一 ROS 消息头时间窗口采集彩色、光学深度、雷达和底盘数据，供模型提出只读建议；它不验证相机曝光同步、标定、空间净空或实机执行条件。
 - 图像、点云、路径、激光数组和占用栅格默认只返回适合模型处理的统计量。
 - Agent 进程仍不提供 ROS advertise/publish、`/cmd_vel`、串口、CAN 或厂商 SDK 工具。
 - 导航只建模为高层 `/move_base` 能力，并经 `rosclawd` 的 `request_action` 路径提交。
@@ -30,14 +31,14 @@ USB、音频、显示、触摸屏、相机健康与 Jetson 证据边界详见
 
 ## 工具
 
-默认 `full` 暴露下表完整的 35 个工具。使用 `--profile inspection` 获取全部只读诊断，或显式使用 `--profile core` 获取包含上下文、观测、readiness、导航验证、三个受控请求、动作状态、回执和急停的 11 工具界面。也可通过 `ROSCLAW_LIMO_MCP_PROFILE` 环境变量选择相同的 profile。
+默认 `full` 暴露完整工具集。使用 `--profile inspection` 获取全部只读诊断，或显式使用 `--profile core` 获取有界工具界面。也可通过 `ROSCLAW_LIMO_MCP_PROFILE` 环境变量选择相同的 profile。
 
 | 分组 | 工具 |
 | --- | --- |
 | 契约与 ROS graph | `limo_get_contract`、`limo_list_observations`、`limo_probe_ros`、`limo_get_topic_info` |
 | 消息检查 | `limo_observe`、`limo_sample_topic` |
 | 巡检快照 | `limo_get_base_state`、`limo_get_laser_summary`、`limo_get_localization_state`、`limo_get_navigation_state`、`limo_get_map_summary`、`limo_get_diagnostics`、`limo_get_transform_state`、`limo_get_patrol_readiness` |
-| 相机与外设 | `limo_get_camera_state`、`limo_capture_camera_frame`、`limo_get_robot_pose`、`limo_get_dabai_device_state`、`limo_list_peripherals`、`limo_get_audio_state`、`limo_measure_microphone`、`limo_get_display_state`、`limo_get_platform_health` |
+| 相机与外设 | `limo_get_camera_state`、`limo_capture_camera_frame`、`limo_capture_synchronized_scene`、`limo_get_robot_pose`、`limo_get_dabai_device_state`、`limo_list_peripherals`、`limo_get_audio_state`、`limo_measure_microphone`、`limo_get_display_state`、`limo_get_platform_health` |
 | 参数验证 | `limo_validate_navigation_goal`、`limo_validate_velocity_command` |
 | ROSClaw 控制面 | `limo_get_runtime_status`、`limo_request_navigation`、`limo_request_initial_pose`、`limo_request_tone`、`limo_request_speech`、`limo_get_action_status`、`limo_get_execution_receipt`、`limo_emergency_stop` |
 

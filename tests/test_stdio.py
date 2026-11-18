@@ -32,7 +32,8 @@ async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
                 await session.initialize()
                 listed = await session.list_tools()
                 names = {tool.name for tool in listed.tools}
-                assert len(names) == 41
+                assert len(names) == 42
+                assert "limo_capture_synchronized_scene" in names
                 assert "limo_capture_planar_scan" in names
                 assert "limo_capture_calibration_diagnostic" in names
                 assert "limo_get_dabai_camera_parameters" in names

@@ -415,6 +415,145 @@ def test_roscli_camera_capture_uses_fixed_read_only_worker(monkeypatch: Any) -> 
     assert kwargs["timeout"] == 8.0
 
 
+def _valid_scene_snapshot() -> dict[str, Any]:
+    from limo_ros_mcp.workers.scene_observation_core import make_snapshot
+
+    data = {
+        "stamps": dict.fromkeys(("color", "scan", "status", "odom", "depth"), 100.0),
+        "scan": {
+            "angle_min": 0,
+            "angle_increment": 0.1,
+            "range_min": 0.1,
+            "range_max": 12.0,
+            "time_increment": 0.0,
+            "scan_time": 0.1,
+            "ranges": [3.0],
+        },
+        "frames": {"laser": "laser_link", "color": "color_optical", "depth": "depth_optical"},
+        "laser_tf": {
+            "source": "laser_link",
+            "target": "base_link",
+            "stamp": 100.0,
+            "x": 0.105,
+            "y": 0.0,
+            "yaw": 0.0,
+            "verified": False,
+        },
+        "base": {
+            "error_code": 0,
+            "motion_mode": 0,
+            "battery_voltage": 12.0,
+            "linear_x_mps": 0.0,
+            "angular_z_radps": 0.0,
+        },
+        "depth": {
+            name: {"minimum_m": 2.0, "valid_ratio": 0.5} for name in ("left", "center", "right")
+        },
+    }
+    return make_snapshot(data, 100.1, 100.1)
+
+
+SCENE_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
+
+
+def test_roscli_scene_capture_is_bounded_and_keeps_image_separate(monkeypatch: Any) -> None:
+    from limo_ros_mcp.workers.scene_observation_core import scene_digest
+
+    png = SCENE_PNG
+    calls = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        request = json.loads(kwargs["input"])
+        assert request == {"protocol": "rosclaw.limo.scene-observer.v1", "timeout_sec": 5.0}
+        response = {
+            "ok": True,
+            "protocol": request["protocol"],
+            "snapshot": _valid_scene_snapshot(),
+            "diagnostic_only": True,
+            "command_dispatched": False,
+            "usable_for_real_execution": False,
+            "sync": "ros_header_approximate",
+            "png_base64": base64.b64encode(png).decode(),
+            "png_sha256": f"sha256:{hashlib.sha256(png).hexdigest()}",
+        }
+        response["scene_sha256"] = scene_digest(png, response["snapshot"])
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(response), stderr="")
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("limo_ros_mcp.roscli.time.time", lambda: 100.1)
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    client = RosCliReadOnlyClient({})
+    capture = getattr(client, "capture_scene", None)
+    assert callable(capture), "synchronized scene capture is unavailable"
+    metadata, observed = capture()
+    assert observed == png
+    assert metadata["diagnostic_only"] is True
+    assert "png_base64" not in metadata
+    assert calls[0][1].endswith("workers/limo_scene_observer_worker.py")
+
+
+def test_roscli_scene_rejects_wrong_hash_and_any_executable_claim(monkeypatch: Any) -> None:
+    from limo_ros_mcp.workers.scene_observation_core import scene_digest
+
+    png = SCENE_PNG
+    response = {
+        "ok": True,
+        "protocol": "rosclaw.limo.scene-observer.v1",
+        "snapshot": _valid_scene_snapshot(),
+        "diagnostic_only": True,
+        "command_dispatched": False,
+        "usable_for_real_execution": False,
+        "sync": "ros_header_approximate",
+        "png_base64": base64.b64encode(png).decode(),
+        "png_sha256": "sha256:bad",
+    }
+    response["scene_sha256"] = scene_digest(png, response["snapshot"])
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("limo_ros_mcp.roscli.time.time", lambda: 100.1)
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda command, **kw: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(response), stderr=""
+        ),
+    )
+    client = RosCliReadOnlyClient({})
+    capture = getattr(client, "capture_scene", None)
+    assert callable(capture), "synchronized scene capture is unavailable"
+    with pytest.raises(RuntimeError):
+        capture()
+    response["png_sha256"] = f"sha256:{hashlib.sha256(png).hexdigest()}"
+    response["usable_for_real_execution"] = True
+    with pytest.raises(RuntimeError):
+        capture()
+    response["usable_for_real_execution"] = False
+    response["snapshot"]["laser_stamp"] = 93.0
+    response["snapshot"]["laser"]["forward_view_stamp"] = 93.0
+    response["scene_sha256"] = scene_digest(png, response["snapshot"])
+    with pytest.raises(RuntimeError):
+        capture()
+    response["snapshot"] = _valid_scene_snapshot()
+    response["scene_sha256"] = scene_digest(png, response["snapshot"])
+    response["snapshot"]["base"]["battery_voltage"] = 12.2
+    with pytest.raises(RuntimeError):
+        capture()
+    response["scene_sha256"] = scene_digest(png, response["snapshot"])
+    monkeypatch.setattr("limo_ros_mcp.roscli.time.time", lambda: 110.0)
+    with pytest.raises(RuntimeError):
+        capture()
+    monkeypatch.setattr("limo_ros_mcp.roscli.time.time", lambda: 100.1)
+    bad_png = b"\x89PNG\r\n\x1a\nimage"
+    response["png_base64"] = base64.b64encode(bad_png).decode()
+    response["png_sha256"] = f"sha256:{hashlib.sha256(bad_png).hexdigest()}"
+    response["scene_sha256"] = scene_digest(bad_png, response["snapshot"])
+    with pytest.raises(RuntimeError):
+        capture()
+
+
 def test_roscli_robot_pose_uses_fixed_map_base_worker(monkeypatch: Any) -> None:
     calls: list[tuple[list[str], dict[str, Any]]] = []
 

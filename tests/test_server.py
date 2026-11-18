@@ -29,6 +29,36 @@ from limo_ros_mcp.server import (
 )
 
 
+def test_synchronized_scene_is_read_only_and_preserves_image(monkeypatch: Any) -> None:
+    png = b"\x89PNG\r\n\x1a\nfixture"
+
+    class FakeClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def capture_scene(self) -> tuple[dict[str, Any], bytes]:
+            return (
+                {
+                    "snapshot": {"laser": {}},
+                    "sync": "ros_header_approximate",
+                    "diagnostic_only": True,
+                    "command_dispatched": False,
+                    "usable_for_real_execution": False,
+                },
+                png,
+            )
+
+    monkeypatch.setattr("limo_ros_mcp.server.RosCliReadOnlyClient", FakeClient)
+    service = LimoMCPService(gateway=object())
+    capture = getattr(service, "capture_synchronized_scene", None)
+    assert callable(capture), "synchronized scene service is unavailable"
+    result, observed = capture(timeout_sec=5)
+    assert observed == png
+    assert result["ok"] is True
+    assert result["command_dispatched"] is False
+    assert result["usable_for_real_execution"] is False
+
+
 def test_mcp_process_status_exposes_bounded_restart_evidence() -> None:
     result = mcp_process_status()
 
@@ -120,7 +150,7 @@ def test_package_and_manifest_versions_match() -> None:
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert manifest["version"] == project["project"]["version"]
-    assert manifest["mcp_tool_count"] == 41
+    assert manifest["mcp_tool_count"] == 42
 
 
 def test_source_launcher_bootstraps_src_layout_without_console_script() -> None:
@@ -176,6 +206,7 @@ async def test_server_exposes_no_raw_ros_publish_tool() -> None:
         "limo_capture_calibration_diagnostic",
         "limo_capture_planar_scan",
         "limo_capture_camera_frame",
+        "limo_capture_synchronized_scene",
         "limo_get_camera_state",
         "limo_get_contract",
         "limo_get_context",

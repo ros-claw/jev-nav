@@ -1088,6 +1088,41 @@ class LimoMCPService:
             "diagnostic_only": True,
         }
 
+    def capture_synchronized_scene(
+        self, timeout_sec: float = 5.0
+    ) -> tuple[dict[str, Any], bytes | None]:
+        """Capture a read-only scene for model advice, never execution evidence."""
+        timeout_sec = self._validate_timeout(timeout_sec)
+        try:
+            client = RosCliReadOnlyClient(
+                dict(LIMO_OBSERVATION_TOPICS.values()), timeout_sec=timeout_sec
+            )
+            result, png = client.capture_scene()
+        except Exception as exc:  # noqa: BLE001 - report observation failure without actuation
+            return (
+                {
+                    "ok": False,
+                    "error_code": "LIMO_SCENE_UNAVAILABLE",
+                    "error": str(exc)[:300],
+                    "diagnostic_only": True,
+                    "command_dispatched": False,
+                    "usable_for_real_execution": False,
+                },
+                None,
+            )
+        return (
+            {
+                **result,
+                "ok": True,
+                "schema_version": "limo.synchronized_scene.v1",
+                "trust_level": "UNVERIFIED_DIAGNOSTIC",
+                "diagnostic_only": True,
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+            },
+            png,
+        )
+
     def localization_state(
         self,
         endpoint: str = "ws://127.0.0.1:9090",
@@ -2440,6 +2475,23 @@ def build_mcp_server(
             timeout_sec,
             stream,
             max_dimension,
+        )
+        if png is None:
+            return metadata
+        return [metadata, Image(data=png, format="png")]
+
+    @mcp.tool(
+        description=(
+            "Capture one approximately header-synchronized color, depth, lidar and base scene. "
+            "Read-only model diagnostics; header synchronization does not verify sensor calibration."
+        ),
+        annotations=READ_ONLY_TOOL,
+        meta={"physicalExecution": False, "returnsImage": True},
+        structured_output=False,
+    )
+    async def limo_capture_synchronized_scene(timeout_sec: float = 5.0) -> Any:
+        metadata, png = await asyncio.to_thread(
+            implementation.capture_synchronized_scene, timeout_sec
         )
         if png is None:
             return metadata

@@ -1,6 +1,6 @@
 # limo-ros-mcp
 
-Inspection-focused MCP server for the AgileX LIMO ROS 1 platform. The default `full` profile exposes all 35 ROS, RGB-D, audio, display, Jetson, and guarded control-plane tools. Use the explicit `core` profile for an 11-tool bounded surface. State-changing requests remain delegated to the ROSClaw daemon.
+Inspection-focused MCP server for the AgileX LIMO ROS 1 platform. The default `full` profile exposes ROS, RGB-D, audio, display, Jetson, and guarded control-plane tools. Use the explicit `core` profile for a bounded surface. State-changing requests remain delegated to the ROSClaw daemon.
 
 The ROSClaw embodiment assets live in `e-urdf-zoo/limo`, with the project template and ROS embodiment card under `configs/`.
 
@@ -20,6 +20,7 @@ The unverified mapless exploration candidate and its outstanding work are docume
 - `limo_measure_microphone` records one to three seconds into memory only, returns RMS/peak statistics, and discards every sample without returning audio content.
 - `limo_observe` returns a compact message summary by default; `include_raw=true` is available for bounded message-level debugging.
 - `limo_sample_topic` collects 1-10 messages and reports compact summaries plus an estimated message rate.
+- `limo_capture_synchronized_scene` captures color, optical depth, laser and base data in one ROS header-time window for advisory model input. It does not certify exposure synchronization, calibration, clearance or real execution.
 - Images, point clouds, paths, laser arrays, and occupancy grids are reduced to useful metadata and statistics by default.
 - No MCP tool can advertise or publish a ROS topic. `/cmd_vel`, serial, CAN, and vendor SDK access are absent from the Agent process.
 - Navigation uses the high-level `/move_base` contract and is submitted through `rosclawd` only.
@@ -32,9 +33,9 @@ The unverified mapless exploration candidate and its outstanding work are docume
 
 ## MCP tools
 
-The default `full` profile exposes the complete 35-tool surface listed below. Use
+The default `full` profile exposes the complete tool surface. Use
 `--profile inspection` for read-only diagnostics or explicitly select `--profile core` for
-the 11-tool surface containing context, observation, readiness, navigation validation,
+the bounded surface containing context, observation, readiness, navigation validation,
 three guarded requests, status, receipt, and emergency stop. The
 `ROSCLAW_LIMO_MCP_PROFILE` environment variable can select the same profiles.
 
@@ -43,7 +44,7 @@ three guarded requests, status, receipt, and emergency stop. The
 | Contract and ROS graph | `limo_get_contract`, `limo_list_observations`, `limo_probe_ros`, `limo_get_topic_info` |
 | Message inspection | `limo_observe`, `limo_sample_topic` |
 | Inspection snapshots | `limo_get_base_state`, `limo_get_laser_summary`, `limo_get_localization_state`, `limo_get_navigation_state`, `limo_get_map_summary`, `limo_get_diagnostics`, `limo_get_transform_state`, `limo_get_patrol_readiness` |
-| Camera and peripherals | `limo_get_camera_state`, `limo_capture_camera_frame`, `limo_get_dabai_device_state`, `limo_list_peripherals`, `limo_get_audio_state`, `limo_measure_microphone`, `limo_get_display_state`, `limo_get_platform_health` |
+| Camera and peripherals | `limo_get_camera_state`, `limo_capture_camera_frame`, `limo_capture_synchronized_scene`, `limo_get_dabai_device_state`, `limo_list_peripherals`, `limo_get_audio_state`, `limo_measure_microphone`, `limo_get_display_state`, `limo_get_platform_health` |
 | Validation | `limo_validate_navigation_goal`, `limo_validate_velocity_command` |
 | ROSClaw control plane | `limo_get_runtime_status`, `limo_request_navigation`, `limo_request_initial_pose`, `limo_request_tone`, `limo_request_speech`, `limo_get_action_status`, `limo_get_execution_receipt`, `limo_emergency_stop` |
 

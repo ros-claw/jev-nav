@@ -19,12 +19,23 @@ from typing import Any
 
 import yaml
 
+from limo_ros_mcp.workers.scene_observation_core import (
+    scene_digest,
+)
+from limo_ros_mcp.workers.scene_observation_core import (
+    validate_png as validate_scene_png,
+)
+from limo_ros_mcp.workers.scene_observation_core import (
+    validate_snapshot as validate_scene_snapshot,
+)
+
 _READINESS_WORKER_PROTOCOL = "rosclaw.limo.readiness-worker.v1"
 _CAMERA_WORKER_PROTOCOL = "rosclaw.limo.camera-capture-worker.v1"
 _DEPTH_WORKER_PROTOCOL = "rosclaw.limo.depth-summary-worker.v1"
 _LOCAL_OBSERVATION_PROTOCOL = "rosclaw.limo.local-observation.v1"
 _CALIBRATION_DIAGNOSTIC_PROTOCOL = "rosclaw.limo.calibration-diagnostic.v1"
 _PLANAR_SCAN_PROTOCOL = "rosclaw.limo.planar-scan-diagnostic.v1"
+_SCENE_OBSERVER_PROTOCOL = "rosclaw.limo.scene-observer.v1"
 _ROBOT_POSE_WORKER_PROTOCOL = "rosclaw.limo.robot-pose-worker.v1"
 _READINESS_WORKER_TOPICS = {
     ("/move_base/global_costmap/costmap", "nav_msgs/OccupancyGrid"): "global_costmap",
@@ -504,6 +515,55 @@ class RosCliReadOnlyClient:
             raise RuntimeError("ROS camera worker PNG hash mismatch")
         metadata = {key: value for key, value in response.items() if key not in {"ok", "protocol"}}
         return metadata, png
+
+    def capture_scene(self) -> tuple[dict[str, Any], bytes]:
+        """Capture one fixed-topic synchronized advisory scene and bounded PNG."""
+        worker = Path(__file__).resolve().parent / "workers" / "limo_scene_observer_worker.py"
+        if not self.python2 or not worker.is_file():
+            raise RuntimeError("synchronized scene worker is unavailable")
+        result = subprocess.run(
+            [self.python2, str(worker)],
+            check=False,
+            capture_output=True,
+            text=True,
+            input=json.dumps(
+                {"protocol": _SCENE_OBSERVER_PROTOCOL, "timeout_sec": self.timeout_sec}
+            ),
+            timeout=self.timeout_sec + 3.0,
+            env=self._environment,
+        )
+        if len(result.stdout.encode("utf-8")) > 5_500_000:
+            raise RuntimeError("synchronized scene output exceeds bound")
+        try:
+            response = json.loads(result.stdout)
+            if (
+                not isinstance(response, dict)
+                or response.get("protocol") != _SCENE_OBSERVER_PROTOCOL
+            ):
+                raise ValueError("protocol mismatch")
+            if result.returncode != 0 or response.get("ok") is not True:
+                raise RuntimeError(str(response.get("error", "scene capture unavailable"))[:300])
+            if (
+                response.get("diagnostic_only") is not True
+                or response.get("command_dispatched") is not False
+                or response.get("usable_for_real_execution") is not False
+                or response.get("sync") != "ros_header_approximate"
+                or not isinstance(response.get("snapshot"), dict)
+            ):
+                raise ValueError("invalid diagnostic metadata")
+            validate_scene_snapshot(response["snapshot"], now=time.time())
+            png = base64.b64decode(response.pop("png_base64"), validate=True)
+            validate_scene_png(png)
+            if (
+                not png.startswith(b"\x89PNG\r\n\x1a\n")
+                or len(png) > 4_000_000
+                or response.get("png_sha256") != f"sha256:{hashlib.sha256(png).hexdigest()}"
+                or response.get("scene_sha256") != scene_digest(png, response["snapshot"])
+            ):
+                raise ValueError("invalid scene image")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("invalid synchronized scene payload") from exc
+        return {key: value for key, value in response.items() if key not in {"ok", "protocol"}}, png
 
     def robot_pose(self) -> dict[str, Any]:
         """Return the current fixed map-to-base_link transform."""
