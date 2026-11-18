@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -1532,6 +1534,116 @@ class LimoMCPService:
             },
         }
 
+    @staticmethod
+    def _exploration_contract(duration_sec: float, body_snapshot_hash: str) -> dict[str, Any]:
+        if (
+            isinstance(duration_sec, bool)
+            or not isinstance(duration_sec, (int, float))
+            or not 1 <= duration_sec <= 30
+            or not math.isfinite(duration_sec)
+            or not isinstance(body_snapshot_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", body_snapshot_hash) is None
+        ):
+            return {
+                "ok": False,
+                "error_code": "LIMO_EXPLORE_CONTRACT_INVALID",
+                "message": "An exact body snapshot and duration from 1 to 30 seconds are required.",
+                "command_dispatched": False,
+                "usable_for_real_execution": False,
+            }
+        return {
+            "ok": True,
+            "arguments": {"schema_version": "limo.explore.v1", "duration_sec": float(duration_sec)},
+        }
+
+    async def request_exploration(
+        self,
+        *,
+        duration_sec: float,
+        body_snapshot_hash: str,
+        execution_mode: str,
+        action_id: str | None,
+        wait_timeout_sec: float,
+    ) -> dict[str, Any]:
+        contract = self._exploration_contract(duration_sec, body_snapshot_hash)
+        if not contract["ok"]:
+            return contract
+        mode = str(execution_mode).upper()
+        if mode == "REAL":
+            return self._navigation_block(
+                "MCP_OPERATOR_CONFIRMATION_REQUIRED",
+                "REAL exploration requires in-context confirmation.",
+            )
+        if mode != "SHADOW":
+            return self._navigation_block(
+                "INVALID_EXECUTION_MODE", "Only SHADOW or REAL is supported."
+            )
+        if (
+            isinstance(wait_timeout_sec, bool)
+            or not isinstance(wait_timeout_sec, (int, float))
+            or not 0 <= wait_timeout_sec <= 30
+            or not math.isfinite(wait_timeout_sec)
+        ):
+            raise ValueError("wait_timeout_sec must be within [0, 30]")
+        try:
+            return await self._gateway.request_exploration(
+                capability_id="limo.explore",
+                arguments=contract["arguments"],
+                execution_mode=mode,
+                body_snapshot_hash=body_snapshot_hash,
+                body_id="limo",
+                action_id=action_id,
+                required_evidence="SYNTHETIC",
+                timeout_sec=float(duration_sec) + 10,
+                wait_timeout_sec=float(wait_timeout_sec),
+            )
+        except Exception as exc:  # noqa: BLE001 - MCP boundary returns structured errors
+            return _control_error("request_exploration", exc)
+
+    def prepare_exploration_confirmation(
+        self, *, duration_sec: float, body_snapshot_hash: str, action_id: str, deadline_at: str
+    ) -> dict[str, Any]:
+        contract = self._exploration_contract(duration_sec, body_snapshot_hash)
+        if not contract["ok"]:
+            return contract
+        display = {
+            "schema_version": "rosclaw.action-display.v2",
+            "title": "LIMO continuous exploration",
+            "summary": "Explore using live sensors and Decisions API direction updates.",
+            "body": {"robot_id": "limo", "duration_sec": float(duration_sec)},
+            "risk_tier": "HIGH",
+            "physical_effects": ["The robot may drive and turn before stopping."],
+            "constraints": [
+                "Duration is fixed; target speeds are at most 0.10 m/s and 0.25 rad/s.",
+                "The relay rejects commands above 0.12 m/s or 0.4 rad/s.",
+            ],
+            "verification": ["Record model decisions and odometry movement and stop."],
+            "abort": ["Use the physical emergency stop if needed."],
+        }
+        try:
+            prepared = self._gateway.prepare_operator_action(
+                capability_id="limo.explore",
+                arguments=contract["arguments"],
+                body_snapshot_hash=body_snapshot_hash,
+                body_id="limo",
+                action_id=action_id,
+                deadline_at=deadline_at,
+                required_evidence="TASK_VERIFIED",
+                timeout_sec=float(duration_sec) + 10,
+                display=display,
+            )
+        except Exception as exc:  # noqa: BLE001 - MCP boundary returns structured errors
+            return _control_error("prepare_exploration_confirmation", exc)
+        return {
+            "ok": True,
+            "decision": "CONFIRMATION_REQUIRED",
+            "approval_request": dict(prepared.approval_request),
+            "prepared_action": prepared,
+            "exploration_contract": contract,
+            "command_dispatched": False,
+            "usable_for_real_execution": False,
+        }
+
     async def request_navigation(
         self,
         *,
@@ -2530,6 +2642,51 @@ def build_mcp_server(
     @mcp.tool(description="Read rosclawd readiness; this never initializes a local executor.")
     async def limo_get_runtime_status() -> dict[str, Any]:
         return await implementation.runtime_status()
+
+    @mcp.tool(
+        description=(
+            "Request a bounded continuous LIMO exploration task through rosclawd. "
+            "REAL uses in-context operator confirmation; live camera frames are sent to Decisions API."
+        ),
+        annotations=GUARDED_ACTION_TOOL,
+        meta={"physicalExecution": True, "operatorConfirmation": "internal"},
+    )
+    async def limo_request_exploration(
+        ctx: Context[Any, Any, Any],
+        body_snapshot_hash: str,
+        duration_sec: float = 10.0,
+        execution_mode: str = "SHADOW",
+        action_id: str | None = None,
+        deadline_at: str | None = None,
+        wait_timeout_sec: float = 2.0,
+    ) -> dict[str, Any]:
+        if str(execution_mode).upper() == "REAL":
+            exact_action_id = action_id or f"action_limo_explore_{uuid.uuid4().hex}"
+            exact_deadline = deadline_at or (
+                datetime.now(UTC) + timedelta(seconds=120)
+            ).isoformat().replace("+00:00", "Z")
+            proposal = implementation.prepare_exploration_confirmation(
+                duration_sec=duration_sec,
+                body_snapshot_hash=body_snapshot_hash,
+                action_id=exact_action_id,
+                deadline_at=exact_deadline,
+            )
+            if proposal.get("ok") is not True:
+                return proposal
+            # Keep the action lease renewed throughout the bounded mission.
+            return await complete_real_confirmation(
+                ctx,
+                proposal,
+                contract_key="exploration_contract",
+                wait_timeout_sec=float(duration_sec) + 15.0,
+            )
+        return await implementation.request_exploration(
+            duration_sec=duration_sec,
+            body_snapshot_hash=body_snapshot_hash,
+            execution_mode=execution_mode,
+            action_id=action_id,
+            wait_timeout_sec=wait_timeout_sec,
+        )
 
     @mcp.tool(
         description=(

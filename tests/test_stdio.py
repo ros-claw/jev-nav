@@ -32,7 +32,7 @@ async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
                 await session.initialize()
                 listed = await session.list_tools()
                 names = {tool.name for tool in listed.tools}
-                assert len(names) == 40
+                assert len(names) == 41
                 assert "limo_capture_planar_scan" in names
                 assert "limo_capture_calibration_diagnostic" in names
                 assert "limo_get_dabai_camera_parameters" in names
@@ -48,6 +48,7 @@ async def test_limo_mcp_stdio_initialize_list_and_call() -> None:
                 assert "limo_get_audio_state" in names
                 assert "limo_measure_microphone" in names
                 assert "limo_request_navigation" in names
+                assert "limo_request_exploration" in names
                 assert "limo_request_initial_pose" in names
                 assert "limo_request_tone" in names
                 assert "limo_request_speech" in names
@@ -82,7 +83,7 @@ async def test_limo_mcp_stdio_explicit_core_profile_remains_bounded() -> None:
                 await session.initialize()
                 listed = await session.list_tools()
                 names = {tool.name for tool in listed.tools}
-                assert len(names) == 11
+                assert len(names) == 12
                 assert "limo_get_context" in names
                 assert "limo_get_readiness" in names
                 assert "limo_request_navigation" in names

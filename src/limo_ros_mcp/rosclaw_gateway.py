@@ -69,6 +69,9 @@ class RosclawGateway:
     async def request_navigation(self, **kwargs: Any) -> dict[str, Any]:
         return self._result(await self._runtime().request_action(**kwargs))
 
+    async def request_exploration(self, **kwargs: Any) -> dict[str, Any]:
+        return self._result(await self._runtime().request_action(**kwargs))
+
     async def request_tone(self, **kwargs: Any) -> dict[str, Any]:
         return self._result(await self._runtime().request_action(**kwargs))
 

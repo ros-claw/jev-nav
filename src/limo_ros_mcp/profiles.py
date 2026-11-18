@@ -8,6 +8,7 @@ CORE_TOOLS = {
     "limo_get_readiness",
     "limo_validate_navigation_goal",
     "limo_request_navigation",
+    "limo_request_exploration",
     "limo_request_initial_pose",
     "limo_request_tone",
     "limo_request_speech",
@@ -18,6 +19,7 @@ CORE_TOOLS = {
 
 CONTROL_TOOLS = {
     "limo_request_navigation",
+    "limo_request_exploration",
     "limo_request_initial_pose",
     "limo_request_tone",
     "limo_request_speech",

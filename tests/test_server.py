@@ -120,7 +120,7 @@ def test_package_and_manifest_versions_match() -> None:
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert manifest["version"] == project["project"]["version"]
-    assert manifest["mcp_tool_count"] == 35
+    assert manifest["mcp_tool_count"] == 41
 
 
 def test_source_launcher_bootstraps_src_layout_without_console_script() -> None:
@@ -203,6 +203,7 @@ async def test_server_exposes_no_raw_ros_publish_tool() -> None:
         "limo_observe",
         "limo_probe_ros",
         "limo_request_navigation",
+        "limo_request_exploration",
         "limo_request_initial_pose",
         "limo_request_tone",
         "limo_request_speech",
@@ -256,12 +257,13 @@ async def test_core_and_inspection_profiles_bound_tool_discovery() -> None:
     core_names = {tool.name for tool in core}
     inspection_names = {tool.name for tool in inspection}
     compat_names = {tool.name for tool in compat}
-    assert len(core_names) == 11
+    assert len(core_names) == 12
     assert "limo_get_context" in core_names
     assert "limo_get_readiness" in core_names
     assert "limo_get_patrol_readiness" not in core_names
     assert "limo_get_audio_state" in inspection_names
     assert "limo_request_navigation" not in inspection_names
+    assert "limo_request_exploration" not in inspection_names
     assert "limo_get_patrol_readiness" in compat_names
 
     annotations = {tool.name: tool.annotations for tool in core}
@@ -1236,6 +1238,33 @@ async def test_real_navigation_uses_elicitation_and_hides_permit_input() -> None
     assert context.messages and "mobile base will move" in context.messages[0]
     assert [call["operation"] for call in gateway.calls] == ["prepare", "confirm"]
     assert gateway.calls[0]["capability_id"] == "limo.navigate_to_pose"
+
+
+@pytest.mark.asyncio
+async def test_real_exploration_waits_for_entire_task_and_confirms_exact_intent() -> None:
+    gateway = FakeGateway()
+    server = build_mcp_server(LimoMCPService(gateway=gateway))
+    context = FakeElicitationContext(accepted=True)
+    result = await server._tool_manager.call_tool(
+        "limo_request_exploration",
+        {
+            "body_snapshot_hash": "a" * 64,
+            "duration_sec": 10.0,
+            "execution_mode": "REAL",
+            "action_id": "action-explore",
+            "deadline_at": "2030-01-02T03:04:05Z",
+        },
+        context=context,
+        convert_result=False,
+    )
+    assert result["interaction"]["decision"] == "CONFIRMED"
+    assert gateway.calls[0]["capability_id"] == "limo.explore"
+    assert gateway.calls[0]["arguments"] == {
+        "schema_version": "limo.explore.v1",
+        "duration_sec": 10.0,
+    }
+    assert gateway.calls[1]["wait_timeout_sec"] == 25.0
+    assert "permit" not in str(result).lower()
 
 
 @pytest.mark.asyncio
