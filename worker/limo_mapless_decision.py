@@ -73,7 +73,12 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                     "instructions": (
                         "Select the next exploration direction, preferring progress into visible "
                         "open space when supported. The lidar may cover only the front: forward_view "
-                        "reports measured rays and gaps, not proof of clearance. If rear_valid_rays "
+                        "groups ray directions about the laser, and reports nearest hit distance and "
+                        "bearing from the robot base. max_unobserved_angle_rad includes sector edges; "
+                        "max_invalid_return_run_rad describes invalid rays within the scan only. "
+                        "base_hits groups all measured points by bearing from the robot base, "
+                        "which can differ from the ray sector because of sensor position. "
+                        "These statistics do not prove clearance. If rear_valid_rays "
                         "is zero the rear is unknown. Missing returns and nulls are unknown. "
                         "The local controller checks obstacles independently."
                     ),

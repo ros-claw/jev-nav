@@ -228,11 +228,20 @@ def summarize_forward_view(ranges, angle_min, angle_increment, range_min, range_
         _finite(value) for value in (angle_min, angle_increment, range_min, range_max, tx, ty, yaw)
     ) or not (0 < range_min < range_max <= 100 and angle_increment != 0 and 1 <= len(ranges) <= 10000):
         raise ValueError("invalid laser scan")
+    bounds = {
+        "right": (-math.pi / 2, -math.pi / 6),
+        "center": (-math.pi / 6, math.pi / 6),
+        "left": (math.pi / 6, math.pi / 2),
+    }
     sectors = {
         name: {"total_rays": 0, "valid_rays": 0, "nearest_to_base_m": None,
-               "max_missing_gap_rad": 0.0, "_missing": 0}
-        for name in ("right", "center", "left")
+               "nearest_bearing_from_base_rad": None, "observed_angle_min_rad": None,
+               "observed_angle_max_rad": None, "max_invalid_return_run_rad": 0.0,
+               "_missing": 0, "_valid_angles": []}
+        for name in bounds
     }
+    base_hits = {name: {"nearest_m": None, "bearing_rad": None}
+                 for name in ("right", "center", "left", "other")}
     rear_total = 0
     rear_valid = 0
     rear_nearest = None
@@ -248,34 +257,65 @@ def summarize_forward_view(ranges, angle_min, angle_increment, range_min, range_
         else:
             name = None
         valid = _finite(distance) and range_min <= distance <= range_max
+        if valid:
+            x, y = tx + distance * math.cos(angle), ty + distance * math.sin(angle)
+            measured = math.hypot(x, y)
+            bearing = math.atan2(y, x) if measured > 1e-9 else None
+            if bearing is None:
+                base_name = "other"
+            elif -math.pi / 2 <= bearing < -math.pi / 6:
+                base_name = "right"
+            elif -math.pi / 6 <= bearing <= math.pi / 6:
+                base_name = "center"
+            elif math.pi / 6 < bearing <= math.pi / 2:
+                base_name = "left"
+            else:
+                base_name = "other"
+            hit = base_hits[base_name]
+            if hit["nearest_m"] is None or measured < hit["nearest_m"]:
+                hit["nearest_m"] = measured
+                hit["bearing_rad"] = bearing
         if name is None:
             if abs(angle) >= 2.1:
                 rear_total += 1
                 if valid:
-                    measured = math.hypot(tx + distance * math.cos(angle), ty + distance * math.sin(angle))
                     rear_nearest = measured if rear_nearest is None else min(rear_nearest, measured)
                     rear_valid += 1
             continue
         sector = sectors[name]
         sector["total_rays"] += 1
+        low, high = sector["observed_angle_min_rad"], sector["observed_angle_max_rad"]
+        sector["observed_angle_min_rad"] = angle if low is None else min(low, angle)
+        sector["observed_angle_max_rad"] = angle if high is None else max(high, angle)
         if valid:
-            measured = math.hypot(tx + distance * math.cos(angle), ty + distance * math.sin(angle))
             nearest = sector["nearest_to_base_m"]
-            sector["nearest_to_base_m"] = measured if nearest is None else min(nearest, measured)
+            if nearest is None or measured < nearest:
+                sector["nearest_to_base_m"] = measured
+                sector["nearest_bearing_from_base_rad"] = bearing
             sector["valid_rays"] += 1
+            sector["_valid_angles"].append(angle)
             sector["_missing"] = 0
         else:
             sector["_missing"] += 1
-            sector["max_missing_gap_rad"] = max(
-                sector["max_missing_gap_rad"], sector["_missing"] * abs(angle_increment)
+            sector["max_invalid_return_run_rad"] = max(
+                sector["max_invalid_return_run_rad"], sector["_missing"] * abs(angle_increment)
             )
-    for sector in sectors.values():
+    for name, sector in sectors.items():
         del sector["_missing"]
+        angles = sorted(sector.pop("_valid_angles"))
+        low, high = bounds[name]
+        if angles:
+            gaps = [angles[0] - low, high - angles[-1]]
+            gaps.extend(angles[index] - angles[index - 1] for index in range(1, len(angles)))
+            sector["max_unobserved_angle_rad"] = max(gaps)
+        else:
+            sector["max_unobserved_angle_rad"] = high - low
         if not sector["total_rays"]:
-            sector["max_missing_gap_rad"] = None
+            sector["max_invalid_return_run_rad"] = None
     sectors["rear_total_rays"] = rear_total
     sectors["rear_valid_rays"] = rear_valid
     sectors["rear_nearest_to_base_m"] = rear_nearest
+    sectors["base_hits"] = base_hits
     return sectors
 
 

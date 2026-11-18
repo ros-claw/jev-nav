@@ -69,7 +69,7 @@ def test_forward_only_lidar_reports_front_directions_and_unknown_rear():
     )
     assert view["right"]["nearest_to_base_m"] == pytest.approx(0.4)
     assert view["left"]["nearest_to_base_m"] == pytest.approx(2.0)
-    assert view["center"]["max_missing_gap_rad"] == pytest.approx(5 * math.pi / 180)
+    assert view["center"]["max_invalid_return_run_rad"] == pytest.approx(5 * math.pi / 180)
     assert view["rear_total_rays"] == 0
     assert view["rear_valid_rays"] == 0
     assert view["rear_nearest_to_base_m"] is None
@@ -78,11 +78,27 @@ def test_forward_only_lidar_reports_front_directions_and_unknown_rear():
 def test_forward_view_distinguishes_missing_coverage_from_invalid_returns():
     partial = worker.summarize_forward_view([2.0] * 81, -0.4, 0.01, 0.1, 12.0, 0, 0, 0)
     assert partial["left"]["total_rays"] == 0
-    assert partial["left"]["max_missing_gap_rad"] is None
+    assert partial["left"]["max_invalid_return_run_rad"] is None
     full = worker.summarize_forward_view([0.0] * 360, -math.pi, math.pi / 180, 0.1, 12.0, 0, 0, 0)
     assert full["rear_total_rays"] > 0
     assert full["rear_valid_rays"] == 0
     assert full["rear_nearest_to_base_m"] is None
+
+
+def test_forward_view_exposes_unscanned_edges_and_base_relative_hit_bearing():
+    single = worker.summarize_forward_view([2.0], 0, 0.01, 0.1, 12.0, 0, 0, 0)
+    assert single["center"]["observed_angle_min_rad"] == 0
+    assert single["center"]["observed_angle_max_rad"] == 0
+    assert single["center"]["max_unobserved_angle_rad"] >= math.pi / 6
+    shifted = worker.summarize_forward_view([0.2], -0.7, 0.01, 0.1, 12.0, 0.1, 0, 0)
+    assert shifted["right"]["nearest_bearing_from_base_rad"] == pytest.approx(-0.473, abs=0.01)
+
+
+def test_forward_view_preserves_nearest_obstacle_for_each_base_direction():
+    view = worker.summarize_forward_view([0.09, 0.12], -1.2, 0.5, 0.05, 12.0, 0.1, 0, 0)
+    assert view["right"]["valid_rays"] == 2
+    assert view["base_hits"]["right"]["nearest_m"] == pytest.approx(0.1569, abs=0.001)
+    assert view["base_hits"]["center"]["nearest_m"] == pytest.approx(0.2067, abs=0.001)
 
 
 def test_depth_frame_and_camera_info_must_match():
