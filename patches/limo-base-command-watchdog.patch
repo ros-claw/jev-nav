@@ -252,7 +252,7 @@
              break;
          }
          case MODE_ACKERMANN: {
-@@ -380,17 +444,53 @@
+@@ -380,17 +444,54 @@
                  steering_angle = inner_angle / right_angle_scale_;
              }
  
@@ -297,12 +297,13 @@
 +void LimoDriver::publishCommandWatchdogStatus(double now) {
 +    const uint8_t mode = commandWatchdogModeFresh(now) ? motion_mode_.load() : MODE_UNKNOWN;
 +    std_msgs::String status;
-+    status.data = "v1 " + command_watchdog_boot_id_ + " " +
++    status.data = "v2 " + command_watchdog_boot_id_ + " " +
 +                  std::to_string(command_watchdog_->zero_writes()) + " " +
 +                  std::to_string(static_cast<unsigned int>(mode)) + " " +
 +                  (command_watchdog_->primed() ? "1" : "0") + " " +
 +                  (command_watchdog_->is_latched() ? "1" : "0") + " " +
 +                  (command_watchdog_->zero_source().empty() ? "none" : command_watchdog_->zero_source()) + " " +
++                  std::to_string(command_watchdog_->last_zero_write_at()) + " " +
 +                  std::to_string(now);
 +    command_watchdog_status_publisher_.publish(status);
  }
@@ -344,7 +345,7 @@
      <include file="$(find ydlidar_ros)/launch/X2L.launch" />
 --- /dev/null
 +++ b/limo_base/include/limo_command_watchdog.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,115 @@
 +#ifndef ROSCLAW_LIMO_COMMAND_WATCHDOG_H
 +#define ROSCLAW_LIMO_COMMAND_WATCHDOG_H
 +
@@ -362,7 +363,7 @@
 +  explicit LimoCommandWatchdog(double timeout_seconds)
 +      : timeout_(timeout_seconds), last_(0.0), seen_(false), active_(false),
 +        primed_(false), pending_(false), pending_zero_(false), prior_deadline_(0.0),
-+        prior_active_(false), latched_(false), zero_writes_(0) {
++        prior_active_(false), latched_(false), zero_writes_(0), last_zero_write_at_(0.0) {
 +    if (!std::isfinite(timeout_) || timeout_ < 0.1 || timeout_ > 1.0) {
 +      throw std::invalid_argument("command timeout must be between 0.1 and 1.0 seconds");
 +    }
@@ -401,6 +402,7 @@
 +        latched_ = true;
 +      } else {
 +        ++zero_writes_;
++        last_zero_write_at_ = now;
 +        active_ = false;
 +        primed_ = true;
 +      }
@@ -419,6 +421,7 @@
 +  bool is_latched() const { return latched_; }
 +  bool primed() const { return primed_; }
 +  std::uint64_t zero_writes() const { return zero_writes_; }
++  double last_zero_write_at() const { return last_zero_write_at_; }
 +  const std::string& zero_source() const { return zero_source_; }
 +
 +  bool accept_source(const std::string& source, bool zero) {
@@ -453,6 +456,7 @@
 +  bool prior_active_;
 +  bool latched_;
 +  std::uint64_t zero_writes_;
++  double last_zero_write_at_;
 +  std::string zero_source_;
 +};
 +

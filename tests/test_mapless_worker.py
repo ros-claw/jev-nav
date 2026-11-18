@@ -1,5 +1,7 @@
 import importlib.util
+import io
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -186,6 +188,75 @@ def test_model_direction_is_rejected_after_large_pose_change():
     assert worker.decision_pose_current((0.0, 0.0, 0.0), (0.05, 0.0, 0.1))
     assert not worker.decision_pose_current((0.0, 0.0, 0.0), (0.2, 0.0, 0.0))
     assert not worker.decision_pose_current((0.0, 0.0, 0.0), (0.0, 0.0, 1.25))
+    assert not worker.decision_pose_current((0.0, 0.0, 0.0), (0.14, 0.0, 0.0), 0.02, 0.0)
+    assert not worker.decision_pose_current((0.0, 0.0, 0.0), (0.0, 0.0, 0.34), 0.0, 0.02)
+
+
+def test_camera_odometry_misalignment_is_bounded_and_charged_to_pose_budget():
+    assert worker.pose_alignment_uncertainty(100.0, 100.08) == pytest.approx((0.016, 0.048))
+    assert worker.pose_alignment_uncertainty(100.0, 100.75) is None
+    assert worker.pose_alignment_uncertainty(float("nan"), 100.0) is None
+
+
+def test_delayed_model_decision_retains_original_anchor_and_requires_fresh_sample():
+    captured = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.02, 0.02)}
+    sample = {"pose": (0.1, 0.0, 0.05), "scan_at": 12.0, "odom_at": 12.0}
+
+    def fresh(observation, now):
+        return now - observation["scan_at"] <= 0.1
+
+    anchor = worker.validated_decision_anchor(captured, sample, 12.0, fresh)
+    assert anchor == ((0.0, 0.0, 0.0), 0.02, 0.02)
+    assert not worker.decision_pose_current(anchor[0], (0.14, 0.0, 0.0), anchor[1], anchor[2])
+    assert worker.validated_decision_anchor(captured, sample, 12.2, fresh) is None
+    sample["pose"] = (0.2, 0.0, 0.0)
+    assert worker.validated_decision_anchor(captured, sample, 12.0, fresh) is None
+
+
+def test_full_relay_pipe_fails_fast_instead_of_blocking_control():
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(write_fd, "wb", buffering=0)
+    try:
+        writer = worker.NonblockingPipeWriter(stream)
+        with pytest.raises(OSError):
+            while True:
+                writer.write(b"x" * 512)
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            writer.write(b"stop\n")
+        assert time.monotonic() - started < 0.5
+    finally:
+        stream.close()
+        os.close(read_fd)
+
+
+def test_exited_relay_reports_its_stop_reason():
+    from types import SimpleNamespace
+
+    relay = SimpleNamespace(poll=lambda: 0, stdout=io.BytesIO(b"MOTION_ACK 3\nSTOP_LATCHED\n"))
+    assert worker.relay_exit_reason(relay) == "relay_stop_latched"
+    relay = SimpleNamespace(poll=lambda: None, stdout=io.BytesIO(b""))
+    assert worker.relay_exit_reason(relay) is None
+
+
+def test_closed_relay_writer_never_writes_to_a_reused_file_descriptor():
+    read_a, write_a = os.pipe()
+    read_b, write_b = os.pipe()
+    stream = os.fdopen(write_a, "wb", buffering=0)
+    writer = worker.NonblockingPipeWriter(stream)
+    try:
+        writer.close()
+        os.dup2(write_b, write_a)
+        with pytest.raises((OSError, ValueError)):
+            writer.write(b"stop\n")
+        os.set_blocking(read_b, False)
+        with pytest.raises(BlockingIOError):
+            os.read(read_b, 100)
+    finally:
+        os.close(write_a)
+        os.close(write_b)
+        os.close(read_a)
+        os.close(read_b)
 
 
 def test_hung_decision_process_is_terminated_after_its_total_deadline():

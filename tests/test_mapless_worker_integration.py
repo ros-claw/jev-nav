@@ -23,6 +23,261 @@ def load(name):
     return module
 
 
+def test_delayed_decisions_keep_simulated_forward_motion_until_obstacle():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=0.0, deadline=16.0)
+    position = 0.0
+    active_anchor = None
+    request_sample = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0)}
+    request_stamp = 0.0
+    response_at = 2.23
+    accepted = 0
+    frames = []
+
+    for step in range(300):
+        now = step * 0.05
+        blocked = 10.0 <= now < 10.3
+        sample = {
+            "pose": (position, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0),
+            "scan_at": now, "status_at": now, "odom_at": now, "depth_at": now,
+            "front": 0.3 if blocked else 3.0, "left": 2.0, "right": 2.0, "rear": 2.0,
+            "depth_min": 1.0, "depth_valid_ratio": 0.2,
+            "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+            "linear_x_mps": 0.0, "angular_z_radps": 0.0,
+        }
+        if now >= response_at:
+            accepted_response, anchor = worker.apply_revalidated_decision(
+                controller, "forward", request_stamp, request_sample, sample, now
+            )
+            assert accepted_response and anchor is not None
+            active_anchor = anchor
+            accepted += 1
+            request_sample, request_stamp = sample, now
+            response_at = now + 2.23
+        current = sample if (active_anchor is not None and worker.decision_pose_current(
+            active_anchor[0], sample["pose"], active_anchor[1], active_anchor[2])) else None
+        linear, angular = controller.tick(current, now)
+        position += linear * 0.05
+        frames.append((now, linear, angular))
+
+    assert accepted >= 5
+    assert all(linear > 0 and angular == 0 for now, linear, angular in frames if 3.0 <= now < 10.0)
+    assert all(linear == 0 and angular == 0 for now, linear, angular in frames if 10.0 <= now < 10.3)
+    assert all(linear > 0 for now, linear, _ in frames if 10.5 <= now < 14.5)
+
+
+def test_stop_decision_is_honored_without_a_fresh_sensor_sample():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    accepted, anchor = worker.apply_revalidated_decision(
+        controller, "stop", 10.1, {}, None, 10.2
+    )
+    assert accepted and anchor is None and controller.choice == "stop"
+
+
+def test_stop_is_honored_even_when_sensor_minimum_timestamp_repeats():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    accepted, _ = worker.apply_revalidated_decision(controller, "stop", 10.0, {}, None, 10.2)
+    assert accepted and controller.choice == "stop"
+
+
+def test_model_stop_immediately_writes_a_sequenced_zero_frame():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    decision = {"count": 1, "pose": None, "expired": False}
+    sequence = {"next": 5}
+    pipe = io.BytesIO()
+    assert worker.accept_and_dispatch_decision(
+        controller, decision, "stop", 10.0, {}, None, pipe, sequence,
+        threading.Lock(), lambda: 10.2
+    )
+    frame = json.loads(pipe.getvalue())
+    assert frame == {"sequence": 5, "stamp": 10.2, "linear": 0.0, "angular": 0.0}
+    assert sequence["next"] == 6 and decision["count"] == 2
+
+
+def test_failed_stop_write_signals_a_fatal_control_pipe_failure():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    decision = {"count": 1, "pose": None, "expired": False}
+    failed = threading.Event()
+
+    class FullPipe:
+        def write(self, payload):
+            raise BlockingIOError("full")
+
+    with pytest.raises(OSError):
+        worker.accept_and_dispatch_decision(
+            controller, decision, "stop", 10.0, {}, None, FullPipe(), {"next": 5},
+            threading.Lock(), lambda: 10.2, on_write_failure=failed.set
+        )
+    assert failed.is_set()
+
+
+def test_budget_stop_immediately_writes_zero_even_when_model_chose_forward():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    controller.linear = 0.1
+    observed = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0)}
+    current = {
+        "pose": (0.13, 0.0, 0.0), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.1, "angular_z_radps": 0.0,
+    }
+    pipe, sequence = io.BytesIO(), {"next": 5}
+    decision = {"count": 1, "pose": None, "expired": False}
+    assert worker.accept_and_dispatch_decision(
+        controller, decision, "forward", 10.1, observed, current, pipe, sequence,
+        threading.Lock(), lambda: 10.2
+    )
+    assert json.loads(pipe.getvalue())["linear"] == 0.0
+    assert controller.choice == "stop"
+
+
+def test_pose_distance_already_used_reduces_the_remaining_motion_budget():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    observed = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0)}
+    current = {
+        "pose": (0.14, 0.0, 0.0), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.0, "angular_z_radps": 0.0,
+    }
+    accepted, _ = worker.apply_revalidated_decision(
+        controller, "forward", 10.0, observed, current, 10.2
+    )
+    assert accepted
+    assert controller.tick(current, 10.2) == (0.0, 0.0)
+
+
+def test_exhausted_pose_budget_requests_zero_without_a_deceleration_ramp():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    controller.linear = 0.1
+    observed = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0)}
+    current = {
+        "pose": (0.13, 0.0, 0.0), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.1, "angular_z_radps": 0.0,
+    }
+    accepted, _ = worker.apply_revalidated_decision(
+        controller, "forward", 10.1, observed, current, 10.2
+    )
+    assert accepted
+    assert controller.tick(current, 10.25) == (0.0, 0.0)
+
+
+def test_exhausted_turn_budget_does_not_turn_a_left_choice_into_forward_motion():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    observed = {"pose": (0.0, 0.0, 0.0), "pose_uncertainty": (0.0, 0.0)}
+    current = {
+        "pose": (0.0, 0.0, 0.31), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.0, "angular_z_radps": 0.0,
+    }
+    accepted, _ = worker.apply_revalidated_decision(controller, "left", 10.0, observed, current, 10.2)
+    assert accepted
+    assert controller.tick(current, 10.25) == (0.0, 0.0)
+
+
+def test_new_decision_cannot_use_a_sample_taken_before_it_was_accepted():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    decision = {"count": 2, "pose": ((0.0, 0.0, 0.0), 0.0, 0.0), "expired": False}
+    sample = {
+        "pose": (0.0, 0.0, 0.0), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.0, "angular_z_radps": 0.0,
+    }
+    pipe = io.BytesIO()
+    linear, angular = worker.send_control_frame(
+        controller, decision, sample, 10.2, {"next": 1}, pipe, threading.Lock(), 8.0,
+        sampled_generation=1
+    )
+    assert (linear, angular) == (None, None)
+    assert pipe.getvalue() == b""
+
+
+def test_stop_acceptance_cannot_overtake_a_pending_control_frame():
+    worker = load("limo_mapless_worker")
+    controller_module = load("limo_mapless_controller")
+    controller = controller_module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    decision = {"count": 1, "pose": ((0.0, 0.0, 0.0), 0.0, 0.0), "expired": False}
+    sample = {
+        "pose": (0.0, 0.0, 0.0), "odom_at": 10.2, "scan_at": 10.2,
+        "status_at": 10.2, "depth_at": 10.2, "front": 3.0, "left": 2.0,
+        "right": 2.0, "rear": 2.0, "depth_min": 1.0, "depth_valid_ratio": 0.2,
+        "error_code": 0, "motion_mode": 0, "battery_voltage": 12.0,
+        "linear_x_mps": 0.0, "angular_z_radps": 0.0,
+    }
+    started, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    lock = threading.Lock()
+
+    class Pipe(io.BytesIO):
+        def write(self, payload):
+            started.set()
+            assert release.wait(2.0)
+            return super().write(payload)
+
+    pipe = Pipe()
+    sequence = {"next": 1}
+    sender = threading.Thread(target=worker.send_control_frame,
+                              args=(controller, decision, sample, 10.2, sequence, pipe, lock, 8.0, 1))
+
+    def stop():
+        assert worker.accept_and_dispatch_decision(
+            controller, decision, "stop", 10.1, {}, None, pipe, sequence, lock, lambda: 10.2
+        )
+        stopped.set()
+
+    sender.start()
+    assert started.wait(2.0)
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    assert not stopped.wait(0.05)
+    release.set()
+    sender.join(timeout=2.0)
+    stopper.join(timeout=2.0)
+    assert stopped.is_set()
+    frames = [json.loads(line) for line in pipe.getvalue().splitlines()]
+    assert [item["sequence"] for item in frames] == [1, 2]
+    assert frames[0]["linear"] == pytest.approx(0.06) and frames[1]["linear"] == 0.0
+    pipe.seek(0)
+    pipe.truncate()
+    worker.send_control_frame(controller, decision, sample, 10.25, sequence, pipe, lock, 8.0, 2)
+    assert json.loads(pipe.getvalue())["linear"] == 0.0
+
+
 @pytest.mark.parametrize(
     "matching_depth,decisions_continue", [(True, True), (False, True), (True, False)]
 )
@@ -225,6 +480,7 @@ def test_continuous_worker_wiring_with_synthetic_ros(
         ),
     )
     monkeypatch.setattr(worker, "subprocess", SimpleNamespace(Popen=popen, PIPE=-1))
+    monkeypatch.setattr(worker, "NonblockingPipeWriter", lambda stream: stream)
 
     def decision_response(command, evidence, **kwargs):
         decision_calls.append(evidence)

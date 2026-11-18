@@ -7,6 +7,7 @@ dedicated velocity relay. Physical sensing and stop behavior remain unverified.
 """
 
 import base64
+import fcntl
 import json
 import math
 import os
@@ -30,6 +31,33 @@ NUMBER_TYPES = INTEGER_TYPES + (float,)
 
 PROTOCOL = "rosclaw.limo.worker.v1"
 _cancel = False
+
+
+class NonblockingPipeWriter(object):  # noqa: UP004 - Python 2 ROS worker
+    """A full relay pipe must fail instead of holding the controller lock."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.closed = False
+        self.fd = stream.fileno()
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def write(self, payload):
+        if self.closed:
+            raise ValueError("control pipe is closed")
+        if len(payload) > 512:
+            raise ValueError("control frame too large")
+        written = os.write(self.fd, payload)
+        if written != len(payload):
+            raise IOError("short control pipe write")
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+        self.stream.close()
 
 
 def _finite(value):
@@ -346,12 +374,126 @@ class MotionEvidence(object):  # noqa: UP004 - Python 2 ROS worker
             self.max_rotation = max(self.max_rotation, rotation)
 
 
-def decision_pose_current(observed_pose, current_pose):
+def pose_alignment_uncertainty(color_stamp, odom_stamp):
+    if not _finite(color_stamp) or not _finite(odom_stamp):
+        return None
+    gap = abs(color_stamp - odom_stamp)
+    if gap > 0.1:
+        return None
+    # These bounds match the candidate controller's allowed speeds. They are
+    # assumptions for simulation, not physically verified velocity bounds.
+    return (0.2 * gap, 0.6 * gap)
+
+
+def decision_pose_current(observed_pose, current_pose, position_error=0.0, yaw_error=0.0):
     try:
+        if (not _finite(position_error) or not _finite(yaw_error)
+                or position_error < 0 or yaw_error < 0):
+            return False
         translation, rotation = motion_delta(observed_pose, current_pose)
-        return translation <= 0.15 and rotation <= 0.35
+        return translation + position_error <= 0.15 and rotation + yaw_error <= 0.35
     except (ValueError, TypeError):
         return False
+
+
+def decision_anchor_current(anchor, current_sample, now):
+    try:
+        age = now - current_sample["odom_at"]
+        if not _finite(age) or not 0 <= age <= 0.5:
+            return False
+        return decision_pose_current(anchor[0], current_sample["pose"],
+                                     anchor[1] + 0.2 * age, anchor[2] + 0.6 * age)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def validated_decision_anchor(observed_sample, current_sample, now, fresh):
+    """Check a delayed decision, retaining its original observation pose."""
+    try:
+        error = observed_sample["pose_uncertainty"]
+        anchor = (tuple(observed_sample["pose"]), error[0], error[1])
+        if (not isinstance(current_sample, dict) or not fresh(current_sample, now)
+                or not decision_anchor_current(anchor, current_sample, now)):
+            return None
+        return anchor
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def apply_revalidated_decision(controller, choice, observed_at, observed_sample, current_sample, now):
+    """Accept a fresh bounded preference; stop does not require sensor data."""
+    if choice == "stop":
+        return controller.accept_stop(observed_at, now), None
+    anchor = validated_decision_anchor(observed_sample, current_sample, now, controller._fresh)
+    if anchor is None:
+        return False, None
+    translation, rotation = motion_delta(anchor[0], current_sample["pose"])
+    age = now - current_sample["odom_at"]
+    translation_budget = max(0.0, min(0.12, 0.15 - translation - anchor[1] - 0.2 * age - 0.02))
+    rotation_budget = max(0.0, min(0.28, 0.35 - rotation - anchor[2] - 0.6 * age - 0.04))
+    if not controller.set_decision(choice, observed_at, now, translation_budget, rotation_budget,
+                                   current_sample["linear_x_mps"], current_sample["angular_z_radps"]):
+        return False, None
+    return True, anchor
+
+
+def _write_next_frame(stream, sequence, now, linear, angular):
+    frame = {"sequence": sequence["next"], "stamp": now, "linear": linear, "angular": angular}
+    sequence["next"] += 1
+    stream.write((json.dumps(frame, allow_nan=False) + "\n").encode("utf-8"))
+    stream.flush()
+
+
+def accept_and_dispatch_decision(controller, decision, choice, observed_at, observed_sample,
+                                 current_sample, stream, sequence, lock, clock, cancelled=None,
+                                 on_write_failure=None):
+    with lock:
+        if cancelled is not None and cancelled():
+            return False
+        now = clock()
+        accepted, anchor = apply_revalidated_decision(
+            controller, choice, observed_at, observed_sample, current_sample, now
+        )
+        if accepted:
+            decision["count"] += 1
+            decision["pose"] = anchor
+            if controller.choice == "stop":
+                try:
+                    _write_next_frame(stream, sequence, now, 0.0, 0.0)
+                except (IOError, OSError):
+                    if on_write_failure is not None:
+                        on_write_failure()
+                    raise
+        return accepted
+
+
+def send_control_frame(controller, decision, sample, now, sequence, stream, lock, ttl,
+                       sampled_generation, clock=None):
+    """Serialize decision acceptance with frame calculation and publication."""
+    with lock:
+        if clock is not None:
+            now = clock()
+        if decision["count"] and now >= controller.observed_at + ttl:
+            decision["expired"] = True
+        if sampled_generation != decision["count"]:
+            return None, None
+        anchor = decision["pose"]
+        if sample is not None and anchor is not None and not decision_anchor_current(anchor, sample, now):
+            sample = None
+        linear, angular = controller.tick(sample, now)
+        _write_next_frame(stream, sequence, now, linear, angular)
+        return linear, angular
+
+
+def relay_exit_reason(relay):
+    if relay.poll() is None:
+        return None
+    remaining = relay.stdout.read(1024)
+    if b"ZERO_TIMEOUT" in remaining:
+        return "relay_zero_timeout"
+    if b"STOP_LATCHED" in remaining:
+        return "relay_stop_latched"
+    return "controller_parent_or_relay_lost"
 
 
 def run_decision_process(command, evidence, cancelled, clock, timeout=6.0):
@@ -426,6 +568,7 @@ def execute(request):
     records = {}
     decision = {"running": False, "count": 0, "pose": None, "expired": False}
     decision_shutdown = threading.Event()
+    control_pipe_failed = threading.Event()
     decision_thread = None
 
     def callback(message, name):
@@ -461,8 +604,10 @@ def execute(request):
         stderr=None,
         close_fds=True,
     )
+    relay_writer = NonblockingPipeWriter(relay.stdin)
     commanded = False
     relay_acknowledged = False
+    sequence_state = {"next": 0}
     acknowledged_at = None
     saw_observation = False
     reason = "duration_elapsed"
@@ -494,6 +639,9 @@ def execute(request):
         source_stamps = {name: message.header.stamp.to_sec() for name, message in
                          (("scan", scan), ("odom", odom), ("status", status), ("depth", depth), ("color", color))}
         if not sensor_stamps_current(source_stamps, ros_now):
+            return None
+        pose_uncertainty = pose_alignment_uncertainty(source_stamps["color"], source_stamps["odom"])
+        if pose_uncertainty is None:
             return None
         scan_at = min(scan_at, mono_now - (ros_now - source_stamps["scan"]))
         odom_at = min(odom_at, mono_now - (ros_now - source_stamps["odom"]))
@@ -552,6 +700,7 @@ def execute(request):
                 "linear_x_mps": float(odom.twist.twist.linear.x),
                 "angular_z_radps": float(odom.twist.twist.angular.z),
                 "pose": (float(pose.position.x), float(pose.position.y), odom_yaw),
+                "pose_uncertainty": pose_uncertainty,
                 "color": color,
                 "color_at": color_at,
             }
@@ -592,30 +741,13 @@ def execute(request):
             )
             if (isinstance(response, dict) and not decision_shutdown.is_set()
                     and response.get("ok") is True and response.get("captured_at") == captured):
-                with lock:
-                    latest = records.get("odom")
-                if latest is None:
-                    return
-                latest_odom, latest_at = latest
-                now = _monotonic()
-                ros_now = rospy.Time.now().to_sec()
-                if (not 0 <= now - latest_at <= 0.5
-                        or not 0 <= ros_now - latest_odom.header.stamp.to_sec() <= 0.5
-                        or latest_odom.header.frame_id.lstrip("/") != "odom"
-                        or latest_odom.child_frame_id.lstrip("/") != "base_link"):
-                    return
-                pose = latest_odom.pose.pose
-                q = pose.orientation
-                yaw = tf.transformations.euler_from_quaternion((q.x, q.y, q.z, q.w))[2]
-                current_pose = (float(pose.position.x), float(pose.position.y), yaw)
-                if not decision_pose_current(sample["pose"], current_pose):
-                    return
-                with controller_lock:
-                    if controller.set_decision(
-                        response.get("choice"), response.get("captured_at"), _monotonic()
-                    ):
-                        decision["count"] += 1
-                        decision["pose"] = sample["pose"]
+                choice = response.get("choice")
+                latest = snapshot() if choice != "stop" else None
+                accept_and_dispatch_decision(
+                    controller, decision, choice, captured, sample, latest, relay_writer,
+                    sequence_state, controller_lock, _monotonic, decision_shutdown.is_set,
+                    control_pipe_failed.set
+                )
         except Exception:  # noqa: BLE001 - network/model errors leave the old decision to expire
             pass
         finally:
@@ -626,13 +758,21 @@ def execute(request):
         readable, _, _ = select.select([relay.stdout], [], [], 5.0)
         if not readable or relay.stdout.readline().strip() != b"READY":
             raise ValueError("velocity relay did not become ready")
-        sequence = 0
         next_query = started
         while not _cancel and not rospy.is_shutdown() and _monotonic() < controller.deadline:
             now = _monotonic()
-            if os.getppid() != parent_pid or relay.poll() is not None:
+            if control_pipe_failed.is_set():
+                reason = "control_pipe_write_failed"
+                break
+            if os.getppid() != parent_pid:
                 reason = "controller_parent_or_relay_lost"
                 break
+            relay_reason = relay_exit_reason(relay)
+            if relay_reason is not None:
+                reason = relay_reason
+                break
+            with controller_lock:
+                sampled_generation = decision["count"]
             sample = snapshot()
             now = _monotonic()
             if sample is not None:
@@ -642,29 +782,36 @@ def execute(request):
                         movement.acknowledge(sample["pose"])
                 else:
                     movement.observe(sample["pose"])
-            with controller_lock:
-                if decision["count"] and now >= controller.observed_at + DECISION_TTL:
-                    decision["expired"] = True
-                current_sample = sample
-                if sample is not None and decision["pose"] is not None and not decision_pose_current(decision["pose"], sample["pose"]):
-                    current_sample = None
-                linear, angular = controller.tick(current_sample, now)
-            frame = {"sequence": sequence, "stamp": now, "linear": linear, "angular": angular}
-            relay.stdin.write((json.dumps(frame, allow_nan=False) + "\n").encode("utf-8"))
-            relay.stdin.flush()
+            try:
+                linear, angular = send_control_frame(
+                    controller, decision, sample, now, sequence_state, relay_writer, controller_lock,
+                    DECISION_TTL, sampled_generation, clock=_monotonic
+                )
+            except (IOError, OSError):
+                control_pipe_failed.set()
+                reason = relay_exit_reason(relay) or "control_pipe_write_failed"
+                break
+            if linear is None:
+                continue
+            sequence = sequence_state["next"] - 1
             if linear or angular:
                 commanded = True
             if not relay_acknowledged:
                 readable, _, _ = select.select([relay.stdout], [], [], 0.0)
                 if readable:
                     acknowledgement = relay.stdout.readline().strip()
+                    if acknowledgement == b"ZERO_TIMEOUT":
+                        reason = "relay_zero_timeout"
+                        break
+                    if acknowledgement == b"STOP_LATCHED":
+                        reason = "relay_stop_latched"
+                        break
                     match = re.match(br"^MOTION_ACK ([0-9]+)$", acknowledgement)
                     if not match or int(match.group(1)) > sequence or not commanded:
                         reason = "invalid_relay_acknowledgement"
                         break
                     relay_acknowledged = True
                     acknowledged_at = _monotonic()
-            sequence += 1
             if sample is not None and now >= next_query:
                 with lock:
                     launch = not decision["running"]
@@ -684,10 +831,11 @@ def execute(request):
         decision_shutdown.set()
         stop_requested_at = _monotonic()
         stop_requested_ros = rospy.Time.now().to_sec()
-        try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
-            relay.stdin.close()
-        except (IOError, OSError):
-            pass
+        with controller_lock:
+            try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
+                relay_writer.close()
+            except (IOError, OSError):
+                pass
         deadline = _monotonic() + 2.0
         while relay.poll() is None and _monotonic() < deadline:
             time.sleep(0.05)

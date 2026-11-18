@@ -49,9 +49,14 @@ acknowledgement or proof of physical stopping.
 The candidate relay sends zero until a stable ROS subscriber connection and a
 fresh status from the candidate driver's `/rosclaw_limo/command_watchdog` topic
 show an increased completed-zero-write counter with the relay's ROS caller name.
-The status carries a source monotonic timestamp and must arrive fresh on the
-same host. The relay stops on stale or
-latched status, a reported mode change, a driver restart, or loss of its ROS
+The status carries a source monotonic timestamp and the last completed
+zero-write time. Before the first motion, a zero frame starts a bounded wait
+for a later zero write. Because ROS `Twist` cannot correlate a particular
+zero frame to the driver write and earlier commands may remain queued, any
+zero after published motion latches and ends the relay; it never publishes a
+later nonzero frame in that relay process. Automatic in-task resumption after
+an obstacle or stale observation is therefore not yet implemented. The
+relay also stops on stale or latched status, a reported mode change, a driver restart, or loss of its ROS
 subscriber. The caller name is ROS 1 connection metadata, not an authenticated
 identity: other nodes can impersonate it or the status, or inject commands.
 Source arbitration is still required before live use. A completed serial write

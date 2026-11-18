@@ -13,8 +13,10 @@ int main() {
   assert(!gate.accept(0.1, 0.0, 0.0, 10.0));
   assert(gate.accept(0.0, 0.0, 0.0, 10.0));
   gate.record_write(true, 10.0);
+  assert(gate.last_zero_write_at() == 10.0);
   assert(gate.accept(0.1, 0.0, 0.0, 10.01));
   gate.record_write(true, 10.01);
+  assert(gate.last_zero_write_at() == 10.0);
   assert(!gate.should_stop(10.30));
   assert(gate.should_stop(10.32));
   assert(gate.is_latched());

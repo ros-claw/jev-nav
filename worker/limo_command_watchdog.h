@@ -15,7 +15,7 @@ class LimoCommandWatchdog {
   explicit LimoCommandWatchdog(double timeout_seconds)
       : timeout_(timeout_seconds), last_(0.0), seen_(false), active_(false),
         primed_(false), pending_(false), pending_zero_(false), prior_deadline_(0.0),
-        prior_active_(false), latched_(false), zero_writes_(0) {
+        prior_active_(false), latched_(false), zero_writes_(0), last_zero_write_at_(0.0) {
     if (!std::isfinite(timeout_) || timeout_ < 0.1 || timeout_ > 1.0) {
       throw std::invalid_argument("command timeout must be between 0.1 and 1.0 seconds");
     }
@@ -54,6 +54,7 @@ class LimoCommandWatchdog {
         latched_ = true;
       } else {
         ++zero_writes_;
+        last_zero_write_at_ = now;
         active_ = false;
         primed_ = true;
       }
@@ -72,6 +73,7 @@ class LimoCommandWatchdog {
   bool is_latched() const { return latched_; }
   bool primed() const { return primed_; }
   std::uint64_t zero_writes() const { return zero_writes_; }
+  double last_zero_write_at() const { return last_zero_write_at_; }
   const std::string& zero_source() const { return zero_source_; }
 
   bool accept_source(const std::string& source, bool zero) {
@@ -106,6 +108,7 @@ class LimoCommandWatchdog {
   bool prior_active_;
   bool latched_;
   std::uint64_t zero_writes_;
+  double last_zero_write_at_;
   std::string zero_source_;
 };
 

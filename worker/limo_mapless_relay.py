@@ -27,6 +27,7 @@ MAX_LINEAR = 0.12
 MAX_ANGULAR = 0.4
 MAX_PENDING_BYTES = 2048
 STATUS_MAX_AGE_SEC = 0.25
+ZERO_ACK_TIMEOUT_SEC = 0.5
 _shutdown = False
 
 
@@ -123,6 +124,7 @@ class DriverStatus(object):  # noqa: UP004 - Python 2 ROS worker
         self.latched = True
         self.received_at = None
         self.generated_at = None
+        self.zero_written_at = None
         self.zero_publisher = None
         self.fault = False
         self.accepted_mode = None
@@ -133,15 +135,18 @@ class DriverStatus(object):  # noqa: UP004 - Python 2 ROS worker
                 if not isinstance(data, str) or len(data) > 256 or not _number(now):
                     raise ValueError("invalid status")
                 fields = data.split()
-                if len(fields) != 8 or fields[0] != "v1" or not fields[1]:
+                if len(fields) != 9 or fields[0] != "v2" or not fields[1]:
                     raise ValueError("invalid status")
                 if not all(field.isdigit() for field in fields[2:6]):
                     raise ValueError("invalid status")
                 count, mode, primed, latched = [int(value) for value in fields[2:6]]
-                generated_at = float(fields[7])
+                zero_written_at, generated_at = float(fields[7]), float(fields[8])
                 if (not _number(generated_at) or not 0 <= now - generated_at <= STATUS_MAX_AGE_SEC
                         or (self.generated_at is not None and generated_at < self.generated_at)):
                     raise ValueError("stale or reordered driver status")
+                if (not _number(zero_written_at) or not 0 <= zero_written_at <= generated_at
+                        or (self.zero_written_at is not None and zero_written_at < self.zero_written_at)):
+                    raise ValueError("invalid zero-write timestamp")
                 if count > 18446744073709551615 or mode > 255 or primed > 1 or latched > 1:
                     raise ValueError("invalid status")
                 if self.received_at is not None and now < self.received_at:
@@ -162,23 +167,66 @@ class DriverStatus(object):  # noqa: UP004 - Python 2 ROS worker
                 self.latched = latched == 1
                 self.received_at = float(now)
                 self.generated_at = generated_at
+                self.zero_written_at = zero_written_at
                 self.zero_publisher = fields[6]
             except (ValueError, OverflowError):
                 self.fault = True
 
+    def _ready_locked(self, now):
+        return bool(
+            not self.fault and self.received_at is not None and _number(now)
+            and 0 <= now - self.received_at <= STATUS_MAX_AGE_SEC
+            and 0 <= now - self.generated_at <= STATUS_MAX_AGE_SEC
+            and self.zero_writes > self.initial_zero_writes
+            and self.zero_publisher == self.expected_publisher
+            and self.mode in (0, 1, 2) and self.primed and not self.latched
+        )
+
     def ready(self, now):
         with self.lock:
-            ready = bool(
-                not self.fault and self.received_at is not None and _number(now)
-                and 0 <= now - self.received_at <= STATUS_MAX_AGE_SEC
-                and 0 <= now - self.generated_at <= STATUS_MAX_AGE_SEC
-                and self.zero_writes > self.initial_zero_writes
-                and self.zero_publisher == self.expected_publisher
-                and self.mode in (0, 1, 2) and self.primed and not self.latched
-            )
+            ready = self._ready_locked(now)
             if ready and self.accepted_mode is None:
                 self.accepted_mode = self.mode
             return ready
+
+    def zero_state(self, now):
+        with self.lock:
+            if not self._ready_locked(now):
+                return None
+            return (self.zero_writes, self.zero_written_at)
+
+
+class ZeroBarrier(object):  # noqa: UP004 - Python 2 ROS worker
+    """Do not resume motion until a zero is written after the stop frame."""
+
+    def __init__(self):
+        self.checkpoint = None
+        self.started_at = None
+        self.timed_out = False
+
+    def begin(self, status, now):
+        if self.timed_out:
+            return False
+        if self.checkpoint is not None:
+            return True
+        state = status.zero_state(now)
+        if state is None:
+            return False
+        self.checkpoint = state[0]
+        self.started_at = now
+        return True
+
+    def command(self, linear, angular, status, now):
+        if self.checkpoint is not None:
+            if not _number(now) or not 0 <= now - self.started_at < ZERO_ACK_TIMEOUT_SEC:
+                self.timed_out = True
+                return (0.0, 0.0)
+            state = status.zero_state(now)
+            if state is None or state[0] <= self.checkpoint or state[1] <= self.started_at:
+                return (0.0, 0.0)
+            self.checkpoint = None
+            self.started_at = None
+        return (linear, angular)
 
 
 def prime_connection(connected, publish_zero, clock, sleep, cancelled, driver_ready, timeout=3.0):
@@ -220,15 +268,17 @@ def main():
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
-    rospy.init_node("rosclaw_limo_mapless_relay", anonymous=True, disable_signals=True)
-    publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-    status = DriverStatus(rospy.get_name())
-    _status_subscriber = rospy.Subscriber(
-        "/rosclaw_limo/command_watchdog", String,
-        lambda msg: status.observe(msg.data, _monotonic()), queue_size=1)
-    pending = b""
-    motion_acknowledged = False
+    publisher = None
     try:
+        rospy.init_node("rosclaw_limo_mapless_relay", anonymous=True, disable_signals=True)
+        publisher = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        status = DriverStatus(rospy.get_name())
+        _status_subscriber = rospy.Subscriber(
+            "/rosclaw_limo/command_watchdog", String,
+            lambda msg: status.observe(msg.data, _monotonic()), queue_size=1)
+        pending = b""
+        motion_acknowledged = False
+        motion_published = False
         # The parent waits for READY before sending commands. A readable pipe
         # here means it closed or violated that protocol, so cancel startup.
         def cancelled():
@@ -241,6 +291,8 @@ def main():
                                 lambda: status.ready(_monotonic())):
             return 1
         gate = RelayGate(_monotonic())
+        zero_barrier = ZeroBarrier()
+        stop_latched = False
         sys.stdout.write("READY\n")
         sys.stdout.flush()
         while not _shutdown and not rospy.is_shutdown():
@@ -261,14 +313,35 @@ def main():
                         break
                     if not gate.accept(frame, _monotonic()):
                         break
+                    if frame["linear"] == 0.0 and frame["angular"] == 0.0:
+                        if motion_published:
+                            # Twist cannot bind a stop to its serial write. Once
+                            # motion was published, never resume in this relay.
+                            stop_latched = True
+                            gate.stopped = True
+                            break
+                        if not zero_barrier.begin(status, _monotonic()):
+                            gate.stopped = True
+                            break
             linear, angular = gate.command(_monotonic())
             if publisher.get_num_connections() <= 0 or not status.ready(_monotonic()):
                 gate.stopped = True
                 linear, angular = 0.0, 0.0
+            linear, angular = zero_barrier.command(linear, angular, status, _monotonic())
             message = Twist()
             message.linear.x = linear
             message.angular.z = angular
+            if linear or angular:
+                motion_published = True
             publisher.publish(message)
+            if stop_latched:
+                sys.stdout.write("STOP_LATCHED\n")
+                sys.stdout.flush()
+                return 0
+            if zero_barrier.timed_out:
+                sys.stdout.write("ZERO_TIMEOUT\n")
+                sys.stdout.flush()
+                return 1
             if not motion_acknowledged and (linear or angular) and publisher.get_num_connections() > 0:
                 sys.stdout.write("MOTION_ACK {}\n".format(gate.last_sequence))  # noqa: UP032 - Python 2
                 sys.stdout.flush()
@@ -277,12 +350,21 @@ def main():
                 break
     finally:
         # Continue publishing zero briefly even if the producer disappears.
-        for _ in range(10):
-            try:
-                publisher.publish(Twist())
-                time.sleep(0.05)
+        if publisher is not None:
+            for _ in range(10):
+                try:
+                    publisher.publish(Twist())
+                    time.sleep(0.05)
+                except Exception:  # noqa: BLE001 - shutdown is best effort
+                    break
+            try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
+                publisher.unregister()
             except Exception:  # noqa: BLE001 - shutdown is best effort
-                break
+                pass
+        try:  # noqa: SIM105 - contextlib.suppress is unavailable on Python 2
+            rospy.signal_shutdown("relay stopped")
+        except Exception:  # noqa: BLE001 - shutdown is best effort
+            pass
     return 0
 
 

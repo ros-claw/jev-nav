@@ -37,6 +37,49 @@ def test_new_model_choice_changes_direction_without_a_stop():
     assert left[0] > 0 and left[1] > 0
 
 
+def test_slow_model_response_limits_speed_to_preserve_next_pose_window():
+    controller = module.MaplessController(started_at=12.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=12.23)
+    linear, angular = controller.tick(sensors(12.4), now=12.4)
+    assert 0 < linear < 0.04
+    assert angular == 0.0
+
+
+def test_fast_model_response_can_use_the_normal_speed_limit():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.1)
+    assert controller.tick(sensors(10.4), now=10.4)[0] == 0.1
+
+
+def test_slower_decision_reserves_commanded_deceleration_distance():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    assert controller.tick(sensors(10.4), now=10.4)[0] == 0.1
+    assert controller.set_decision("forward", observed_at=10.5, now=11.5)
+    horizon = 2.5
+    target = controller.linear_limit
+    predicted_distance = target * horizon + (0.1 - target) ** 2 / (2 * 0.3)
+    assert predicted_distance <= module.POSE_TRANSLATION_BUDGET + 1e-9
+
+
+def test_turn_speed_scales_with_the_available_angular_budget():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("left", observed_at=9.0, now=10.0, rotation_budget=0.02)
+    linear, angular = controller.tick(sensors(10.4), now=10.4)
+    assert linear > 0 and angular > 0
+    assert linear <= 0.28 * angular + 1e-9
+
+
+def test_turn_transition_does_not_abruptly_cut_forward_speed():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    assert controller.tick(sensors(10.4), now=10.4)[0] == 0.1
+    assert controller.set_decision("left", observed_at=10.4, now=10.4)
+    linear, angular = controller.tick(sensors(10.45), now=10.45)
+    assert linear >= 0.1 - 0.3 * 0.05 - 1e-9
+    assert angular > 0
+
+
 def test_stale_sensor_or_obstacle_stops_and_fresh_model_can_replan():
     controller = module.MaplessController(started_at=10.0, deadline=30.0)
     assert controller.set_decision("forward", observed_at=10.0, now=10.0)
@@ -47,6 +90,30 @@ def test_stale_sensor_or_obstacle_stops_and_fresh_model_can_replan():
     assert controller.tick(sensors(10.3), now=11.2) == (0.0, 0.0)
     assert controller.set_decision("left", observed_at=11.2, now=11.2)
     assert controller.tick(sensors(11.3), now=11.3)[1] > 0
+
+
+def test_sensor_age_reduces_the_available_front_and_depth_distance():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    assert controller.tick(sensors(10.4), now=10.4)[0] > 0
+    observation = sensors(10.5)
+    observation["scan_at"] = 10.0
+    observation["front"] = 0.62
+    assert controller.tick(observation, now=10.5) == (0.0, 0.0)
+
+    observation = sensors(10.6)
+    observation["depth_at"] = 10.1
+    observation["depth_min"] = 0.42
+    assert controller.tick(observation, now=10.6) == (0.0, 0.0)
+
+
+def test_aged_side_obstacle_is_not_lost_when_base_is_turning():
+    controller = module.MaplessController(started_at=10.0, deadline=30.0)
+    assert controller.set_decision("forward", observed_at=10.0, now=10.0)
+    assert controller.tick(sensors(10.4), now=10.4)[0] > 0
+    observation = sensors(10.5)
+    observation.update({"scan_at": 10.0, "left": 0.62, "angular_z_radps": 0.4})
+    assert controller.tick(observation, now=10.5) == (0.0, 0.0)
 
 
 def test_expired_or_replayed_decision_does_not_replace_newer_decision():
