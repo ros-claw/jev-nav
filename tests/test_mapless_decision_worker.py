@@ -48,3 +48,21 @@ def test_outdated_or_invalid_responses_do_not_update_the_control_target():
         )["ok"]
         is False
     )
+
+
+def test_forward_lidar_gaps_and_unobserved_rear_are_sent_to_the_model():
+    view = {"center": {"valid_rays": 20, "total_rays": 40}, "rear_valid_rays": 0}
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {"forward_view": view},
+        "base": {},
+    }
+
+    def transport(payload, key, timeout):
+        assert payload["input"][0]["content"][2]["data"]["laser"]["forward_view"] == view
+        instructions = payload["questions"][0]["instructions"].lower()
+        assert "rear" in instructions and "unknown" in instructions
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": "forward"}]}
+
+    assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["ok"]

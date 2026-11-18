@@ -352,7 +352,8 @@ class RosCliReadOnlyClient:
                 or response.get("usable_for_real_execution") is not False
                 or response.get("deskewed") is not False
                 or not all(isinstance(x, dict) for x in (scan, depth, info, transform))
-                or depth.get("frame_id") != "camera_color_optical_frame"
+                or depth.get("frame_id")
+                not in ("camera_color_optical_frame", "camera_depth_optical_frame")
                 or transform.get("source") != scan.get("frame_id")
                 or transform.get("target") != depth.get("frame_id")
                 or not isinstance(scan.get("ranges"), list)

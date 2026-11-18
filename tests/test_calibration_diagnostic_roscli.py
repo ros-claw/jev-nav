@@ -36,6 +36,23 @@ def test_diagnostic_cli_only_invokes_fixed_worker(monkeypatch):
     }
 
 
+def test_diagnostic_cli_accepts_native_depth_frame(monkeypatch):
+    payload = response()
+    payload["depth"]["frame_id"] = "camera_depth_optical_frame"
+    payload["transform"]["target"] = "camera_depth_optical_frame"
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr("limo_ros_mcp.roscli.Path.is_file", lambda _path: True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+    output = RosCliReadOnlyClient({}).calibration_diagnostic()
+    assert output["depth"]["frame_id"] == "camera_depth_optical_frame"
+    assert output["calibration_verified"] is False
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -44,6 +61,10 @@ def test_diagnostic_cli_only_invokes_fixed_worker(monkeypatch):
         lambda r: r.update(usable_for_real_execution=True),
         lambda r: r["depth"].update(data_base64="bad"),
         lambda r: r["transform"].update(target="base_link"),
+        lambda r: (
+            r["depth"].update(frame_id="unrecognized_camera"),
+            r["transform"].update(target="unrecognized_camera"),
+        ),
     ],
 )
 def test_diagnostic_cli_rejects_false_authority_or_malformed_payload(monkeypatch, mutate):

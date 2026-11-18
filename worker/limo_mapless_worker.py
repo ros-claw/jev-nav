@@ -222,6 +222,63 @@ def summarize_scan(ranges, angle_min, angle_increment, range_min, range_max, tx,
     }
 
 
+def summarize_forward_view(ranges, angle_min, angle_increment, range_min, range_max, tx, ty, yaw):
+    """Describe measured forward rays and missing angular spans without inferring free space."""
+    if not all(
+        _finite(value) for value in (angle_min, angle_increment, range_min, range_max, tx, ty, yaw)
+    ) or not (0 < range_min < range_max <= 100 and angle_increment != 0 and 1 <= len(ranges) <= 10000):
+        raise ValueError("invalid laser scan")
+    sectors = {
+        name: {"total_rays": 0, "valid_rays": 0, "nearest_to_base_m": None,
+               "max_missing_gap_rad": 0.0, "_missing": 0}
+        for name in ("right", "center", "left")
+    }
+    rear_total = 0
+    rear_valid = 0
+    rear_nearest = None
+    for index, distance in enumerate(ranges):
+        angle = angle_min + index * angle_increment + yaw
+        angle = math.atan2(math.sin(angle), math.cos(angle))
+        if -math.pi / 2 <= angle < -math.pi / 6:
+            name = "right"
+        elif -math.pi / 6 <= angle <= math.pi / 6:
+            name = "center"
+        elif math.pi / 6 < angle <= math.pi / 2:
+            name = "left"
+        else:
+            name = None
+        valid = _finite(distance) and range_min <= distance <= range_max
+        if name is None:
+            if abs(angle) >= 2.1:
+                rear_total += 1
+                if valid:
+                    measured = math.hypot(tx + distance * math.cos(angle), ty + distance * math.sin(angle))
+                    rear_nearest = measured if rear_nearest is None else min(rear_nearest, measured)
+                    rear_valid += 1
+            continue
+        sector = sectors[name]
+        sector["total_rays"] += 1
+        if valid:
+            measured = math.hypot(tx + distance * math.cos(angle), ty + distance * math.sin(angle))
+            nearest = sector["nearest_to_base_m"]
+            sector["nearest_to_base_m"] = measured if nearest is None else min(nearest, measured)
+            sector["valid_rays"] += 1
+            sector["_missing"] = 0
+        else:
+            sector["_missing"] += 1
+            sector["max_missing_gap_rad"] = max(
+                sector["max_missing_gap_rad"], sector["_missing"] * abs(angle_increment)
+            )
+    for sector in sectors.values():
+        del sector["_missing"]
+        if not sector["total_rays"]:
+            sector["max_missing_gap_rad"] = None
+    sectors["rear_total_rays"] = rear_total
+    sectors["rear_valid_rays"] = rear_valid
+    sectors["rear_nearest_to_base_m"] = rear_nearest
+    return sectors
+
+
 def motion_delta(initial, current):
     if len(initial) != 3 or len(current) != 3 or not all(_finite(v) for v in initial + current):
         raise ValueError("invalid odometry pose")
@@ -420,6 +477,16 @@ def execute(request):
                 trans[1],
                 yaw,
             )
+            forward_view = summarize_forward_view(
+                scan.ranges,
+                scan.angle_min,
+                scan.angle_increment,
+                scan.range_min,
+                scan.range_max,
+                trans[0],
+                trans[1],
+                yaw,
+            )
             depth_array = bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
             minimum, ratio = summarize_depth(depth_array, depth.encoding)
             pose = odom.pose.pose
@@ -436,6 +503,7 @@ def execute(request):
                 "left": sectors["left"],
                 "right": sectors["right"],
                 "rear": sectors["rear"],
+                "forward_view": forward_view,
                 "depth_min": minimum,
                 "depth_valid_ratio": ratio,
                 "error_code": int(status.error_code),
@@ -468,6 +536,7 @@ def execute(request):
                     "left_min_m": sample["left"],
                     "right_min_m": sample["right"],
                     "rear_min_m": sample["rear"],
+                    "forward_view": sample["forward_view"],
                 },
                 "base": {
                     "linear_x_mps": sample["linear_x_mps"],

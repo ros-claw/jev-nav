@@ -39,6 +39,17 @@ def test_mismatched_info_frame_is_preserved_as_untrusted_diagnostic():
     assert output["deskewed"] is False
 
 
+def test_native_depth_frame_is_preserved_as_untrusted_diagnostic():
+    scan, depth, info, transform = fixture()
+    depth["frame_id"] = "camera_depth_optical_frame"
+    info["frame_id"] = "camera_depth_optical_frame"
+    output = core.make_diagnostic(scan, depth, info, transform, now=100.1)
+    assert output["camera_info"]["frame_matches_image"] is True
+    assert output["transform"]["target"] == "camera_depth_optical_frame"
+    assert output["calibration_verified"] is False
+    assert output["usable_for_real_execution"] is False
+
+
 def test_laser_to_base_transform_is_preserved_only_as_unverified_diagnostic():
     scan, depth, info, transform = fixture()
     output = core.make_diagnostic(scan, depth, info, transform, now=100.1, scan_to_base=transform)
@@ -62,6 +73,7 @@ def test_invalid_laser_to_base_transform_is_rejected():
         lambda s, d, i, t: i.update(stamp=99.0),
         lambda s, d, i, t: d.update(data=b"bad"),
         lambda s, d, i, t: d.update(is_bigendian=2),
+        lambda s, d, i, t: d.update(frame_id="unrecognized_camera"),
         lambda s, d, i, t: s.update(time_increment=-1),
         lambda s, d, i, t: s.update(ranges=[1.0] * 10001),
         lambda s, d, i, t: i.update(K=[float("nan")] * 9),

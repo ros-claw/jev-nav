@@ -4,6 +4,8 @@ import base64
 
 from local_observation_core import INTEGER_TYPES, STRING_TYPES, _frame, _matrix, _number
 
+CAMERA_FRAMES = ("camera_color_optical_frame", "camera_depth_optical_frame")
+
 
 def _rigid(raw):
     matrix = _matrix(raw)
@@ -39,7 +41,7 @@ def make_diagnostic(scan, depth, info, scan_to_camera, now, scan_to_base=None):
     if max(scan_stamp, depth_stamp, info_stamp) - min(scan_stamp, depth_stamp, info_stamp) > 0.1:
         raise ValueError("sensor timestamps differ")
     scan_frame, image_frame = _frame(scan["frame_id"]), _frame(depth["frame_id"])
-    if image_frame != "camera_color_optical_frame":
+    if image_frame not in CAMERA_FRAMES:
         raise ValueError("unexpected claimed camera optical frame")
     info_frame = info["frame_id"]
     if not isinstance(info_frame, STRING_TYPES) or len(info_frame) > 128:

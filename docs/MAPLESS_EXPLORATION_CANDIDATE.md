@@ -18,6 +18,8 @@ measured control timing, independent chassis command-loss stopping, worker and
 helper process lifetime management, and cancellation/startup race resolution
 across the daemon. Synthetic tests do not establish these properties on LIMO.
 
-One live setup used an X2L launch configuration publishing only the front 180°;
-zero range values were frequent. The diagnostic source marks missing readings
-unknown and never treats a missing rear sector as clear.
+The operator reports that the installed lidar sees only part of the forward
+field and cannot observe behind the robot. One live scan had a ±90° message
+range with frequent zero values. The model receives measured front-direction
+rays and missing-angle statistics; missing or rear observations remain unknown.
+Changing the ROS scan angle does not create physical sensor coverage.

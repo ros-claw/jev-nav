@@ -5,8 +5,9 @@
 import json
 import math
 import sys
+import time
 
-from calibration_bundle_core import make_diagnostic
+from calibration_bundle_core import CAMERA_FRAMES, make_diagnostic
 from limo_local_observation_worker import _synchronized_messages
 
 PROTOCOL = "rosclaw.limo.calibration-diagnostic.v1"
@@ -40,15 +41,29 @@ def _lookup_matrix(listener, tf_module, ros, target, source, stamp, timeout):
 
 def collect(ros, tf_module, filters, laser_type, image_type, info_type, timeout):
     listener = tf_module.TransformListener()
-    scan, image, info = _synchronized_messages(filters, laser_type, image_type, info_type, timeout)
-    if image.header.frame_id != "camera_color_optical_frame":
-        raise ValueError("unexpected claimed camera optical frame")
-    if image.is_bigendian not in (0, 1):
-        raise ValueError("invalid depth endian flag")
-    target, source = image.header.frame_id, scan.header.frame_id
-    transform = _lookup_matrix(
-        listener, tf_module, ros, target, source, scan.header.stamp, min(timeout, 2.0)
-    )
+    deadline = time.time() + timeout
+    for attempt in range(3):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise ValueError("synchronized capture timed out")
+        scan, image, info = _synchronized_messages(
+            filters, laser_type, image_type, info_type, remaining
+        )
+        if image.header.frame_id not in CAMERA_FRAMES:
+            raise ValueError("unexpected claimed camera optical frame")
+        if image.is_bigendian not in (0, 1):
+            raise ValueError("invalid depth endian flag")
+        target, source = image.header.frame_id, scan.header.frame_id
+        try:
+            transform = _lookup_matrix(
+                listener, tf_module, ros, target, source, scan.header.stamp,
+                max(0.01, min(deadline - time.time(), 2.0)),
+            )
+            break
+        except Exception:  # noqa: BLE001 - the first scan may predate this TF listener
+            if attempt == 2 or time.time() >= deadline:
+                raise
+            time.sleep(min(0.2, max(0.0, deadline - time.time())))
     try:
         base_transform = _lookup_matrix(
             listener, tf_module, ros, "base_link", source, scan.header.stamp, min(timeout, 1.0)

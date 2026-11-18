@@ -70,7 +70,13 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                 {
                     "type": "choice",
                     "name": "next_action",
-                    "instructions": "Select the next exploration direction. Sensor nulls mean unknown. The local controller checks obstacles.",
+                    "instructions": (
+                        "Select the next exploration direction, preferring progress into visible "
+                        "open space when supported. The lidar may cover only the front: forward_view "
+                        "reports measured rays and gaps, not proof of clearance. If rear_valid_rays "
+                        "is zero the rear is unknown. Missing returns and nulls are unknown. "
+                        "The local controller checks obstacles independently."
+                    ),
                     "choices": [
                         {"value": "forward", "description": "Continue exploring ahead"},
                         {"value": "left", "description": "Explore to the left"},

@@ -60,6 +60,31 @@ def test_laser_sparse_or_rear_obstacle_observations_are_not_treated_as_clear():
     assert obstacle["rear"] == pytest.approx(0.2)
 
 
+def test_forward_only_lidar_reports_front_directions_and_unknown_rear():
+    ranges = [2.0] * 181
+    ranges[30] = 0.4
+    ranges[90:95] = [0.0] * 5
+    view = worker.summarize_forward_view(
+        ranges, -math.pi / 2, math.pi / 180, 0.1, 12.0, 0.0, 0.0, 0.0
+    )
+    assert view["right"]["nearest_to_base_m"] == pytest.approx(0.4)
+    assert view["left"]["nearest_to_base_m"] == pytest.approx(2.0)
+    assert view["center"]["max_missing_gap_rad"] == pytest.approx(5 * math.pi / 180)
+    assert view["rear_total_rays"] == 0
+    assert view["rear_valid_rays"] == 0
+    assert view["rear_nearest_to_base_m"] is None
+
+
+def test_forward_view_distinguishes_missing_coverage_from_invalid_returns():
+    partial = worker.summarize_forward_view([2.0] * 81, -0.4, 0.01, 0.1, 12.0, 0, 0, 0)
+    assert partial["left"]["total_rays"] == 0
+    assert partial["left"]["max_missing_gap_rad"] is None
+    full = worker.summarize_forward_view([0.0] * 360, -math.pi, math.pi / 180, 0.1, 12.0, 0, 0, 0)
+    assert full["rear_total_rays"] > 0
+    assert full["rear_valid_rays"] == 0
+    assert full["rear_nearest_to_base_m"] is None
+
+
 def test_depth_frame_and_camera_info_must_match():
     image = {"frame_id": "color_optical", "width": 640, "height": 400, "stamp": 10.0}
     info = {"frame_id": "color_optical", "width": 640, "height": 400, "stamp": 10.05}

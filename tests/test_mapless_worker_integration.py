@@ -252,6 +252,8 @@ def test_continuous_worker_wiring_with_synthetic_ros(
     assert result["relay_acknowledged"] is matching_depth
     assert result["physical_stop_verified"] is False
     assert result["stopped_odometry"]["samples"] >= 3
+    if matching_depth:
+        assert decision_calls[0]["laser"]["forward_view"]["center"]["valid_rays"] > 0
     if not matching_depth:
         assert result["reason"] == "no_compatible_observation"
     elif not decisions_continue:
