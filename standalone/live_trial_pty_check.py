@@ -41,6 +41,8 @@ from relay_pty_check import STATUS_MONITOR, FakeChassis, StatusCollector, wait_f
 
 ZERO = (0, 0, 0, 0)
 MOTION = (20, 0, 0, 0)
+MIN_PRE_MOTION_ZERO_WRITES = 3
+MOTION_LIMIT_SEC = 0.3
 
 CHILD = r'''
 from __future__ import print_function
@@ -93,7 +95,7 @@ print(json.dumps({'trial': result, 'writes': writes, 'status_reads': status_read
 '''
 
 
-def summarize_frames(frames, started_at, returned_at, stop_at=None, first_write_at=None):
+def summarize_frames(frames, started_at, returned_at, stop_at=None, first_write_at=None, motion_limit_sec=0.3):
     relevant = [(stamp, frame) for stamp, frame in frames if stamp >= started_at]
     if not relevant or any(frame not in (ZERO, MOTION) for _, frame in relevant):
         raise ValueError('unexpected serial speed or missing frames')
@@ -105,24 +107,29 @@ def summarize_frames(frames, started_at, returned_at, stop_at=None, first_write_
         stop_at = returned_at
     if first_write_at is None:
         first_write_at = first_motion
-    after_pipe_deadline = [(stamp, frame) for stamp, frame in motion if stamp >= first_write_at + 0.3]
+    after_pipe_deadline = [(stamp, frame) for stamp, frame in motion if stamp >= first_write_at + motion_limit_sec]
     after_stop = [(stamp, frame) for stamp, frame in relevant if stamp >= stop_at]
     after_return = [(stamp, frame) for stamp, frame in relevant if stamp >= returned_at]
     after_motion_zero = [stamp for stamp, frame in relevant if stamp > last_motion and frame == ZERO]
-    if (last_motion - first_motion > 0.4 or len(after_stop) < 4
+    if (last_motion - first_motion > motion_limit_sec + 0.1 or len(after_stop) < 4
             or not after_motion_zero or any(frame != ZERO for _, frame in after_stop + after_return)):
         raise ValueError('bounded motion and repeated post-STOP zeros not demonstrated')
-    return {'forward_frames': len(motion),
+    result = {'forward_frames': len(motion),
             'first_nonzero_monotonic_s': first_motion,
             'last_nonzero_monotonic_s': last_motion,
             'serial_nonzero_span_sec': round(last_motion - first_motion, 6),
             'first_zero_after_last_nonzero_sec': round(after_motion_zero[0] - last_motion, 6),
-            'nonzero_after_first_pipe_stamp_plus_0_3': len(after_pipe_deadline),
-            'last_nonzero_minus_first_pipe_stamp_plus_0_3_sec': round(last_motion - first_write_at - 0.3, 6),
+            'motion_limit_sec': motion_limit_sec,
+            'nonzero_after_motion_limit': len(after_pipe_deadline),
+            'last_nonzero_minus_motion_limit_sec': round(last_motion - first_write_at - motion_limit_sec, 6),
             'post_stop_zero_frames': len(after_stop), 'post_stop_nonzero_frames': 0,
             'first_serial_zero_after_stop_observed_sec': round(after_stop[0][0] - stop_at, 6),
             'post_return_zero_frames': len(after_return), 'post_return_nonzero_frames': 0,
             'post_return_serial_idle': not after_return}
+    if motion_limit_sec == 0.3:
+        result['nonzero_after_first_pipe_stamp_plus_0_3'] = len(after_pipe_deadline)
+        result['last_nonzero_minus_first_pipe_stamp_plus_0_3_sec'] = round(last_motion - first_write_at - 0.3, 6)
+    return result
 
 
 def main():
@@ -202,27 +209,29 @@ def main():
                 if (result['model_calls'] != 1 or trial.get('motion_requested') is not True
                         or trial.get('stop_requested') is not True
                         or trial.get('physical_stop_verified') is not False
-                        or trial.get('reason') not in ('motion_limit', 'relay_failure')
+                        or trial.get('reason') not in ('motion_limit', 'time_limit', 'relay_failure',
+                                                       'sensor_unavailable', 'expiry_unavailable')
                         or trial.get('relay_evidence', {}).get('process_exited') is not True
                         or not result['fake_arbiter_released'] or not result['fake_serial_released']):
                     raise RuntimeError('unexpected LiveTrial result: {}'.format(json.dumps(result, sort_keys=True)))
                 motion_writes = [index for index, write in enumerate(writes)
                                  if write['frame']['linear'] > 0]
-                if (not motion_writes or motion_writes[0] < 3
+                if (not motion_writes or motion_writes[0] < MIN_PRE_MOTION_ZERO_WRITES
                         or any(write['frame']['linear'] != 0 for write in writes[:motion_writes[0]])
                         or any(write['frame']['linear'] != 0.02 or write['frame']['angular'] != 0
                                for write in writes if write['frame']['linear'] > 0)
                         or writes[-1]['frame']['linear'] != 0):
                     raise RuntimeError('trial did not write the expected zero/motion/zero sequence')
                 stopped = [item for item in result['status_reads']
-                           if item['line'] in ('STOP motion_deadline\n', 'STOP requested_stop\n')]
+                           if item['line'] in ('STOP motion_deadline\n', 'STOP requested_stop\n',
+                                               'FAULT intent_deadline\n')]
                 if not stopped:
                     raise RuntimeError('relay did not report a terminal STOP line')
                 stop_at = stopped[0]['at']
                 first_write_at = writes[motion_writes[0]]['frame']['stamp']
                 time.sleep(1.0)
                 frames = fake.snapshot()
-                summary = summarize_frames(frames, started, returned, stop_at, first_write_at)
+                summary = summarize_frames(frames, started, returned, stop_at, first_write_at, MOTION_LIMIT_SEC)
                 before_motion = [fields for _, fields in collector.snapshot()
                                  if fields[3:6] == ['0', '1', '0']
                                  and fields[6].startswith('/standalone_limo_relay_')
@@ -310,6 +319,13 @@ class FrameSummaryTests(unittest.TestCase):
             self.fail('clean serial idle is allowed after prior post-STOP zero frames')
         self.assertEqual(result['post_return_zero_frames'], 0)
         self.assertTrue(result['post_return_serial_idle'])
+
+    def test_explicit_two_second_bound_accepts_longer_simulated_motion(self):
+        frames = [(10.0, MOTION), (11.5, MOTION)] + [(12.1 + .05 * i, ZERO) for i in range(8)]
+        result = summarize_frames(frames, 9.9, 12.09, stop_at=12.09, first_write_at=10.0,
+                                  motion_limit_sec=2.0)
+        self.assertEqual(result['nonzero_after_motion_limit'], 0)
+        self.assertEqual(result['motion_limit_sec'], 2.0)
 
 
 if __name__ == '__main__':

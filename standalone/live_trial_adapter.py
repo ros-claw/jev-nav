@@ -13,6 +13,7 @@ from __future__ import division
 import copy
 import errno
 import fcntl
+import gc
 import hashlib
 import json
 import math
@@ -40,28 +41,50 @@ class ObservationAdapter(object):
     """Translate an existing RosObservation without creating ROS connections."""
     simulation_only = False
 
-    def __init__(self, observation, jpeg_encoder):
+    def __init__(self, observation, jpeg_encoder, take_scene_ownership=False, projection_only_after_model=False):
+        if type(take_scene_ownership) is not bool or type(projection_only_after_model) is not bool:
+            raise ValueError("scene ownership must be explicit")
         self.observation = observation
         self.jpeg_encoder = jpeg_encoder
+        # Only use this when the source allocates a new unshared scene on
+        # every snapshot, as RosObservation's fusion snapshot does.
+        self.take_scene_ownership = take_scene_ownership
+        self.projection_only_after_model = projection_only_after_model
         self.last_issue = None
+        self._encode_images = True
+
+    def enable_safety_snapshots(self):
+        """Skip repeated JPEG encoding once model evidence has been captured."""
+        if self.projection_only_after_model:
+            enable_projection_only = getattr(self.observation, "enable_projection_only", None)
+            disable_projection_only = getattr(self.observation, "disable_projection_only", None)
+            if not callable(enable_projection_only) or not callable(disable_projection_only):
+                raise ValueError("observation cannot provide projected depth")
+            enable_projection_only()
+        self._encode_images = False
+
+    def restore_model_snapshots(self):
+        if self.projection_only_after_model:
+            self.observation.disable_projection_only()
+        self._encode_images = True
 
     def snapshot(self):
         try:
             sample = self.observation.snapshot()
             if not isinstance(sample, dict):
-                self.last_issue = "source_unavailable"
-                return None
-            if not self.observation.is_current_sample(sample):
-                self.last_issue = "current_before_copy"
+                issue = getattr(self.observation, "snapshot_last_issue", None)
+                self.last_issue = "source_" + issue if isinstance(issue, str) else "source_unavailable"
                 return None
             scan, color = sample["scan"], sample["color"]
-            result = {key: _copy_scene(value) if key == "scene" else copy.deepcopy(value)
+            result = {key: (value if self.take_scene_ownership else _copy_scene(value))
+                      if key == "scene" else copy.deepcopy(value)
                       for key, value in sample.items() if key not in ("scan", "color")}
             # These fields must come from the actual observation, never defaults.
             result["depth_pose"] = copy.deepcopy(sample["depth_pose"])
             result["state"]["vehicle_state"] = sample["state"]["vehicle_state"]
             result["state"]["control_mode"] = sample["state"]["control_mode"]
-            result["image_jpeg"] = self.jpeg_encoder(color)
+            if self._encode_images:
+                result["image_jpeg"] = self.jpeg_encoder(color)
             result["raw_scan"] = {"stamp": sample["scan_at"], "frame_id": scan.header.frame_id,
                                   "angle_min": scan.angle_min, "angle_increment": scan.angle_increment,
                                   "range_min": scan.range_min, "range_max": scan.range_max,
@@ -80,6 +103,27 @@ class ObservationAdapter(object):
             return self.observation.is_current_sample(sample) is True
         except Exception:
             return False
+
+    def current_issue(self):
+        return getattr(self.observation, "current_last_issue", None)
+
+    def current_limit_kind(self):
+        return getattr(self.observation, "current_limit_kind", None)
+
+    def current_valid_until(self, sample):
+        try:
+            method = getattr(self.observation, "current_valid_until", None)
+            if callable(method):
+                return method(sample)
+            if self.observation.is_current_sample(sample) is not True:
+                return None
+            # Injectable fixtures can expose only sample timestamps. A real
+            # ROS observer supplies the latest odom and scan deadlines above.
+            return min(sample['odom_at'] + 0.1, sample['scan_at'] + 0.3,
+                       sample['status_at'] + 1.0, sample['snapshot_at'] + 0.25,
+                       sample['depth_at'] + 0.5, sample['color_at'] + 0.5)
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return None
 
     def is_current_epoch(self, epoch):
         try:
@@ -166,6 +210,13 @@ class ExistingDecisionHelper(object):
                                     clock=self.clock.now, timeout=timeout)
 
 
+def relay_ready_line(motion_limit_sec):
+    """Return the exact handshake for one of the supported bounded trials."""
+    if not checks._finite(motion_limit_sec) or motion_limit_sec not in (0.3, 2.0):
+        raise ValueError("unsupported motion limit")
+    return ("READY motion_limit_sec=%.6f\n" % motion_limit_sec).encode("ascii")
+
+
 class RelayProcessTransport(object):
     """Bounded pipe transport; starts the relay only when start() is called."""
     def __init__(self, clock, popen=None):
@@ -176,10 +227,12 @@ class RelayProcessTransport(object):
         self.exited = None
 
     def start(self, max_motion_sec):
-        if self.process is not None or max_motion_sec != 0.3:
+        if self.process is not None:
             raise ValueError("invalid relay startup")
+        relay_ready_line(max_motion_sec)
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py")
-        command = ["/usr/bin/python2", path, "--max-motion-sec", "0.300000"]
+        command = ["/usr/bin/python2", path, "--require-intent-deadline",
+                   "--max-motion-sec", "%.6f" % max_motion_sec]
         with open(os.devnull, "wb") as errors:
             self.process = self.popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=errors, close_fds=True)
@@ -269,8 +322,10 @@ class RelayAdapter(object):
     """One calling thread writes bounded relay JSON; no start until arm()."""
     simulation_only = False
 
-    def __init__(self, transport, clock):
+    def __init__(self, transport, clock, motion_limit_sec=0.3):
+        relay_ready_line(motion_limit_sec)
         self.transport, self.clock = transport, clock
+        self.motion_limit_sec = motion_limit_sec
         self.owner = None
         self.armed = False
         self.faulted = False
@@ -284,13 +339,13 @@ class RelayAdapter(object):
         return self.owner == threading.current_thread().ident
 
     def arm(self, max_motion_sec):
-        if self.owner is not None or max_motion_sec != 0.3:
+        if self.owner is not None or max_motion_sec != self.motion_limit_sec:
             return None
         self.owner = threading.current_thread().ident
         try:
             self.transport.start(max_motion_sec)
             ready = self.transport.read_line(3.5)
-            if ready != checks.RELAY_READY_LINE:
+            if ready != relay_ready_line(self.motion_limit_sec):
                 self.faulted = True
                 return None
             self.armed = True
@@ -312,25 +367,34 @@ class RelayAdapter(object):
             self.faulted = True
             return False
 
-    def _write(self, sequence, stamp, linear, angular):
-        frame = {"sequence": sequence, "stamp": stamp, "linear": linear, "angular": angular}
+    def _write(self, sequence, stamp, linear, angular, valid_until):
+        frame = {"sequence": sequence, "stamp": stamp, "linear": linear, "angular": angular,
+                 "expires_at": valid_until}
         data = (json.dumps(frame, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("ascii")
-        if self.transport.write_line(data, 0.05) is not True:
+        remaining = valid_until - self.clock.now()
+        if not checks._finite(remaining) or remaining <= 0:
+            self.faulted = True
+            return False
+        timeout = min(0.01 if linear else 0.05, remaining)
+        if self.transport.write_line(data, timeout) is not True:
             self.faulted = True
             return False
         self.sequence, self.last_stamp = sequence, stamp
         return True
 
-    def send_frame(self, sequence, stamp, linear, angular):
+    def send_frame(self, sequence, stamp, linear, angular, valid_until=None):
+        if valid_until is None and checks._finite(stamp):
+            valid_until = stamp + 0.16
         if (not self._owner() or not self.armed or self.faulted
                 or isinstance(sequence, bool) or not isinstance(sequence, checks.INTEGER_TYPES)
                 or sequence != self.sequence + 1 or not checks._finite(stamp)
                 or (self.last_stamp is not None and stamp <= self.last_stamp)
                 or not checks._finite(linear) or not 0 < linear <= checks.MAX_SPEED_MPS
-                or not checks._finite(angular) or angular != 0.0):
+                or not checks._finite(angular) or angular != 0.0
+                or not checks._finite(valid_until) or not stamp < valid_until <= stamp + 0.2):
             return False
         try:
-            written = self._write(sequence, stamp, linear, angular)
+            written = self._write(sequence, stamp, linear, angular, valid_until)
             if written:
                 self.had_motion = True
             return written
@@ -347,7 +411,7 @@ class RelayAdapter(object):
                 self.clock.sleep(0.001)
                 now = self.clock.now()
             return (checks._finite(now) and (self.last_stamp is None or now > self.last_stamp)
-                    and self._write(self.sequence + 1, now, 0.0, 0.0))
+                    and self._write(self.sequence + 1, now, 0.0, 0.0, now + 0.19))
         except Exception:
             self.faulted = True
             return False
@@ -362,7 +426,7 @@ class RelayAdapter(object):
                 now = self.clock.now()
             if not checks._finite(now) or (self.last_stamp is not None and now <= self.last_stamp):
                 return False
-            sent = self._write(self.sequence + 1, now, 0.0, 0.0)
+            sent = self._write(self.sequence + 1, now, 0.0, 0.0, now + 0.19)
             self.evidence["zero_write_completed"] = sent
             if sent:
                 try:
@@ -427,7 +491,7 @@ class StrictDepthGate(object):
                 "depth_at": sample.get("depth_at"), "geometric_clearance_verified": False}
 
 
-def _snapshot_without_depth_gate(sample, now, diagnostic=None):
+def _snapshot_without_depth_gate(sample, now, diagnostic=None, require_image=True):
     """The offline sample gates, with only depth interpretation delegated."""
     def reject(check, reason="sensor_unavailable"):
         if diagnostic is not None:
@@ -439,10 +503,11 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None):
         epoch = sample["epoch"]
         if isinstance(epoch, bool) or not isinstance(epoch, checks.INTEGER_TYPES) or epoch < 0:
             return reject("epoch")
-        image = sample["image_jpeg"]
-        if (not isinstance(image, bytes) or not image.startswith(b"\xff\xd8")
-                or not image.endswith(b"\xff\xd9") or not 4 < len(image) <= 2000000):
-            return reject("image")
+        if require_image:
+            image = sample["image_jpeg"]
+            if (not isinstance(image, bytes) or not image.startswith(b"\xff\xd8")
+                    or not image.endswith(b"\xff\xd9") or not 4 < len(image) <= 2000000):
+                return reject("image")
         pose, image_pose, depth_pose = sample["pose"], sample["image_pose"], sample["depth_pose"]
         if not all(checks._pose(item) for item in (pose, image_pose, depth_pose)):
             return reject("pose")
@@ -501,13 +566,40 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None):
         return reject("malformed_sample")
 
 
+def _assess_sample(sample, now, depth_gate, require_image):
+    """Validate one owned sample without mutating another thread's state."""
+    detail = {}
+    reason = _snapshot_without_depth_gate(sample, now, detail, require_image=require_image)
+    if reason:
+        return reason, None, detail
+    try:
+        assessment = depth_gate.assess(sample, now)
+        if (not isinstance(assessment, dict) or type(assessment.get("candidate")) is not bool
+                or not isinstance(assessment.get("reason"), checks.STRING_TYPES)
+                or not assessment["reason"] or len(assessment["reason"]) > 128
+                or not checks._finite(assessment.get("depth_at"))
+                or assessment["depth_at"] != sample["depth_at"]
+                or assessment.get("geometric_clearance_verified") is not False):
+            return "depth_gate_invalid", None, detail
+        return (None if assessment["candidate"] else assessment["reason"],
+                copy.deepcopy(assessment), detail)
+    except Exception:
+        return "depth_gate_invalid", None, detail
+
+
 class LiveTrial(object):
     """Candidate entry point; external ROS and serial monitors are required."""
+    MAX_DURATION_SEC = 0.6
+    MOTION_LIMIT_SEC = 0.3
+    MAX_DISTANCE_M = 0.02
+    ASYNC_SAMPLING = False
+    ARM_BEFORE_MODEL = False
+
     def __init__(self, source, model, relay, arbiter, clock, enable_motion=False,
                  duration_sec=0.6, speed_mps=0.02, period_sec=0.05, serial_guard=None, depth_gate=None,
                  operator_site_report=None):
         if (not all(checks._finite(x) for x in (duration_sec, speed_mps, period_sec))
-                or not 0 < duration_sec <= 0.6 or not 0 < speed_mps <= 0.02
+                or not 0 < duration_sec <= self.MAX_DURATION_SEC or not 0 < speed_mps <= 0.02
                 or not 0 < period_sec <= 0.05 or type(enable_motion) is not bool):
             raise ValueError("invalid trial bounds")
         self.source, self.model, self.relay, self.arbiter, self.clock = source, model, relay, arbiter, clock
@@ -517,6 +609,7 @@ class LiveTrial(object):
         self._last_depth_assessment = None
         self._last_diagnostic = None
         self._validation_detail = {}
+        self._image_required = True
         self._stationary_proof_at = None
         self._stationary_proof_key = None
         self.enable_motion = enable_motion
@@ -524,6 +617,7 @@ class LiveTrial(object):
         self._used = False
         self._lock = threading.Lock()
         self._last_time = None
+        self._motion_started = False
 
     def _now(self):
         now = self.clock.now()
@@ -545,36 +639,39 @@ class LiveTrial(object):
                                      "check": self._validation_detail.get("check")}
             self._last_diagnostic.update(self._validation_detail)
             raise checks._StopError(reason)
-        if (self.source.is_current_epoch(sample["epoch"]) is not True
-                or self.source.is_current_sample(sample) is not True):
-            self._last_diagnostic = {"step": "latest_sample_recheck"}
+        if (not self._motion_started and (self.source.is_current_epoch(sample["epoch"]) is not True
+                or self.source.is_current_sample(sample) is not True)):
+            issue = getattr(self.source, "current_issue", None)
+            self._last_diagnostic = {"step": "latest_sample_recheck",
+                                     "detail": issue() if callable(issue) else None}
             raise checks._StopError("sensor_unavailable")
         self._last_diagnostic = None
         return sample, now
 
     def _validate(self, sample, now):
-        self._validation_detail = {}
-        reason = _snapshot_without_depth_gate(sample, now, self._validation_detail)
-        if reason:
-            return reason
-        try:
-            assessment = self.depth_gate.assess(sample, now)
-            if (not isinstance(assessment, dict) or type(assessment.get("candidate")) is not bool
-                    or not isinstance(assessment.get("reason"), checks.STRING_TYPES)
-                    or not assessment["reason"] or len(assessment["reason"]) > 128
-                    or not checks._finite(assessment.get("depth_at"))
-                    or assessment["depth_at"] != sample["depth_at"]
-                    or assessment.get("geometric_clearance_verified") is not False):
-                return "depth_gate_invalid"
-            self._last_depth_assessment = copy.deepcopy(assessment)
-            return None if assessment["candidate"] else assessment["reason"]
-        except Exception:
-            return "depth_gate_invalid"
+        reason, assessment, self._validation_detail = _assess_sample(
+            sample, now, self.depth_gate, self._image_required)
+        if assessment is not None:
+            self._last_depth_assessment = assessment
+        return reason
 
     def _model_fresh(self, before, now):
         if (not checks._fresh(before["color_at"], now, checks.MODEL_MAX_AGE_SEC)
                 or not checks._fresh(before["scan_at"], now, checks.MODEL_MAX_AGE_SEC)):
             raise checks._StopError("model_stale")
+
+    def _request_forward_decision(self, sample, result):
+        result["stage"] = "decision"
+        evidence = make_evidence(sample)
+        decision = self.model.decide(copy.deepcopy(evidence))
+        now = self._now()
+        self._model_fresh(sample, now)
+        if (not isinstance(decision, dict) or decision.get("ok") is not True
+                or decision.get("observation_id") != evidence["observation_id"]):
+            raise checks._StopError("model_invalid")
+        result["model_choice"] = decision.get("choice")
+        if decision.get("choice") != "forward":
+            raise checks._StopError("model_not_forward")
 
     def _stationary(self, before, now):
         key = (before["epoch"], before["color_at"], before["scan_at"], tuple(before["image_pose"]))
@@ -694,7 +791,9 @@ class LiveTrial(object):
                   "physical_stop_verified": False, "site_conditions_verified": False,
                   "atomic_exclusivity_verified": False, "serial_sole_writer_verified": False,
                   "site_conditions_operator_report": copy.deepcopy(self.operator_site_report)}
-        acquired = serial_acquired = attempted_arm = armed = False
+        acquired = serial_acquired = attempted_arm = armed = gc_suspended = safety_mode_enabled = False
+        sampler = None
+        sampler_started = False
         try:
             started = self._now()
             if not self.enable_motion:
@@ -733,24 +832,28 @@ class LiveTrial(object):
                     or self.serial_guard.acquire() is not True):
                 raise checks._StopError("serial_exclusivity_unavailable")
             serial_acquired = True
-            result["stage"] = "decision"
-            evidence = make_evidence(sample)
-            decision = self.model.decide(copy.deepcopy(evidence))
-            now = self._now()
-            self._model_fresh(sample, now)
-            if (not isinstance(decision, dict) or decision.get("ok") is not True
-                    or decision.get("observation_id") != evidence["observation_id"]):
-                raise checks._StopError("model_invalid")
-            result["model_choice"] = decision.get("choice")
-            if decision.get("choice") != "forward":
-                raise checks._StopError("model_not_forward")
-            result["stage"] = "post_decision_observation"
-            current, now = self._aligned_stationary_sample(sample)
+            if not self.ARM_BEFORE_MODEL:
+                self._request_forward_decision(sample, result)
+                enable_safety_snapshots = getattr(self.source, "enable_safety_snapshots", None)
+                if callable(enable_safety_snapshots):
+                    safety_mode_enabled = True
+                    enable_safety_snapshots()
+                self._image_required = False
+                result["stage"] = "post_decision_observation"
+                current, now = self._aligned_stationary_sample(sample)
+            # CPython's full cyclic collection can block the sensor and relay
+            # threads longer than a control-intent lifetime on this host.
+            # Collect while stopped, defer only during the bounded trial, then
+            # restore the caller's original setting after the relay exits.
+            if gc.isenabled():
+                gc.collect()
+                gc_suspended = True
+                gc.disable()
             attempted_arm = True
             result["stage"] = "relay_startup"
-            contract = self.relay.arm(checks.RELAY_MOTION_LIMIT_SEC)
+            contract = self.relay.arm(self.MOTION_LIMIT_SEC)
             armed = self.relay.armed is True
-            if (not isinstance(contract, dict) or contract.get("ready_line") != checks.RELAY_READY_LINE
+            if (not isinstance(contract, dict) or contract.get("ready_line") != relay_ready_line(self.MOTION_LIMIT_SEC)
                     or contract.get("relative_motion_limit") is not True):
                 raise checks._StopError("relay_contract")
             if self.relay.send_zero_heartbeat() is not True:
@@ -763,33 +866,97 @@ class LiveTrial(object):
                 raise checks._StopError("relay_failure")
             result["stage"] = "relay_ready_observation"
             current, now = self._aligned_stationary_sample(sample)
+            if self.ARM_BEFORE_MODEL:
+                # Capture the model evidence only after the relay is primed
+                # at zero, so startup latency does not age the decision.
+                sample = current
+                self._stationary_proof_at = self._stationary_proof_key = None
+                self._request_forward_decision(sample, result)
+                enable_safety_snapshots = getattr(self.source, "enable_safety_snapshots", None)
+                if callable(enable_safety_snapshots):
+                    safety_mode_enabled = True
+                    enable_safety_snapshots()
+                self._image_required = False
+                result["stage"] = "post_decision_observation"
+                current, now = self._aligned_stationary_sample(sample)
             if self.relay.send_zero_heartbeat() is not True:
                 raise checks._StopError("relay_failure")
             # No nonzero has been sent yet. Start the upper bound after the
             # fresh, stationary observation and retain the relay's independent
             # first-motion deadline as the actual motion limit.
             ready_at = self._now()
+            pre_motion_retry_until = ready_at + 2.0
             deadline = ready_at + self.duration_sec
             if not checks._finite(deadline) or deadline <= ready_at:
                 raise checks._StopError("clock_invalid")
             anchor = previous = current["pose"]
             previous_odom = current["odom_at"]
             first_sent_at = last_sent_at = None
+            last_valid_until = None
             path, sequence = 0.0, self.relay.sequence + 1
             result["stage"] = "motion_loop"
+            result["motion_timing"] = {"last_sample_sec": None, "max_sample_sec": 0.0,
+                                       "last_submit_interval_sec": None}
+            if self.ASYNC_SAMPLING:
+                from async_safety_sampler import AsyncSafetySampler
+                def validate_background(candidate, captured_at):
+                    reason, assessment, _ = _assess_sample(candidate, captured_at, self.depth_gate, False)
+                    return reason, assessment
+                def transient_background(source):
+                    issue = getattr(source, 'last_issue', None)
+                    return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
+                                     'source_snapshot_exception_ExtrapolationException')
+                sampler = AsyncSafetySampler(self.source, validate_background, self.clock,
+                                             transient_unavailable=transient_background)
             while True:
                 now = self._now()
                 if now >= deadline:
                     raise checks._StopError("time_limit")
-                if first_sent_at is not None and now >= first_sent_at + checks.RELAY_MOTION_LIMIT_SEC:
+                if first_sent_at is not None and now >= first_sent_at + self.MOTION_LIMIT_SEC:
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 if first_sent_at is None:
                     # The post-relay sample was just checked; revalidate it
                     # below against the latest scan, pose and guard state.
                     now = self._now()
+                elif sampler is not None:
+                    now = self._now()
+                    # The producer keeps refreshing in parallel. Poll close
+                    # to the publication slot so a valid sample does not
+                    # spend most of its odometry lifetime waiting here.
+                    next_slot = max(last_sent_at + 0.005,
+                                    min(last_sent_at + self.period_sec, last_valid_until - 0.015))
+                    early_wait = max(0.0, next_slot - now - 0.005)
+                    if early_wait:
+                        self.clock.sleep(early_wait)
+                    pending = sampler.poll()
+                    if pending['state'] == 'fault':
+                        self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
+                        raise checks._StopError(pending['reason'])
+                    if pending['state'] == 'ready':
+                        current = pending['sample']
+                        self._last_depth_assessment = pending['assessment']
+                    now = self._now()
                 else:
-                    current, now = self._sample()
+                    # Do not capture the next sample immediately after a
+                    # command: its short odometry lifetime would mostly be
+                    # consumed while waiting for the next publication slot.
+                    # A small early wait still leaves most of the period for
+                    # slower real sensing and validation.
+                    now = self._now()
+                    next_slot = max(last_sent_at + 0.005,
+                                    min(last_sent_at + self.period_sec, last_valid_until - 0.015))
+                    early_wait = min(0.015, max(0.0, next_slot - now))
+                    if early_wait:
+                        self.clock.sleep(early_wait)
+                    sample_started = self._now()
+                    try:
+                        current, now = self._sample()
+                    finally:
+                        sample_elapsed = self._now() - sample_started
+                        result["motion_timing"]["last_sample_sec"] = sample_elapsed
+                        result["motion_timing"]["max_sample_sec"] = max(
+                            result["motion_timing"]["max_sample_sec"], sample_elapsed)
                 if current["epoch"] != sample["epoch"] or current["odom_at"] < previous_odom:
                     raise checks._StopError("odom_discontinuity")
                 step, rotation = checks._delta(previous, current["pose"])
@@ -804,8 +971,16 @@ class LiveTrial(object):
                 path += step
                 previous, previous_odom = current["pose"], current["odom_at"]
                 result["odom_displacement_m"], result["odom_path_m"] = displacement, path
-                if max(displacement, path) + self.speed_mps * self.period_sec >= checks.MAX_DISTANCE_M:
+                if max(displacement, path) + self.speed_mps * self.period_sec >= self.MAX_DISTANCE_M:
                     raise checks._StopError("distance_limit")
+                # Prepare the next checked observation while the previous
+                # command is active, then wait only for the remaining frame
+                # interval. Recheck the live inputs after any wait.
+                if last_sent_at is not None:
+                    now = self._now()
+                    remaining = next_slot - now
+                    if remaining > 0:
+                        self.clock.sleep(remaining)
                 if self.arbiter.verify() is not True:
                     raise checks._StopError("exclusive_arbitration_lost")
                 if self.serial_guard.verify() is not True:
@@ -813,23 +988,26 @@ class LiveTrial(object):
                 self._guard_evidence(result)
                 if self.relay.healthy() is not True:
                     raise checks._StopError("relay_failure")
-                if (self.source.is_current_epoch(current["epoch"]) is not True
-                        or self.source.is_current_sample(current) is not True):
-                    raise checks._StopError("sensor_unavailable")
-                now = self._now()
-                reason = self._validate(current, now)
-                if reason:
-                    raise checks._StopError(reason)
-                if (self.source.is_current_epoch(current["epoch"]) is not True
-                        or self.source.is_current_sample(current) is not True):
-                    raise checks._StopError("sensor_unavailable")
+                current_limit = getattr(self.source, "current_valid_until", None)
                 now = self._now()
                 if now >= deadline:
                     raise checks._StopError("time_limit")
-                if first_sent_at is not None and now >= first_sent_at + checks.RELAY_MOTION_LIMIT_SEC:
+                if first_sent_at is not None and now >= first_sent_at + self.MOTION_LIMIT_SEC:
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 if not _live_timestamps_fresh(current, now):
+                    self._last_diagnostic = {"step": "motion_final_timestamps"}
+                    if first_sent_at is None and now < pre_motion_retry_until:
+                        self.clock.sleep(0.01)
+                        current, now = self._aligned_stationary_sample(sample)
+                        if self.relay.send_zero_heartbeat() is not True:
+                            raise checks._StopError("relay_failure")
+                        ready_at = self._now()
+                        deadline = ready_at + self.duration_sec
+                        anchor = previous = current["pose"]
+                        previous_odom = current["odom_at"]
+                        path, sequence = 0.0, self.relay.sequence + 1
+                        continue
                     raise checks._StopError("sensor_unavailable")
                 if last_sent_at is None and self.relay.last_stamp is not None and now == self.relay.last_stamp:
                     self.clock.sleep(0.001)
@@ -842,24 +1020,96 @@ class LiveTrial(object):
                     self._model_fresh(sample, now)
                 if last_sent_at is not None and now <= last_sent_at:
                     raise checks._StopError("clock_invalid")
+                if last_sent_at is not None:
+                    result["motion_timing"]["last_submit_interval_sec"] = now - last_sent_at
+                proposed_first = now if first_sent_at is None else first_sent_at
+                if proposed_first + self.MOTION_LIMIT_SEC <= proposed_first:
+                    raise checks._StopError("clock_invalid")
+                ros_limit = getattr(self.arbiter, "valid_until", None)
+                serial_limit = getattr(self.serial_guard, "valid_until", None)
+                ros_until = ros_limit() if callable(ros_limit) else None
+                serial_until = serial_limit() if callable(serial_limit) else None
+                limits = {"ros_monitor": ros_until, "serial_monitor": serial_until, "trial": deadline,
+                          "relay": proposed_first + self.MOTION_LIMIT_SEC,
+                          "model_color": sample["color_at"] + checks.MODEL_MAX_AGE_SEC,
+                          "model_scan": sample["scan_at"] + checks.MODEL_MAX_AGE_SEC,
+                          "snapshot": current["snapshot_at"] + 0.25, "odom": current["odom_at"] + 0.25,
+                          "scan": current["scan_at"] + 0.5, "status": current["status_at"] + 1.0,
+                          "color": current["color_at"] + 0.5, "depth": current["depth_at"] + 0.5}
+                gate_limit = self._last_depth_assessment.get("valid_until")
+                if gate_limit is not None:
+                    limits["depth_gate"] = gate_limit
+                missing = [name for name, limit in limits.items() if not checks._finite(limit)]
+                if missing:
+                    self._last_diagnostic = {"step": "intent_deadline", "missing": missing}
+                    raise checks._StopError("expiry_unavailable")
+                final_sensor_until = current_limit(current) if callable(current_limit) else None
+                now = self._now()
+                if not checks._finite(final_sensor_until):
+                    issue = getattr(self.source, "current_issue", None)
+                    self._last_diagnostic = {"step": "motion_final_latest",
+                                             "detail": issue() if callable(issue) else None}
+                    if first_sent_at is not None:
+                        raise checks._StopError("sensor_unavailable")
+                    limiting, valid_until = "latest_sensors", now
+                else:
+                    limits["latest_sensors"] = final_sensor_until
+                    limiting = min(limits, key=limits.get)
+                    valid_until = limits[limiting]
+                if valid_until - now <= 0.03:
+                    self._last_diagnostic = {"step": "intent_deadline", "limiting": limiting,
+                                             "remaining_sec": valid_until - now}
+                    if (first_sent_at is None and now < pre_motion_retry_until
+                            and limiting not in ("relay", "trial", "model_color", "model_scan")):
+                        self.clock.sleep(0.01)
+                        current, now = self._aligned_stationary_sample(sample)
+                        if self.relay.send_zero_heartbeat() is not True:
+                            raise checks._StopError("relay_failure")
+                        ready_at = self._now()
+                        deadline = ready_at + self.duration_sec
+                        anchor = previous = current["pose"]
+                        previous_odom = current["odom_at"]
+                        path, sequence = 0.0, self.relay.sequence + 1
+                        continue
+                    if limiting == "relay":
+                        raise checks._StopError("motion_limit")
+                    if limiting == "trial":
+                        raise checks._StopError("time_limit")
+                    raise checks._StopError("expiry_unavailable")
+                result["motion_timing"]["last_intent_valid_sec"] = valid_until - now
+                result["motion_timing"]["last_intent_limit"] = limiting
+                if limiting == "latest_sensors":
+                    sensor_kind = getattr(self.source, "current_limit_kind", None)
+                    if callable(sensor_kind):
+                        result["motion_timing"]["last_sensor_limit"] = sensor_kind()
+                if sampler is not None:
+                    pending = sampler.poll()
+                    if pending['state'] == 'fault':
+                        self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
+                        raise checks._StopError(pending['reason'])
                 if first_sent_at is None:
-                    if now + checks.RELAY_MOTION_LIMIT_SEC <= now:
-                        raise checks._StopError("clock_invalid")
                     first_sent_at = now
                 result["motion_requested"] = True
-                if self.relay.send_frame(sequence, now, self.speed_mps, 0.0) is not True:
+                if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
+                                         valid_until=valid_until) is not True:
                     raise checks._StopError("relay_failure")
+                self._motion_started = True
+                if sampler is not None and not sampler_started:
+                    sampler.start()
+                    sampler_started = True
                 sequence += 1
                 last_sent_at = now
+                last_valid_until = valid_until
                 now = self._now()
                 if now >= deadline:
                     raise checks._StopError("time_limit")
-                self.clock.sleep(min(self.period_sec, deadline - now))
         except checks._StopError as exc:
             result["reason"] = str(exc)
         except BaseException:
             result["reason"] = "exception"
         finally:
+            if sampler is not None:
+                sampler.close(0)
             relay_exited = not attempted_arm
             try:
                 if armed:
@@ -876,6 +1126,17 @@ class LiveTrial(object):
                 if not relay_exited:
                     result["trigger_reason"] = result["reason"]
                     result["reason"] = "relay_unreaped"
+            if sampler is not None:
+                result['sampler_closed'] = sampler.close(0.2)
+            if gc_suspended:
+                gc.enable()
+            if safety_mode_enabled:
+                try:
+                    restore = getattr(self.source, "restore_model_snapshots", None)
+                    if callable(restore):
+                        restore()
+                except Exception:
+                    result["source_restore_failed"] = True
             try:
                 if serial_acquired and relay_exited:
                     self.serial_guard.release()
@@ -899,6 +1160,15 @@ class LiveTrial(object):
                 except Exception:
                     result[name] = {"reason": "diagnostic_unavailable"}
         return result
+
+
+class LongerForwardTrial(LiveTrial):
+    """A separately opted-in, bounded forward trial; not full exploration."""
+    MAX_DURATION_SEC = 2.0
+    MOTION_LIMIT_SEC = 2.0
+    MAX_DISTANCE_M = 0.04
+    ASYNC_SAMPLING = True
+    ARM_BEFORE_MODEL = True
 
 
 if __name__ == "__main__":

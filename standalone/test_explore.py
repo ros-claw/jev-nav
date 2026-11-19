@@ -4,6 +4,7 @@ import math
 import threading
 
 import numpy as np
+import pytest
 from explore import (
     DecisionGate,
     RosObservation,
@@ -164,11 +165,18 @@ def test_current_sample_rejects_new_scan_odom_drift_or_base_fault():
     observer.lock = threading.Lock()
     observer.epoch = 2
     observer.clock_guard, observer.odom_guard = Guard(), Guard()
+    observer.odom_history = [{'stamp': now, 'pose': (0.0, 0.0, 0.0), 'epoch': 2}]
     observer.latest = {'odom': {'stamp': now, 'pose': (0.0, 0.0, 0.0), 'message': odom},
-                       'status': {'stamp': now, 'message': status}, 'scan': {'stamp': now}}
+                       'status': {'stamp': now, 'message': status}, 'scan': {'stamp': now},
+                       'depth': {'stamp': now}}
     sample = {'epoch': 2, 'snapshot_at': now, 'scan_at': now, 'status_at': now, 'depth_at': now,
-              'color_at': now, 'pose': (0.0, 0.0, 0.0)}
+              'color_at': now, 'pose': (0.0, 0.0, 0.0),
+              'scene': {'status': 'ok', 'coverage': {'sensor_fresh': True}, 'rays': [], 'occupied_hits': []}}
     assert observer.is_current_sample(sample)
+    observer.latest['depth']['stamp'] = now + 0.01
+    assert not observer.is_current_sample(sample)
+    assert observer.current_last_issue == 'new_depth_unchecked'
+    observer.latest['depth']['stamp'] = now
     observer.latest['scan']['stamp'] += 0.01
     assert not observer.is_current_sample(sample)
     observer.latest['scan']['stamp'] = now
@@ -177,11 +185,13 @@ def test_current_sample_rejects_new_scan_odom_drift_or_base_fault():
     observer.latest['odom']['pose'] = (0.0, 0.0, 0.0)
     status.error_code = 1
     assert not observer.is_current_sample(sample)
+    assert observer.current_last_issue == 'base_state'
     status.error_code = 0
     scan = Value()
     scan.header = Value()
     scan.header.frame_id = 'laser_link'
     scan.angle_min, scan.angle_increment = -1.57079632679, 0.01745329252
+    scan.time_increment = 0.0
     scan.range_min, scan.range_max, scan.ranges = 0.1, 8.0, [2.0] * 181
     observer.extrinsics = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)
     observer.latest['scan']['message'] = scan
@@ -228,6 +238,129 @@ def test_odometry_subscription_can_buffer_short_cpu_scheduling_delays():
     assert sensor_queue_size('color') == 1
 
 
+def test_missing_sensor_snapshot_has_a_non_sensitive_reason():
+    import collections
+    class Guard(object):
+        faulted = False
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock = threading.Lock()
+    observer.clock_guard = observer.odom_guard = Guard()
+    observer.latest = {}
+    observer.odom_history = collections.deque()
+    observer.epoch = 0
+    observer.limits = {'scan': 0.5}
+    assert observer.snapshot() is None
+    assert observer.snapshot_last_issue == 'missing_scan'
+
+
+def test_depth_transform_fallback_requires_known_unchanged_recent_rigid_transform():
+    from explore import lookup_rigid_transform
+
+    class Stamp(object):
+        def __init__(self, value):
+            self.value = value
+        def to_sec(self):
+            return self.value
+
+    class Transformations(object):
+        @staticmethod
+        def euler_from_quaternion(rotation):
+            return rotation[:3]
+
+    class Tf(object):
+        class ExtrapolationException(Exception):  # noqa: N818 - matches ROS API
+            pass
+        transformations = Transformations()
+
+    class Ros(object):
+        Time = Stamp
+
+    class Listener(object):
+        common = 99.94
+        translation = (0.1, 0.0, 0.1)
+        def lookupTransform(self, target, frame, stamp):  # noqa: N802 - matches ROS API
+            if stamp.value:
+                raise Tf.ExtrapolationException()
+            return self.translation, (0.0, 0.0, 0.0, 1.0)
+        def getLatestCommonTime(self, target, frame):  # noqa: N802 - matches ROS API
+            return Stamp(self.common)
+
+    listener = Listener()
+    known = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)
+    assert lookup_rigid_transform(listener, Tf, Ros, 'camera_depth_optical_frame',
+                                  Stamp(100.0), known)[0] == listener.translation
+    with pytest.raises(Tf.ExtrapolationException):
+        lookup_rigid_transform(listener, Tf, Ros, 'camera_depth_optical_frame', Stamp(100.0), None)
+    listener.common = 99.7
+    with pytest.raises(ValueError):
+        lookup_rigid_transform(listener, Tf, Ros, 'camera_depth_optical_frame', Stamp(100.0), known)
+    listener.common = 99.94
+    listener.translation = (0.2, 0.0, 0.1)
+    with pytest.raises(ValueError):
+        lookup_rigid_transform(listener, Tf, Ros, 'camera_depth_optical_frame', Stamp(100.0), known)
+
+
+def test_projection_only_summary_keeps_stamp_without_running_full_image_statistics(monkeypatch):
+    import explore
+    def unexpected(*args):
+        raise AssertionError('full image statistics are not needed by the projected gate')
+    monkeypatch.setattr(explore, 'depth_grid', unexpected)
+    assert explore.depth_summary_for_snapshot(None, '16UC1', 10.0, True) == {'stamp': 10.0}
+    assert explore.depth_summary_for_snapshot(None, '16UC1', float('nan'), True) is None
+
+
+def test_newer_depth_frame_requires_projection_and_rejects_obstacles(monkeypatch):
+    import explore
+    from test_projected_depth_gate import sample as projected_sample
+    class Value(object):
+        pass
+    class Transformations(object):
+        @staticmethod
+        def quaternion_from_euler(*args):
+            return (0.0, 0.0, 0.0, 1.0)
+        @staticmethod
+        def quaternion_matrix(_rotation):
+            return np.eye(4)
+    class Bridge(object):
+        def imgmsg_to_cv2(self, message, desired_encoding):
+            return np.ones((6, 6), dtype=np.uint16)
+    depth, info = Value(), Value()
+    depth.header, info.header = Value(), Value()
+    depth.header.frame_id = info.header.frame_id = 'camera_depth_optical_frame'
+    depth.width = info.width = depth.height = info.height = 6
+    depth.encoding = '16UC1'
+    info.K = [1.0, 0, 2.0, 0, 1.0, 2.0, 0, 0, 1.0]
+    observer = RosObservation.__new__(RosObservation)
+    observer.bridge = Bridge()
+    observer.tf = Value()
+    observer.tf.transformations = Transformations()
+    observer.depth_projection_config = {'sample_stride': 4}
+    observer.depth_extrinsics = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)
+    observer.epoch = 2
+    observer.odom_history = [{'stamp': 100.0, 'pose': (0.0, 0.0, 0.0), 'epoch': 2}]
+    observer.latest = {'info': {'stamp': 100.0, 'message': info}}
+    frame = {'stamp': 100.0, 'message': depth}
+    odom = {'pose': (0.0, 0.0, 0.0)}
+    original = {'pose': (0.0, 0.0, 0.0)}
+    corridor = projected_sample()['depth']['corridor']
+    calls = []
+    def project(*args):
+        calls.append(True)
+        return corridor
+    monkeypatch.setattr(explore, 'project_depth_frame', project)
+    assert observer._newest_depth_safe_locked(original, frame, odom, 100.01)
+    assert observer._newest_depth_safe_locked(original, frame, odom, 100.01)
+    assert len(calls) == 1
+    frame['stamp'] = observer.latest['info']['stamp'] = 100.01
+    observer.odom_history[0]['stamp'] = 100.01
+    corridor['stamp'] = 100.01
+    corridor['obstacle_count'] = 1
+    corridor['outside_corridor_count'] -= 1
+    assert not observer._newest_depth_safe_locked(original, frame, odom, 100.02)
+    corridor['obstacle_count'] = 0
+    corridor['outside_corridor_count'] += 1
+    observer.odom_history[0]['stamp'] = 99.8
+    assert not observer._newest_depth_safe_locked(original, frame, odom, 100.01)
 def test_newer_scan_is_checked_for_obstacles_instead_of_unconditionally_discarding_sample():
     from explore import newest_scan_veto
 
@@ -237,6 +370,7 @@ def test_newer_scan_is_checked_for_obstacles_instead_of_unconditionally_discardi
     scan.header = Value()
     scan.header.frame_id = 'laser_link'
     scan.angle_min, scan.angle_increment = -1.57079632679, 0.01745329252
+    scan.time_increment = 0.0
     scan.range_min, scan.range_max = 0.1, 8.0
     scan.ranges = [2.0] * 181
     extrinsics = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)
@@ -251,6 +385,77 @@ def test_newer_scan_is_checked_for_obstacles_instead_of_unconditionally_discardi
     scan.header.frame_id = 'laser_link'
     scan.angle_increment = 1.0
     assert newest_scan_veto(scan, extrinsics) is False
+    scan.angle_increment = 0.01745329252
+    scan.time_increment = -0.01
+    assert newest_scan_veto(scan, extrinsics) is False
+
+
+def test_newer_scan_cannot_replace_corridor_coverage_with_twenty_side_rays():
+    from explore import newest_scan_veto
+    class Value(object):
+        pass
+    scan = Value()
+    scan.header = Value()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -math.pi, 2 * math.pi / 719.0
+    scan.time_increment = 0.0
+    scan.range_min, scan.range_max = 0.1, 8.0
+    scan.ranges = [0.0] * 720
+    for index in range(440, 460):
+        scan.ranges[index] = 2.0
+    assert newest_scan_veto(scan, (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)) is False
+
+
+def test_newer_scan_can_combine_recent_pose_aligned_history_but_not_stale_history():
+    from explore import newest_scan_veto
+    class Value(object):
+        pass
+    scan = Value()
+    scan.header = Value()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -0.3, 0.6 / 32.0
+    scan.time_increment = 0.0
+    scan.range_min, scan.range_max = 0.1, 8.0
+    latest = (0, 6, 12, 18, 24, 30, 32)
+    scan.ranges = [2.0 if index in latest else 0.0 for index in range(33)]
+    rays = []
+    for index in (0, 3, 9, 15, 21, 27, 32):
+        angle = scan.angle_min + index * scan.angle_increment
+        rays.append({'start_base': (0.1, 0.0),
+                     'hit_base': (0.1 + 2.0 * math.cos(angle), 2.0 * math.sin(angle)),
+                     'stamp': 10.0})
+    scene = {'status': 'ok', 'coverage': {'sensor_fresh': True, 'scan_stamp': 10.0},
+             'rays': rays, 'occupied_hits': [{'point_base': ray['hit_base'], 'stamp': ray['stamp']}
+                                              for ray in rays]}
+    extrinsics, pose = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    assert not newest_scan_veto(scan, extrinsics)
+    assert newest_scan_veto(scan, extrinsics, scene, 10.1, 10.1, pose, pose, pose)
+    assert not newest_scan_veto(scan, extrinsics, scene, 10.8, 10.8, pose, pose, pose)
+
+
+def test_fast_recent_history_agrees_with_scalar_new_scan_check(monkeypatch):
+    import explore
+    from test_policy import fusion_scene
+    class Value(object):
+        pass
+    scan = Value()
+    scan.header = Value()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -0.3, 0.6 / 32.0
+    scan.time_increment = 0.0
+    scan.range_min, scan.range_max = 0.1, 8.0
+    pose = (0.0, 0.0, 0.0)
+    scene = fusion_scene(10.0, 10.1, [2.0] * 33, [2.0] * 33)
+    original_numpy = explore._np
+    assert original_numpy is not None
+    for missing in (0, 2, 3, 4, 5, 6, 7):
+        scan.ranges = [2.0 if missing == 0 or i % missing != 0 else 0.0 for i in range(33)]
+        monkeypatch.setattr(explore, '_np', None)
+        expected = explore.newest_scan_veto(scan, (0.105, 0.0, 0.1, 0.0, 0.0, 0.0),
+                                            scene, 10.2, 10.2, pose, pose, pose)
+        monkeypatch.setattr(explore, '_np', original_numpy)
+        assert explore.newest_scan_veto(scan, (0.105, 0.0, 0.1, 0.0, 0.0, 0.0),
+                                       scene, 10.2, 10.2, pose, pose, pose) == expected
 
 
 def test_depth_grid_reports_spatial_gaps_not_just_global_fraction():

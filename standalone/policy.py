@@ -16,6 +16,11 @@ from __future__ import division
 import math
 
 try:
+    import numpy as _np
+except ImportError:  # scalar implementation remains available
+    _np = None
+
+try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - ROS Melodic Python 2
 except NameError:
     INTEGER_TYPES = (int,)
@@ -40,6 +45,66 @@ def _largest_gap(crossings, half_width):
     gaps = [values[0] + half_width, half_width - values[-1]]
     gaps.extend(values[i] - values[i - 1] for i in range(1, len(values)))
     return max(gaps)
+
+
+def _fast_assess_rays(rays, hits, scan_stamp, latest_valid, now, line_x, half_width,
+                      max_age, max_gap, history_age_limit, history_span_limit):
+    """Vectorize the immutable, shared tuple form emitted by scan fusion.
+
+    Return None for any other input shape so the full scalar validator keeps
+    its original behavior for malformed or externally constructed evidence.
+    """
+    if _np is None or len(rays) < 32:
+        return None
+    rows = []
+    for ray, hit in zip(rays, hits):
+        if type(ray) is not dict or type(hit) is not dict:
+            return None
+        try:
+            start, end, stamp = ray['start_base'], ray['hit_base'], ray['stamp']
+            if (type(start) is not tuple or len(start) != 2 or type(end) is not tuple or len(end) != 2
+                    or hit['point_base'] is not end or hit['stamp'] is not stamp or type(stamp) is not float
+                    or type(start[0]) is not float or type(start[1]) is not float
+                    or type(end[0]) is not float or type(end[1]) is not float):
+                return None
+            rows.append((start[0], start[1], end[0], end[1], stamp))
+        except (KeyError, IndexError, TypeError):
+            return None
+    try:
+        data = _np.asarray(rows, dtype=_np.float64)
+        sx, sy, hx, hy, stamps = data.T
+        if (not _np.all(_np.isfinite(data)) or _np.any(stamps < 0) or _np.any(stamps > scan_stamp)):
+            return None
+        result = {"candidate": False, "reason": "invalid_evidence", "geometric_clearance_verified": False}
+        if _np.any((hx >= -0.18) & (hx <= line_x) & (_np.abs(hy) <= max(half_width, 0.15))):
+            result['reason'] = 'forward_obstacle'
+            return result
+        latest = stamps == scan_stamp
+        if int(_np.count_nonzero(latest)) != latest_valid:
+            return result
+        age = now - stamps
+        recent = ((age >= 0) & (age <= min(history_age_limit, max_age))
+                  & (scan_stamp - stamps <= history_span_limit)
+                  & (sx <= line_x) & (hx > line_x))
+        indices = _np.flatnonzero(recent)
+        with _np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            crossing_y = sy[indices] + ((line_x - sx[indices]) / (hx[indices] - sx[indices])) * (hy[indices] - sy[indices])
+        if not _np.all(_np.isfinite(crossing_y)):
+            return None
+        inside = (crossing_y >= -half_width) & (crossing_y <= half_width)
+        crossings = crossing_y[inside].tolist()
+        latest_crossings = crossing_y[inside & latest[indices]].tolist()
+        result['samples'] = len(crossings)
+        result['max_sample_gap_m'] = _largest_gap(crossings, half_width)
+        result['latest_max_sample_gap_m'] = _largest_gap(latest_crossings, half_width)
+        if (not crossings or not latest_crossings or result['max_sample_gap_m'] > max_gap
+                or result['latest_max_sample_gap_m'] > 2 * max_gap):
+            result['reason'] = 'forward_coverage_incomplete'
+            return result
+        result.update(candidate=True, reason='sampled_forward_corridor')
+        return result
+    except (ArithmeticError, AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def assess_front(scene, now, line_x=0.60, half_width=0.15, max_age=0.65, max_gap=0.035,
@@ -84,6 +149,10 @@ def assess_front(scene, now, line_x=0.60, half_width=0.15, max_age=0.65, max_gap
         if (not isinstance(rays, list) or not isinstance(hits, list)
                 or len(rays) > 200000 or len(rays) != len(hits)):
             return result
+        fast = _fast_assess_rays(rays, hits, scan_stamp, latest_valid, now, line_x, half_width,
+                                 max_age, max_gap, history_age_limit, history_span_limit)
+        if fast is not None:
+            return fast
         crossings = []
         latest_crossings = []
         latest_ray_count = 0

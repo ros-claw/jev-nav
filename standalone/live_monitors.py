@@ -302,6 +302,26 @@ class _AsyncMonitor(object):
                 return {}
             return copy.deepcopy(result)
 
+    def _additional_deadlines(self, sample, now, mono_now):
+        return []
+
+    def valid_until(self):
+        """Return the earliest cache/evidence expiry in the injected clock domain."""
+        with self._lock:
+            if not self._acquired or not self._confirmed or self._read() is None:
+                return None
+            try:
+                now, mono_now = self.clock.now(), _monotonic()
+                deadlines = [self._sample_at + self.max_age,
+                             now + self.max_age - (mono_now - self._sample_mono_at)]
+                deadlines.extend(self._additional_deadlines(self._sample, now, mono_now))
+                if not all(_number(item) for item in deadlines):
+                    return None
+                deadline = min(deadlines)
+                return deadline if now < deadline else None
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                return None
+
     def release(self):
         self._stop.set()
         self._wake.set()
@@ -349,6 +369,33 @@ class RosCallerMonitor(_AsyncMonitor):
         self._relay_pid = None
         self._last_status = None
 
+    def _graph_fresh(self, sample, now):
+        get_generation = getattr(self.backend, "graph_generation", None)
+        if not callable(get_generation):
+            return True  # Existing injectable backends retain their contract.
+        try:
+            observed = sample["graph_observed_at"]
+            observed_mono = sample["graph_observed_mono_at"]
+            generation = sample["graph_generation"]
+            return (not isinstance(generation, bool) and isinstance(generation, INTS)
+                    and generation == get_generation()
+                    and _number(now) and _number(observed) and _number(observed_mono)
+                    and 0 <= now - observed <= 1.2
+                    and 0 <= _monotonic() - observed_mono <= 1.2)
+        except BaseException:
+            return False
+
+    def _additional_deadlines(self, sample, now, mono_now):
+        packet = sample['watchdog']
+        status = _parse_watchdog(packet, now, self.driver_pid)
+        if status is None:
+            return [None]
+        limits = [status['generated_at'] + 0.25, packet['received_at'] + 0.25]
+        if callable(getattr(self.backend, 'graph_generation', None)):
+            limits.extend([sample['graph_observed_at'] + 1.2,
+                           now + 1.2 - (mono_now - sample['graph_observed_mono_at'])])
+        return limits
+
     def _diagnostic_details(self, sample):
         # Never include raw graph entries, caller names, status text or URIs.
         details = {"driver_pid_expected": self.driver_pid, "relay_pid_expected": self._relay_pid,
@@ -390,6 +437,8 @@ class RosCallerMonitor(_AsyncMonitor):
     def _diagnose_assessment(self, sample, now):
         """Explain a failed assessment without mutating status or querying ROS."""
         try:
+            if not self._graph_fresh(sample, now):
+                return "graph_expired_or_invalidated"
             pubs = sample["cmd_vel_publishers"]
             drivers = sample["watchdog_publishers"]
             pids = sample["node_pids"]
@@ -447,6 +496,8 @@ class RosCallerMonitor(_AsyncMonitor):
 
     def _assess(self, sample, now):
         try:
+            if not self._graph_fresh(sample, now):
+                return None
             pubs = sample["cmd_vel_publishers"]
             drivers = sample["watchdog_publishers"]
             pids = sample["node_pids"]
@@ -471,11 +522,16 @@ class RosCallerMonitor(_AsyncMonitor):
                     or status["source"] != pubs[0] or status["primed"] != 1
                     or status["count"] == 0 or not self._relay_alive()):
                 return None
-            return {"driver_caller_bound": True, "observed_competitors": [], "graph_query_atomic": False,
-                    "relay_node": pubs[0], "relay_pid": self._relay_pid, "driver_node": drivers[0],
-                    "driver_pid": self.driver_pid, "watchdog_source": status["source"],
-                    "watchdog_boot_id": status["boot_id"], "watchdog_generated_at": status["generated_at"],
-                    "checked_at": self._sample_at}
+            result = {"driver_caller_bound": True, "observed_competitors": [], "graph_query_atomic": False,
+                      "relay_node": pubs[0], "relay_pid": self._relay_pid, "driver_node": drivers[0],
+                      "driver_pid": self.driver_pid, "watchdog_source": status["source"],
+                      "watchdog_boot_id": status["boot_id"], "watchdog_generated_at": status["generated_at"],
+                      "checked_at": self._sample_at}
+            if callable(getattr(self.backend, "graph_generation", None)):
+                result.update({"graph_observed_at": sample["graph_observed_at"],
+                               "graph_age_sec": now - sample["graph_observed_at"],
+                               "graph_max_age_sec": 1.2})
+            return result
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None
 
@@ -494,6 +550,9 @@ class RosCallerMonitor(_AsyncMonitor):
             with self._lock:
                 if not self._acquired or self._confirmed or self._faulted:
                     return False
+                invalidate = getattr(self.backend, "invalidate_graph", None)
+                if callable(invalidate):
+                    invalidate()
                 self._relay, self._relay_pid = relay, process.pid
             self._wake.set()
             if not self._wait_valid(self.bind_timeout):
@@ -552,6 +611,18 @@ class SerialOwnershipMonitor(_AsyncMonitor):
                     "fuser_visibility_complete": False}
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None
+
+    def _additional_deadlines(self, sample, now, mono_now):
+        return [sample['fuser_at'] + 1.2]
+
+    def valid_until(self):
+        own = _AsyncMonitor.valid_until(self)
+        if own is None:
+            return None
+        if self.ros_monitor is None:
+            return own
+        linked = self.ros_monitor.valid_until()
+        return min(own, linked) if _number(linked) else None
 
     def acquire(self):
         if not _AsyncMonitor.acquire(self):
@@ -620,6 +691,20 @@ class Ros1ReadOnlyBackend(object):
         self.subscriber = None
         self.caller_id = "/standalone_trial_monitor"
         self._diagnostic_rpc_failure = None
+        self._graph_lock = threading.Lock()
+        self._graph_generation = 0
+        self._graph_cache = None
+
+    def graph_generation(self):
+        with self._graph_lock:
+            return self._graph_generation
+
+    def invalidate_graph(self):
+        """Require queries started after this call; do not wait for in-flight RPC."""
+        with self._graph_lock:
+            self._graph_generation += 1
+            self._graph_cache = None
+            return self._graph_generation
 
     def _proxy(self, uri):
         if not isinstance(uri, STRINGS) or not uri.startswith("http://"):
@@ -664,8 +749,7 @@ class Ros1ReadOnlyBackend(object):
             self._diagnostic_rpc_failure = "rpc_exception"
             raise
 
-    def sample(self):
-        self._diagnostic_rpc_failure = None
+    def _query_graph(self):
         master = self._proxy(self.master_uri)
         state = self._rpc_value(master.getSystemState, self.caller_id)
         if not isinstance(state, (tuple, list)) or len(state) != 3:
@@ -691,10 +775,60 @@ class Ros1ReadOnlyBackend(object):
             if not _valid_pid(pid):
                 raise ValueError("invalid ROS node PID")
             node_pids[node] = pid
-        with self.lock:
-            watchdog = copy.deepcopy(self.watchdog)
         return {"cmd_vel_publishers": cmd, "watchdog_publishers": status_nodes,
-                "node_pids": node_pids, "watchdog": watchdog}
+                "node_pids": node_pids}
+
+    def sample(self):
+        """Reuse graph/PIDs for <0.75 s; always read the latest watchdog packet.
+
+        Graph time is the beginning of the non-atomic RPC sequence. Invalidation
+        discards in-flight older generations, and a slower concurrent query
+        cannot overwrite a newer cache. Clock regressions and RPC errors fail
+        closed; a failed refresh never silently reuses stale graph data.
+        """
+        self._diagnostic_rpc_failure = None
+        graph = None
+        for _ in range(3):
+            now, mono = self.clock.now(), _monotonic()
+            if not _number(now) or not _number(mono):
+                raise ValueError("invalid graph clock")
+            with self._graph_lock:
+                generation = self._graph_generation
+                cached = self._graph_cache
+                if cached is not None:
+                    age = now - cached["graph_observed_at"]
+                    mono_age = mono - cached["graph_observed_mono_at"]
+                    if age < 0 or mono_age < 0:
+                        raise ValueError("graph clock regressed")
+                    if age < 0.75 and mono_age < 0.75:
+                        graph = copy.deepcopy(cached)
+                        break
+            graph = self._query_graph()
+            after, after_mono = self.clock.now(), _monotonic()
+            if (not _number(after) or not _number(after_mono)
+                    or not 0 <= after - now <= 1.2 or not 0 <= after_mono - mono <= 1.2):
+                raise ValueError("graph observation expired or clock changed")
+            graph.update({"graph_observed_at": now, "graph_observed_mono_at": mono,
+                          "graph_generation": generation})
+            with self._graph_lock:
+                if generation != self._graph_generation:
+                    graph = None
+                    continue
+                cached = self._graph_cache
+                if cached is None or cached["graph_observed_mono_at"] <= mono:
+                    self._graph_cache = copy.deepcopy(graph)
+                else:
+                    # A newer concurrent query has already completed.
+                    if (not 0 <= after - cached["graph_observed_at"] <= 1.2
+                            or not 0 <= after_mono - cached["graph_observed_mono_at"] <= 1.2):
+                        raise ValueError("concurrent graph observation expired")
+                    graph = copy.deepcopy(cached)
+                break
+        if graph is None:
+            raise ValueError("graph invalidated repeatedly")
+        with self.lock:
+            graph["watchdog"] = copy.deepcopy(self.watchdog)
+        return graph
 
     def stop(self):
         if self.subscriber is not None:

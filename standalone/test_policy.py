@@ -2,6 +2,7 @@
 
 import math
 import os
+import random
 import sys
 
 import pytest
@@ -82,6 +83,30 @@ def test_fresh_front_samples_can_be_a_candidate_without_certifying_clearance():
     result = assess_front(sample(), 10.1)
     assert result["candidate"] is True
     assert result["geometric_clearance_verified"] is False
+
+
+def test_vectorized_fusion_check_matches_scalar_for_sparse_and_blocked_scans(monkeypatch):
+    import policy
+    assert callable(policy._fast_assess_rays)
+    rng = random.Random(6210)
+    numpy_module = policy._np
+    assert numpy_module is not None
+    for case in range(400):
+        old = [rng.choice([0.0, 0.0, 2.0, 2.0]) for _ in range(33)]
+        if case % 4 == 0:
+            old[rng.randrange(33)] = 0.25
+        new = [rng.choice([0.0, 2.0, 2.0, 2.0]) for _ in range(33)]
+        scene = fusion_scene(10.0, 10.2, old, new)
+        monkeypatch.setattr(policy, '_np', None)
+        expected = policy.assess_front(scene, 10.2)
+        monkeypatch.setattr(policy, '_np', numpy_module)
+        actual = policy.assess_front(scene, 10.2)
+        assert set(actual) == set(expected)
+        for key in expected:
+            if isinstance(expected[key], float):
+                assert actual[key] == pytest.approx(expected[key], abs=1e-12)
+            else:
+                assert actual[key] == expected[key]
 
 
 def test_missing_directional_samples_are_not_filled_by_old_rays():

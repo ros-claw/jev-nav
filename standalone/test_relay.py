@@ -21,6 +21,24 @@ except ImportError:  # Python 3.12 removed imp; ROS Melodic still uses Python 2.
 
 
 class GateTests(unittest.TestCase):
+    def test_required_intent_deadline_expires_before_heartbeat_and_latches(self):
+        gate = relay.RelayGate(10.0, require_intent_deadline=True)
+        frame = {'sequence': 0, 'stamp': 10.0, 'linear': 0.02, 'angular': 0.0,
+                 'expires_at': 10.06}
+        self.assertTrue(gate.accept(frame, 10.0))
+        self.assertEqual(gate.command(10.05), (0.02, 0.0))
+        self.assertEqual(gate.command(10.06), (0.0, 0.0))
+        self.assertEqual(gate.reason, 'intent_deadline')
+        self.assertFalse(gate.accept(dict(frame, sequence=1, stamp=10.07, expires_at=10.15), 10.07))
+
+    def test_required_intent_deadline_rejects_missing_stale_or_unbounded_values(self):
+        frame = {'sequence': 0, 'stamp': 10.0, 'linear': 0.02, 'angular': 0.0}
+        for expiry in (None, 9.99, 10.0, 10.201, float('nan'), True):
+            gate = relay.RelayGate(10.0, require_intent_deadline=True)
+            value = frame if expiry is None else dict(frame, expires_at=expiry)
+            self.assertFalse(gate.accept(value, 10.0))
+            self.assertEqual(gate.command(10.01), (0.0, 0.0))
+
     def test_independent_motion_deadline_cannot_be_extended_by_heartbeats(self):
         gate = relay.RelayGate(10.0, max_motion_sec=0.4)
         for sequence, stamp in enumerate((10.05, 10.15, 10.25, 10.35, 10.44)):
@@ -116,6 +134,14 @@ class GateTests(unittest.TestCase):
 
 
 class WorkerProgressTests(unittest.TestCase):
+    def test_ros_worker_checks_intent_expiry_at_publication_time(self):
+        shared = relay._Shared()
+        shared.set_command((0.02, 0.0), 10.0, 10.06)
+        self.assertEqual(shared.command_for_publish(lambda: 10.05)[1], (0.02, 0.0))
+        fault, command, _ = shared.command_for_publish(lambda: 10.06)
+        self.assertEqual(command, (0.0, 0.0))
+        self.assertEqual(fault, 'intent_deadline')
+
     def test_progress_clock_is_sampled_under_same_lock_as_progress(self):
         shared = relay._Shared()
         shared.progressed(10.1)

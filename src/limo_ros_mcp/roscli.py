@@ -31,6 +31,9 @@ from limo_ros_mcp.workers.scene_observation_core import (
 
 _READINESS_WORKER_PROTOCOL = "rosclaw.limo.readiness-worker.v1"
 _CAMERA_WORKER_PROTOCOL = "rosclaw.limo.camera-capture-worker.v1"
+# Python 2, rospy and cv_bridge imports can be slow on a cold, swapped Jetson.
+# This is a parent-process budget; the worker's sensor wait remains unchanged.
+_CAMERA_WORKER_STARTUP_BUDGET_SEC = 20.0
 _DEPTH_WORKER_PROTOCOL = "rosclaw.limo.depth-summary-worker.v1"
 _LOCAL_OBSERVATION_PROTOCOL = "rosclaw.limo.local-observation.v1"
 _CALIBRATION_DIAGNOSTIC_PROTOCOL = "rosclaw.limo.calibration-diagnostic.v1"
@@ -486,7 +489,7 @@ class RosCliReadOnlyClient:
             capture_output=True,
             text=True,
             input=json.dumps(request, separators=(",", ":")),
-            timeout=self.timeout_sec + 3.0,
+            timeout=self.timeout_sec + _CAMERA_WORKER_STARTUP_BUDGET_SEC,
             env=self._environment,
         )
         if len(result.stdout.encode("utf-8")) > 6_000_000:

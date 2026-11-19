@@ -20,6 +20,8 @@ import time
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--execute', action='store_true', help='enable a single bounded motion trial')
+    parser.add_argument('--longer-forward', action='store_true',
+                        help='allow up to two seconds of forward motion in this trial')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -73,6 +75,19 @@ class RealClock(object):  # noqa: UP004 - ROS Melodic Python 2
         time.sleep(delay)
 
 
+def make_relay(clock, motion_limit_sec=0.3):
+    from live_trial_adapter import RelayProcessTransport
+    from threaded_relay_adapter import ThreadedRelayAdapter
+    return ThreadedRelayAdapter(RelayProcessTransport(clock), clock, motion_limit_sec=motion_limit_sec)
+
+
+def make_ros_monitor(clock, driver_pid, master_uri):
+    from live_monitors import Ros1ReadOnlyBackend, RosCallerMonitor
+    backend = Ros1ReadOnlyBackend(master_uri, clock, rpc_timeout=0.2)
+    return RosCallerMonitor(backend, clock, driver_pid, poll_interval=0.1, max_age=0.3,
+                            acquire_timeout=1.0, bind_timeout=0.35)
+
+
 class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
     """Subscribe only; never publish a command."""
     def __init__(self, clock):
@@ -112,8 +127,6 @@ def main(argv=None):
     from explore import RosObservation
     from live_monitors import (
         ProcSerialBackend,
-        Ros1ReadOnlyBackend,
-        RosCallerMonitor,
         SerialOwnershipMonitor,
     )
     from live_trial_adapter import (
@@ -121,9 +134,8 @@ def main(argv=None):
         DecisionsAdapter,
         ExistingDecisionHelper,
         LiveTrial,
+        LongerForwardTrial,
         ObservationAdapter,
-        RelayAdapter,
-        RelayProcessTransport,
     )
     from projected_depth_gate import ProjectedDepthGate
 
@@ -140,7 +152,8 @@ def main(argv=None):
                       'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': 4}
     observation = RosObservation(depth_projection_config=projection)
     recorder = ObservationRecorder(clock)
-    source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge))
+    source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
+                                projection_only_after_model=True)
     # Populate subscriptions and scan fusion before the bounded session starts.
     warm_until = clock.now() + 2.0
     while clock.now() < warm_until and not rospy.is_shutdown():
@@ -150,20 +163,21 @@ def main(argv=None):
         print(json.dumps({'mode': 'observation_only', 'observation': observation.diagnostic_status(),
                           'recorder': recorder.summary()}, allow_nan=False))
         return 0
-    backend = Ros1ReadOnlyBackend(os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'), clock)
-    ros_guard = RosCallerMonitor(backend, clock, args.driver_pid, max_age=0.3,
-                                 acquire_timeout=1.0, bind_timeout=0.16)
+    ros_guard = make_ros_monitor(clock, args.driver_pid,
+                                os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'))
     serial_backend = ProcSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1', fuser_timeout=0.4)
     serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                           args.driver_sha256, max_age=0.6, acquire_timeout=1.2,
                                           ros_monitor=ros_guard)
     model = DecisionsAdapter(ExistingDecisionHelper(clock, cancelled=rospy.is_shutdown))
-    relay = RelayAdapter(RelayProcessTransport(clock), clock)
+    relay = make_relay(clock, motion_limit_sec=2.0 if args.longer_forward else 0.3)
     report = {'clear_room': True, 'operator_present': True, 'emergency_stop_available': True,
               'source': 'operator_report', 'independently_verified': False}
-    trial = LiveTrial(source, model, relay, ros_guard, clock, enable_motion=True,
-                      serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
-                      operator_site_report=report)
+    trial_class = LongerForwardTrial if args.longer_forward else LiveTrial
+    trial = trial_class(source, model, relay, ros_guard, clock, enable_motion=True,
+                        duration_sec=2.0 if args.longer_forward else 0.6,
+                        serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
+                        operator_site_report=report)
     result = trial.run()
     # Continue read-only observation briefly after the relay has been closed.
     time.sleep(0.7)

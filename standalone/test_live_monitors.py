@@ -98,6 +98,7 @@ def test_ros_guard_binds_relay_pid_caller_and_watchdog_identity():
         assert evidence["graph_query_atomic"] is False
         assert evidence["relay_node"] == "/relay" and evidence["relay_pid"] == 222
         assert evidence["driver_pid"] == 11139 and evidence["watchdog_source"] == "/relay"
+        assert clock.now() < guard.valid_until() <= clock.now() + 0.25
     finally:
         guard.release()
     assert backend.stopped
@@ -757,3 +758,275 @@ def test_diagnostic_preserves_initial_background_timeout_after_acquire_releases(
     finally:
         blocked.set()
         guard.release()
+
+
+def test_ros_graph_cache_reduces_queries_but_reads_latest_watchdog(monkeypatch):
+    mod, clock = module(), Clock()
+    monotonic = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: monotonic[0])
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            self.uri = uri
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            return [1, "ok", [[("/cmd_vel", ["/relay"]),
+                               ("/rosclaw_limo/command_watchdog", ["/limo_base"])], [], []]]
+        def lookupNode(self, caller, name):  # noqa: N802
+            calls.append("lookup")
+            return [1, "ok", "http://" + name.lstrip("/")]
+        def getPid(self, caller):  # noqa: N802
+            calls.append("pid")
+            return [1, "ok", 222 if self.uri.endswith("relay") else 11139]
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy)
+    def received(text):
+        backend._receive(Obj(data=text, _connection_header={"callerid": "/limo_base"}))
+    received("first")
+    first = backend.sample()
+    first["cmd_vel_publishers"].append("/tampered")
+    first["node_pids"]["/relay"] = 999
+    received("second")
+    second = backend.sample()
+    assert second["watchdog"]["data"] == "second"
+    assert second["cmd_vel_publishers"] == ["/relay"] and second["node_pids"]["/relay"] == 222
+    assert calls.count("graph") == 1 and calls.count("lookup") == 2 and calls.count("pid") == 2
+    clock.t += 0.74
+    monotonic[0] += 0.74
+    assert backend.sample()["graph_observed_at"] == 100.0
+    assert calls.count("graph") == 1
+    clock.t += 0.02
+    monotonic[0] += 0.02
+    refreshed = backend.sample()
+    assert calls.count("graph") == 2
+    assert refreshed["graph_observed_at"] == clock.t
+    generation = backend.invalidate_graph()
+    assert backend.sample()["graph_generation"] == generation
+    assert calls.count("graph") == 3
+
+
+def test_ros_graph_invalidation_during_inflight_query_discards_old_generation():
+    mod, clock = module(), Clock()
+    entered, finish = threading.Event(), threading.Event()
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            pass
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            if len(calls) == 1:
+                entered.set()
+                assert finish.wait(0.5)
+                return [1, "ok", [[("/cmd_vel", ["/old"])], [], []]]
+            return [1, "ok", [[("/cmd_vel", ["/new"])], [], []]]
+        def lookupNode(self, caller, name):  # noqa: N802
+            return [1, "ok", "http://fake"]
+        def getPid(self, caller):  # noqa: N802
+            return [1, "ok", 222]
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(backend.sample()))
+    try:
+        worker.start()
+        assert entered.wait(0.5)
+        generation = backend.invalidate_graph()
+        finish.set()
+        worker.join(0.5)
+        assert not worker.is_alive()
+        assert len(calls) == 2
+        assert result[0]["graph_generation"] == generation
+        assert result[0]["cmd_vel_publishers"] == ["/new"]
+        assert backend.sample()["cmd_vel_publishers"] == ["/new"]
+        assert len(calls) == 2
+    finally:
+        finish.set()
+        worker.join(0.5)
+
+
+def test_ros_guard_rejects_old_future_or_invalidated_graph_even_with_fresh_watchdog(monkeypatch):
+    mod, clock = module(), Clock()
+    mono = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: mono[0])
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=lambda uri: None)
+    guard = ros_guard(clock, backend)
+    guard._relay_pid = 222
+    guard._relay = Relay(222)
+    sample = ros_sample(clock, ["/relay"], caller="/relay", primed=1)
+    sample.update({"graph_observed_at": 98.81, "graph_observed_mono_at": 48.81,
+                   "graph_generation": backend.graph_generation()})
+    assert guard._assess(sample, clock.now()) is not None
+    sample["graph_observed_at"] = 98.79
+    assert guard._assess(sample, clock.now()) is None
+    sample["graph_observed_at"] = 100.01
+    assert guard._assess(sample, clock.now()) is None
+    sample["graph_observed_at"] = 100.0
+    sample["graph_observed_mono_at"] = 48.79
+    assert guard._assess(sample, clock.now()) is None
+    sample["graph_observed_mono_at"] = 50.0
+    backend.invalidate_graph()
+    assert guard._assess(sample, clock.now()) is None
+
+
+def test_bind_relay_waits_for_fresh_post_invalidation_graph():
+    mod, clock = module(), Clock()
+    entered, finish = threading.Event(), threading.Event()
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            self.uri = uri
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            if len(calls) > 1:
+                entered.set()
+                assert finish.wait(0.5)
+            pubs = [] if len(calls) == 1 else ["/relay"]
+            return [1, "ok", [[("/cmd_vel", pubs),
+                               ("/rosclaw_limo/command_watchdog", ["/limo_base"])], [], []]]
+        def lookupNode(self, caller, name):  # noqa: N802
+            return [1, "ok", "http://" + name.lstrip("/")]
+        def getPid(self, caller):  # noqa: N802
+            return [1, "ok", 222 if self.uri.endswith("relay") else 11139]
+    class Subscriber(object):
+        def unregister(self):
+            pass
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy,
+                                      subscriber_factory=lambda callback: Subscriber())
+    backend._receive(Obj(data="v2 boot_11139 4 0 0 0 none 99.9 100.0",
+                         _connection_header={"callerid": "/limo_base"}))
+    guard = ros_guard(clock, backend)
+    outcome = []
+    try:
+        assert guard.acquire()
+        backend._receive(Obj(data="v2 boot_11139 5 0 1 0 /relay 99.9 100.0",
+                             _connection_header={"callerid": "/limo_base"}))
+        # Make the existing cache look relay-bound, but it predates bind_relay.
+        with guard._lock:
+            guard._sample["cmd_vel_publishers"] = ["/relay"]
+            guard._sample["node_pids"]["/relay"] = 222
+            guard._sample["watchdog"] = copy.deepcopy(backend.watchdog)
+        worker = threading.Thread(target=lambda: outcome.append(guard.bind_relay(Relay(222))))
+        worker.start()
+        assert entered.wait(0.3)
+        assert not outcome and not guard._confirmed
+        finish.set()
+        worker.join(0.4)
+        assert outcome == [True]
+        assert guard.verify()
+    finally:
+        finish.set()
+        guard.release()
+
+
+def test_ros_cached_graph_never_extends_watchdog_validity(monkeypatch):
+    mod, clock = module(), Clock()
+    mono = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: mono[0])
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            self.uri = uri
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            return [1, "ok", [[("/cmd_vel", ["/relay"]),
+                               ("/rosclaw_limo/command_watchdog", ["/limo_base"])], [], []]]
+        def lookupNode(self, caller, name):  # noqa: N802
+            return [1, "ok", "http://" + name.lstrip("/")]
+        def getPid(self, caller):  # noqa: N802
+            return [1, "ok", 222 if self.uri.endswith("relay") else 11139]
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy)
+    backend._receive(Obj(data="v2 boot_11139 4 0 1 0 /relay 99.9 100.0",
+                         _connection_header={"callerid": "/limo_base"}))
+    guard = ros_guard(clock, backend)
+    guard._relay_pid, guard._relay = 222, Relay(222)
+    sample = backend.sample()
+    assert guard._assess(sample, clock.now()) is not None
+    clock.t += 0.25
+    mono[0] += 0.25
+    sample = backend.sample()
+    assert len(calls) == 1
+    assert guard._assess(sample, clock.now()) is None
+    assert guard._diagnose_assessment(sample, clock.now()) == "watchdog_expired"
+
+
+def test_ros_graph_refresh_rpc_timeout_does_not_reuse_old_cache(monkeypatch):
+    mod, clock = module(), Clock()
+    mono = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: mono[0])
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            pass
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            if len(calls) > 1:
+                raise socket.timeout("private detail")  # noqa: UP041
+            return [1, "ok", [[], [], []]]
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy)
+    assert backend.sample()["graph_observed_at"] == 100.0
+    clock.t += 0.76
+    mono[0] += 0.76
+    with pytest.raises(socket.timeout):  # noqa: UP041
+        backend.sample()
+    assert backend._diagnostic_rpc_failure == "rpc_timeout"
+    with pytest.raises(socket.timeout):  # noqa: UP041
+        backend.sample()
+    assert len(calls) == 3
+
+
+def test_older_concurrent_graph_query_cannot_replace_newer_cache(monkeypatch):
+    mod, clock = module(), Clock()
+    mono = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: mono[0])
+    entered, finish = threading.Event(), threading.Event()
+    calls = []
+    class Proxy(object):
+        def __init__(self, uri):
+            pass
+        def getSystemState(self, caller):  # noqa: N802
+            calls.append("graph")
+            if len(calls) == 1:
+                entered.set()
+                assert finish.wait(0.5)
+                return [1, "ok", [[("/cmd_vel", ["/old"])], [], []]]
+            return [1, "ok", [[("/cmd_vel", ["/new"])], [], []]]
+        def lookupNode(self, caller, name):  # noqa: N802
+            return [1, "ok", "http://fake"]
+        def getPid(self, caller):  # noqa: N802
+            return [1, "ok", 222]
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=Proxy)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(backend.sample()))
+    try:
+        worker.start()
+        assert entered.wait(0.5)
+        clock.t += 0.1
+        mono[0] += 0.1
+        assert backend.sample()["cmd_vel_publishers"] == ["/new"]
+        finish.set()
+        worker.join(0.5)
+        assert not worker.is_alive()
+        assert results[0]["cmd_vel_publishers"] == ["/new"]
+        assert backend.sample()["cmd_vel_publishers"] == ["/new"]
+        assert len(calls) == 2
+    finally:
+        finish.set()
+        worker.join(0.5)
+
+
+def test_guard_evidence_reports_separate_graph_observation_time(monkeypatch):
+    mod, clock = module(), Clock()
+    mono = [50.0]
+    monkeypatch.setattr(mod, "_monotonic", lambda: mono[0])
+    backend = mod.Ros1ReadOnlyBackend("http://fake-master", clock, proxy_factory=lambda uri: None)
+    guard = ros_guard(clock, backend)
+    guard._relay_pid, guard._relay = 222, Relay(222)
+    guard._acquired = guard._confirmed = True
+    guard._sample_at = 100.0
+    guard._sample_mono_at = 50.0
+    guard._sample = ros_sample(clock, ["/relay"], caller="/relay", primed=1)
+    guard._sample.update({"graph_observed_at": 99.4, "graph_observed_mono_at": 49.4,
+                          "graph_generation": backend.graph_generation()})
+    evidence = guard.evidence()
+    assert evidence["checked_at"] == 100.0
+    assert evidence["graph_observed_at"] == 99.4
+    assert evidence["graph_age_sec"] == pytest.approx(0.6)
+    assert evidence["graph_max_age_sec"] == 1.2

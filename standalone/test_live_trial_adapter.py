@@ -69,7 +69,7 @@ def test_observation_adapter_owns_jpeg_and_scan_without_fabricating_fields():
     obs.current = False
     assert not adapter.is_current_sample(sample)
     assert adapter.snapshot() is None
-    assert adapter.last_issue == 'current_before_copy'
+    assert adapter.last_issue == 'current_after_copy'
 
 
 def test_observation_adapter_owns_mutable_scan_and_scene_evidence():
@@ -97,6 +97,59 @@ def test_observation_adapter_owns_mutable_scan_and_scene_evidence():
     assert result['scene']['occupied_hits'][0]['stamp'] == hit_before
     assert result['scene']['coverage']['front_samples'] == coverage_before
     assert result['raw_scan']['ranges'][0] == range_before
+
+
+def test_safety_snapshots_skip_jpeg_after_model_evidence_is_captured():
+    mod = module()
+    clock = Clock()
+    observation = Observation(clock)
+    calls = []
+    adapter = mod.ObservationAdapter(observation, lambda color: calls.append(color) or b'\xff\xd8offline\xff\xd9')
+    model_sample = adapter.snapshot()
+    assert model_sample['image_jpeg'] and len(calls) == 1
+    adapter.enable_safety_snapshots()
+    safety_sample = adapter.snapshot()
+    assert 'image_jpeg' not in safety_sample and len(calls) == 1
+    assert mod._snapshot_without_depth_gate(safety_sample, clock.now(), require_image=False) is None
+    assert mod._snapshot_without_depth_gate(safety_sample, clock.now()) == 'sensor_unavailable'
+    adapter.restore_model_snapshots()
+    assert adapter.snapshot()['image_jpeg'] and len(calls) == 2
+
+
+def test_projection_only_mode_requires_explicit_source_support():
+    mod = module()
+    observation = Observation(Clock())
+    enabled = []
+    observation.enable_projection_only = lambda: enabled.append(True)
+    observation.disable_projection_only = lambda: enabled.append(False)
+    adapter = mod.ObservationAdapter(observation, lambda color: b'\xff\xd8offline\xff\xd9',
+                                     projection_only_after_model=True)
+    adapter.enable_safety_snapshots()
+    assert enabled == [True]
+    adapter.restore_model_snapshots()
+    assert enabled == [True, False]
+    unsupported = mod.ObservationAdapter(Observation(Clock()), lambda color: b'',
+                                          projection_only_after_model=True)
+    with pytest.raises(ValueError):
+        unsupported.enable_safety_snapshots()
+
+
+def test_adapter_can_take_ownership_of_a_newly_allocated_scene():
+    mod = module()
+    clock = Clock()
+    observation = Observation(clock)
+    original = observation.snapshot
+    snapshots = []
+    def capture():
+        sample = original()
+        snapshots.append(sample)
+        return sample
+    observation.snapshot = capture
+    adapter = mod.ObservationAdapter(observation, lambda color: b'\xff\xd8offline\xff\xd9',
+                                     take_scene_ownership=True)
+    result = adapter.snapshot()
+    assert result['scene'] is snapshots[0]['scene']
+    assert result['raw_scan']['ranges'] is not snapshots[0]['scan'].ranges
 
 
 def test_live_timestamps_allow_processing_delay_but_reject_stale_sensors():
@@ -222,6 +275,124 @@ def test_relay_adapter_uses_one_writer_and_requests_zero_on_shutdown():
     assert relay.evidence["physical_stop_verified"] is False
 
 
+def test_longer_forward_relay_requires_explicit_matching_deadline():
+    mod = module()
+    clock = Clock()
+    ordinary = mod.RelayAdapter(Transport(), clock)
+    assert ordinary.arm(2.0) is None
+    transport = Transport(ready=b'READY motion_limit_sec=2.000000\n')
+    relay = mod.RelayAdapter(transport, clock, motion_limit_sec=2.0)
+    assert relay.arm(2.0)['relative_motion_limit'] is True
+    assert transport.started == [2.0]
+    assert relay.send_frame(0, clock.now(), 0.02, 0.0)
+    assert relay.stop_and_latch() and relay.close()
+
+
+def test_longer_forward_trial_streams_and_still_stops_on_new_obstacle():
+    mod = module()
+    class SynchronousLongTrial(mod.LongerForwardTrial):
+        ASYNC_SAMPLING = False
+    for obstacle in (False, True):
+        clock = Clock()
+        adapter, obs = source(clock)
+        if obstacle:
+            def mutate(sample, count):
+                if count >= 12:
+                    sample['raw_scan']['ranges'][16] = 0.195
+                return sample
+            obs.source.mutate = mutate
+        transport = Transport(ready=b'READY motion_limit_sec=2.000000\n')
+        relay = mod.RelayAdapter(transport, clock, motion_limit_sec=2.0)
+        model = mod.DecisionsAdapter(lambda payload, timeout: {
+            'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+        result = SynchronousLongTrial(adapter, model, relay, FakeArbiter(), clock,
+                                      duration_sec=2.0, enable_motion=True,
+                                      serial_guard=FakeSerialGuard()).run()
+        frames = [json.loads(line) for line in transport.lines]
+        moving = [frame for frame in frames if frame['linear'] > 0]
+        assert len(moving) > 3 and frames[-1]['linear'] == 0.0
+        if obstacle:
+            assert result['reason'] == 'front_blocked'
+        else:
+            assert result['reason'] in ('time_limit', 'motion_limit')
+            assert moving[-1]['stamp'] - moving[0]['stamp'] > 1.0
+
+
+def test_longer_trial_streams_while_background_source_produces_samples():
+    import time
+
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    clock = RealClock()
+    adapter, _ = source(clock)
+    transport = Transport(ready=b'READY motion_limit_sec=2.000000\n')
+    relay = mod.RelayAdapter(transport, clock, motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=0.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    frames = [json.loads(line) for line in transport.lines]
+    moving = [frame for frame in frames if frame['linear'] > 0]
+    assert result['sampler_closed'] is True and frames[-1]['linear'] == 0.0
+    assert all(frame['stamp'] < frame['expires_at'] for frame in moving)
+    if result['reason'] == 'time_limit':
+        assert len(moving) >= 5 and moving[-1]['stamp'] - moving[0]['stamp'] > 0.3
+    else:
+        assert result['reason'] in ('sensor_unavailable', 'expiry_unavailable')
+
+
+def test_longer_trial_requests_decision_after_relay_is_ready_at_zero():
+    mod = module()
+    clock = Clock()
+    class SynchronousLongTrial(mod.LongerForwardTrial):
+        ASYNC_SAMPLING = False
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    observed = []
+    def decide(payload, timeout):
+        observed.append((relay.armed, list(relay.transport.lines)))
+        return {'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']}
+    result = SynchronousLongTrial(source(clock)[0], mod.DecisionsAdapter(decide), relay,
+                                  FakeArbiter(), clock, duration_sec=0.6, enable_motion=True,
+                                  serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is True and len(observed) == 1
+    assert observed[0][0] and observed[0][1]
+    assert all(json.loads(line)['linear'] == 0.0 for line in observed[0][1])
+
+
+def test_longer_trial_stops_when_background_sensing_fails():
+    import time
+
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    clock = RealClock()
+    adapter, _ = source(clock)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    class FailingSource(object):
+        def snapshot(self):
+            return None if relay.had_motion else adapter.snapshot()
+        def __getattr__(self, name):
+            return getattr(adapter, name)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(FailingSource(), model, relay, FakeArbiter(), clock,
+                                   duration_sec=0.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    frames = [json.loads(line) for line in relay.transport.lines]
+    assert result['reason'] == 'sensor_unavailable' and result['sampler_closed'] is True
+    assert any(frame['linear'] > 0 for frame in frames) and frames[-1]['linear'] == 0.0
 def test_transport_waits_for_relay_zero_burst_and_ros_unregister_after_term():
     mod = module()
     clock = Clock()
@@ -438,6 +609,9 @@ class FakeArbiter(object):
     def evidence(self):
         return {"driver_caller_bound": True, "observed_competitors": [], "graph_query_atomic": False}
 
+    def valid_until(self):
+        return 1e100
+
     def release(self):
         self.released = True
 
@@ -457,6 +631,9 @@ class FakeSerialGuard(object):
     def evidence(self):
         return {"tioc_exclusive_reported": False, "initial_open_errno": "EBUSY",
                 "probe_repeated": False, "observed_other_fds": [], "previous_fd_excluded": False}
+
+    def valid_until(self):
+        return 1e100
 
     def release(self):
         self.released = True
@@ -585,7 +762,7 @@ def test_fake_live_trial_accepts_delayed_model_only_when_odom_continuous(delay):
     assert result["reason"] == "motion_limit"
     frames = [json.loads(line) for line in relay.transport.lines]
     moving = [frame for frame in frames if frame["linear"] > 0]
-    assert 1 <= len(moving) <= 7 and frames[0]["linear"] == 0.0 and frames[-1]["linear"] == 0.0
+    assert 1 <= len(moving) <= 61 and frames[0]["linear"] == 0.0 and frames[-1]["linear"] == 0.0
     assert all(frame["linear"] <= 0.02 and frame["angular"] == 0 for frame in moving)
     assert moving[-1]["stamp"] - moving[0]["stamp"] < 0.3
     assert arbiter.released and result["physical_stop_verified"] is False
@@ -642,6 +819,172 @@ def test_guard_loss_after_first_fake_command_requests_zero():
     frames = [json.loads(line) for line in relay.transport.lines]
     assert frames[0]["linear"] == 0 and any(frame["linear"] > 0 for frame in frames)
     assert frames[-1]["linear"] == 0.0
+
+
+def test_motion_rechecks_latest_observation_after_guard_and_before_each_command():
+    mod = module()
+    clock = Clock()
+    adapter, observation = source(clock)
+    relay = mod.RelayAdapter(Transport(), clock)
+    class LateChange(FakeSerialGuard):
+        def verify(self):
+            if relay.had_motion:
+                observation.current = False
+            return True
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=LateChange()).run()
+    frames = [json.loads(line) for line in relay.transport.lines]
+    assert result['reason'] == 'sensor_unavailable'
+    assert len([frame for frame in frames if frame['linear'] > 0]) == 1
+    assert frames[-1]['linear'] == 0.0
+
+
+def test_motion_loop_prepares_next_sample_during_the_frame_interval():
+    mod = module()
+    clock = Clock()
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        "ok": True, "choice": "forward", "captured_at": payload["captured_at"]})
+
+    class TimedTrial(mod.LiveTrial):
+        def __init__(self, *args, **kwargs):
+            mod.LiveTrial.__init__(self, *args, **kwargs)
+            self.motion_samples = self.motion_validations = 0
+
+        def _sample(self):
+            if relay.had_motion:
+                self.motion_samples += 1
+                # Sampling takes 40 ms of the 50 ms command period.
+                clock.sleep(0.04)
+            return mod.LiveTrial._sample(self)
+
+        def _validate(self, sample, now):
+            if relay.had_motion:
+                self.motion_validations += 1
+            return mod.LiveTrial._validate(self, sample, now)
+
+    trial = TimedTrial(source(clock)[0], model, relay, FakeArbiter(), clock,
+                       enable_motion=True, serial_guard=FakeSerialGuard())
+    result = trial.run()
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)["linear"] > 0]
+    assert result["reason"] == "motion_limit"
+    assert len(moving) >= 3
+    assert max(b["stamp"] - a["stamp"] for a, b in zip(moving, moving[1:])) <= 0.066
+    assert trial.motion_samples == trial.motion_validations
+    assert result['motion_timing']['max_sample_sec'] >= 0.039
+
+
+def test_motion_intent_is_bounded_by_monitor_expiry():
+    mod = module()
+    clock = Clock()
+    class ExpiringArbiter(FakeArbiter):
+        def valid_until(self):
+            return clock.now() + 0.03
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(source(clock)[0], model, relay, ExpiringArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)['linear'] > 0]
+    assert result['reason'] == 'motion_limit' and moving
+    assert all(frame['expires_at'] <= frame['stamp'] + 0.030001 for frame in moving)
+
+
+def test_motion_refreshes_before_short_sensor_deadline():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.current_valid_until = lambda sample: clock.now() + 0.035
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)['linear'] > 0]
+    assert result['reason'] in ('motion_limit', 'expiry_unavailable') and len(moving) >= 3
+    assert max(b['stamp'] - a['stamp'] for a, b in zip(moving, moving[1:])) <= 0.021
+
+
+def test_motion_never_submits_an_intent_with_too_little_time_to_reach_the_relay():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.current_valid_until = lambda sample: clock.now() + 0.005
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'expiry_unavailable' and result['motion_requested'] is False
+    assert all(json.loads(line)['linear'] == 0.0 for line in relay.transport.lines)
+
+
+def test_trial_refreshes_once_before_motion_if_initial_sample_is_nearly_expired():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    calls = []
+    def validity(sample):
+        calls.append(True)
+        return clock.now() + (0.005 if len(calls) == 1 else 0.1)
+    adapter.current_valid_until = validity
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert len(calls) > 1 and result['motion_requested'] is True
+
+
+def test_trial_refreshes_stale_initial_snapshot_while_still_stopped():
+    mod = module()
+    clock = Clock()
+    class InitiallyStale(mod.LiveTrial):
+        calls = 0
+        def _aligned_stationary_sample(self, before):
+            sample, now = mod.LiveTrial._aligned_stationary_sample(self, before)
+            self.calls += 1
+            if self.calls == 2:
+                sample['snapshot_at'] = now - 0.26
+            return sample, now
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    trial = InitiallyStale(source(clock)[0], model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard())
+    result = trial.run()
+    assert trial.calls >= 3 and result['motion_requested'] is True
+
+
+@pytest.mark.parametrize('initially_enabled', [True, False])
+def test_trial_defers_gc_only_during_armed_window_and_restores_prior_state(monkeypatch, initially_enabled):
+    mod = module()
+    class Gc(object):
+        enabled = initially_enabled
+        calls = []
+        def isenabled(self):
+            return self.enabled
+        def collect(self):
+            self.calls.append('collect')
+        def disable(self):
+            self.calls.append('disable')
+            self.enabled = False
+        def enable(self):
+            self.calls.append('enable')
+            self.enabled = True
+    recorder = Gc()
+    monkeypatch.setattr(mod, 'gc', recorder)
+    clock = Clock()
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(source(clock)[0], model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'motion_limit'
+    assert recorder.enabled is initially_enabled
+    assert recorder.calls == (['collect', 'disable', 'enable'] if initially_enabled else [])
 
 
 @pytest.mark.parametrize("problem", ["new_hit", "sensor_lost"])

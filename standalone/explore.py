@@ -19,6 +19,11 @@ import sys
 import threading
 import time
 
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WORKER = os.path.join(ROOT, "worker")
@@ -31,7 +36,7 @@ from limo_mapless_worker import run_decision_process, summarize_forward_view
 from limo_scan_fusion import RollingScanFusion
 from observation_guards import ClockGuard, OdomGuard, sensors_aligned
 from policy import ForwardPolicy, assess_front
-from projected_depth_gate import project_depth_frame
+from projected_depth_gate import ProjectedDepthGate, project_depth_frame
 from relay import _monotonic
 
 try:
@@ -128,6 +133,13 @@ def depth_grid(array, encoding, stamp, min_depth_m=0.3, max_depth_m=3.0):
         return None
 
 
+def depth_summary_for_snapshot(array, encoding, stamp, projection_only):
+    """Projected safety mode validates the depth array in its own gate."""
+    if projection_only:
+        return {"stamp": stamp} if _finite(stamp) else None
+    return depth_grid(array, encoding, stamp)
+
+
 def base_state(odom, status, stamp):
     try:
         twist = odom.twist.twist
@@ -193,28 +205,152 @@ def transform_matches(first, second):
                for i in range(3, 6))
 
 
-def newest_scan_veto(scan, extrinsics):
+def lookup_rigid_transform(listener, tf_module, rospy_module, frame, stamp, known_signature):
+    """Allow a nearby latest rigid transform only after a stamped baseline.
+
+    Some ROS 1 camera TF publishers lag the image header slightly. The fallback
+    uses the latest transform only within 150 ms of that header and only when
+    it still matches a previously obtained timestamped rigid transform.
+    """
+    try:
+        return listener.lookupTransform("base_link", frame, stamp)
+    except tf_module.ExtrapolationException:
+        if known_signature is None:
+            raise
+        common = listener.getLatestCommonTime("base_link", frame).to_sec()
+        captured = stamp.to_sec()
+        if (not all(_finite(value) and value > 0 for value in (common, captured))
+                or abs(common - captured) > 0.15):
+            raise ValueError("rigid transform timestamp is not nearby")
+        trans, rot = listener.lookupTransform("base_link", frame, rospy_module.Time(0))
+        roll, pitch, yaw = tf_module.transformations.euler_from_quaternion(rot)
+        signature = tuple(trans) + (roll, pitch, yaw)
+        if not transform_matches(known_signature, signature):
+            raise ValueError("rigid transform changed")
+        return trans, rot
+
+
+def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose):
+    """Vectorize the immutable ray/hit tuples created by the scan fusion."""
+    if _np is None or len(rays) < 32:
+        return None
+    rows = []
+    for ray, hit in zip(rays, hits):
+        if type(ray) is not dict or type(hit) is not dict:
+            return None
+        try:
+            start, end, stamp = ray['start_base'], ray['hit_base'], ray['stamp']
+            if (type(start) is not tuple or len(start) != 2 or type(end) is not tuple or len(end) != 2
+                    or hit['point_base'] is not end or hit['stamp'] is not stamp or type(stamp) is not float
+                    or any(type(value) is not float for value in start + end)):
+                return None
+            rows.append((start[0], start[1], end[0], end[1], stamp))
+        except (KeyError, IndexError, TypeError):
+            return None
+    try:
+        data = _np.asarray(rows, dtype=_np.float64)
+        sx, sy, hx, hy, stamps = data.T
+        if not _np.all(_np.isfinite(data)) or _np.any(stamps < 0) or _np.any(stamps > scan_at):
+            return None
+        theta = scene_pose[2] - current_pose[2]
+        c, s = math.cos(theta), math.sin(theta)
+        cc, cs = math.cos(current_pose[2]), math.sin(current_pose[2])
+        dx, dy = scene_pose[0] - current_pose[0], scene_pose[1] - current_pose[1]
+        tx, ty = cc * dx + cs * dy, -cs * dx + cc * dy
+        start_x, start_y = tx + c * sx - s * sy, ty + s * sx + c * sy
+        end_x, end_y = tx + c * hx - s * hy, ty + s * hx + c * hy
+        if not all(_np.all(_np.isfinite(values)) for values in (start_x, start_y, end_x, end_y)):
+            return None
+        if _np.any((end_x >= -0.20) & (end_x <= 0.65) & (_np.abs(end_y) <= 0.17)):
+            return False
+        age = now - stamps
+        recent = ((age >= 0) & (age <= 0.65) & (scan_at - stamps <= 0.4)
+                  & (start_x <= 0.60) & (end_x > 0.60))
+        indices = _np.flatnonzero(recent)
+        with _np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            ys = start_y[indices] + ((0.60 - start_x[indices]) / (end_x[indices] - start_x[indices])) * (
+                end_y[indices] - start_y[indices])
+        if not _np.all(_np.isfinite(ys)):
+            return None
+        values = list(crossings) + ys[(ys >= -0.15) & (ys <= 0.15)].tolist()
+        values.sort()
+        gaps = [values[0] + 0.15, 0.15 - values[-1]]
+        gaps.extend(values[index] - values[index - 1] for index in range(1, len(values)))
+        return max(gaps) <= 0.035
+    except (ArithmeticError, AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
+                     scene_pose=None, scan_pose=None, current_pose=None):
     """Reject newly measured front hits; non-returns remain unknown.
 
-    This permits an already assessed snapshot to survive arrival of a newer
-    scan only when that scan has enough measured front rays and no measured
-    hit in the padded corridor. It does not assert clearance between rays.
+    The latest scan must have bounded gaps and no measured hit in the padded
+    corridor. Recent pose-aligned historical rays may fill the remaining small
+    gaps, subject to the same age and spacing limits as the forward policy.
+    Missing returns remain unknown and sampling does not certify clearance.
     """
     try:
         if (scan.header.frame_id.lstrip("/") != "laser_link"
                 or not transform_matches(extrinsics, extrinsics)):
             return False
         angle_min, increment = scan.angle_min, scan.angle_increment
-        lower, upper, ranges = scan.range_min, scan.range_max, scan.ranges
-        if (not all(_finite(item) for item in (angle_min, increment, lower, upper))
+        lower, upper, ranges, time_increment = scan.range_min, scan.range_max, scan.ranges, scan.time_increment
+        if (not all(_finite(item) for item in (angle_min, increment, lower, upper, time_increment))
                 or increment == 0 or not 0 < lower < upper <= 100
-                or not isinstance(ranges, (tuple, list)) or not 1 <= len(ranges) <= 8192):
+                or time_increment < 0 or not isinstance(ranges, (tuple, list))
+                or not 1 <= len(ranges) <= 8192 or (len(ranges) - 1) * time_increment > 0.3):
             return False
         angle_end = angle_min + (len(ranges) - 1) * increment
         if (not _finite(angle_end) or not -math.pi - 1e-5 <= angle_min <= math.pi + 1e-5
                 or not -math.pi - 1e-5 <= angle_end <= math.pi + 1e-5):
             return False
-        valid_front = 0
+        have_history = scene is not None
+        if have_history:
+            if (not _finite(now) or not _finite(scan_at) or not 0 <= now - scan_at <= 0.3
+                    or not isinstance(scene, dict) or scene.get('status') != 'ok'
+                    or not isinstance(scene.get('coverage'), dict)
+                    or scene['coverage'].get('sensor_fresh') is not True):
+                return False
+            for pose in (scene_pose, scan_pose, current_pose):
+                _pose_delta(pose, pose)
+            if any(distance > 0.02 or rotation > 0.02 for distance, rotation in
+                   (_pose_delta(scene_pose, current_pose), _pose_delta(scan_pose, current_pose))):
+                return False
+        else:
+            scene_pose = scan_pose = current_pose = (0.0, 0.0, 0.0)
+
+        def make_transform(source_pose):
+            theta = source_pose[2] - current_pose[2]
+            c, s = math.cos(theta), math.sin(theta)
+            cc, cs = math.cos(current_pose[2]), math.sin(current_pose[2])
+            dx, dy = source_pose[0] - current_pose[0], source_pose[1] - current_pose[1]
+            tx, ty = cc * dx + cs * dy, -cs * dx + cc * dy
+            return lambda point: (tx + c * point[0] - s * point[1],
+                                  ty + s * point[0] + c * point[1])
+
+        from_scan = make_transform(scan_pose)
+        from_scene = make_transform(scene_pose)
+
+        def crossing(start, end):
+            if not start[0] <= 0.60 < end[0]:
+                return None
+            fraction = (0.60 - start[0]) / (end[0] - start[0])
+            value = start[1] + fraction * (end[1] - start[1])
+            if not _finite(value):
+                raise ValueError('invalid ray crossing')
+            return value if -0.15 <= value <= 0.15 else None
+
+        def gap(values):
+            if not values:
+                return 0.3
+            values = sorted(values)
+            gaps = [values[0] + 0.15, 0.15 - values[-1]]
+            gaps.extend(values[index] - values[index - 1] for index in range(1, len(values)))
+            return max(gaps)
+
+        start = from_scan((extrinsics[0], extrinsics[1]))
+        crossings = []
         for index, value in enumerate(ranges):
             if isinstance(value, bool) or not isinstance(value, NUMBER_TYPES):
                 return False
@@ -226,12 +362,45 @@ def newest_scan_veto(scan, extrinsics):
             angle = math.atan2(math.sin(angle), math.cos(angle))
             if not -math.pi / 2 <= angle <= math.pi / 2:
                 continue
-            valid_front += 1
             x = extrinsics[0] + value * math.cos(angle)
             y = extrinsics[1] + value * math.sin(angle)
+            x, y = from_scan((x, y))
             if -0.20 <= x <= 0.65 and abs(y) <= 0.17:
                 return False
-        return valid_front >= 20
+            value = crossing(start, (x, y))
+            if value is not None:
+                crossings.append(value)
+        if not crossings or gap(crossings) > 0.07:
+            return False
+        if not have_history:
+            return gap(crossings) <= 0.035
+        rays, hits = scene['rays'], scene['occupied_hits']
+        if (not isinstance(rays, list) or not isinstance(hits, list)
+                or len(rays) != len(hits) or len(rays) > 200000):
+            return False
+        fast = _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose)
+        if fast is not None:
+            return fast
+        for ray, hit in zip(rays, hits):
+            start_old, end_old, stamp = ray['start_base'], ray['hit_base'], ray['stamp']
+            point, hit_stamp = hit['point_base'], hit['stamp']
+            if (not isinstance(start_old, (tuple, list)) or len(start_old) != 2
+                    or not isinstance(end_old, (tuple, list)) or len(end_old) != 2
+                    or not isinstance(point, (tuple, list)) or len(point) != 2
+                    or not all(_finite(item) for item in tuple(start_old) + tuple(end_old) + tuple(point)
+                               + (stamp, hit_stamp))
+                    or point[0] != end_old[0] or point[1] != end_old[1]
+                    or hit_stamp != stamp or not 0 <= stamp <= scan_at):
+                return False
+            end = from_scene(end_old)
+            if -0.20 <= end[0] <= 0.65 and abs(end[1]) <= 0.17:
+                return False
+            if not 0 <= now - stamp <= 0.65 or scan_at - stamp > 0.4:
+                continue
+            value = crossing(from_scene(start_old), end)
+            if value is not None:
+                crossings.append(value)
+        return gap(crossings) <= 0.035
     except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
         return False
 
@@ -331,8 +500,12 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.depth_projection_config = (dict(depth_projection_config)
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
+        self._depth_veto_cache = None
+        self.projection_only = False
         self.epoch = 0
         self.fusion_epoch = None
+        self.snapshot_last_issue = None
+        self.current_last_issue = None
         self.clock_guard = ClockGuard(max_offset_jump_sec=0.02)
         self.odom_guard = OdomGuard(max_linear_mps=0.12, max_angular_radps=0.1,
                                     position_slack_m=0.002, yaw_slack_rad=0.003,
@@ -407,27 +580,32 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def snapshot(self):
         """Take aligned observations, independently of model/network activity."""
+        def reject(reason):
+            self.snapshot_last_issue = reason
+            return None
+
         with self.lock:
             if self.clock_guard.faulted or self.odom_guard.faulted:
-                return None
+                return reject("guard_fault")
             current = dict(self.latest)
             odom_history = list(self.odom_history)[-150:]
             epoch = self.epoch
+            projection_only = getattr(self, "projection_only", False)
         now = _monotonic()
-        if any(name not in current for name in self.limits):
-            return None
-        if any(not 0 <= now - current[name]["stamp"] <= self.limits[name]
-               for name in self.limits):
-            return None
+        for name in self.limits:
+            if name not in current:
+                return reject("missing_" + name)
+            if not 0 <= now - current[name]["stamp"] <= self.limits[name]:
+                return reject("stale_" + name)
         if not sensors_aligned({name: current[name]["stamp"] for name in ("scan", "color", "depth")},
                                odom_history, now, max_sensor_age_sec=0.5,
                                max_sensor_skew_sec=0.25, max_odom_skew_sec=0.05,
                                max_translation_m=0.02, max_rotation_rad=0.02,
                                max_linear_mps=0.12, max_angular_radps=0.1):
-            return None
+            return reject("sensor_alignment")
         scan = current["scan"]["message"]
         if scan.header.frame_id.lstrip("/") != "laser_link":
-            return None
+            return reject("scan_frame")
         status = current["status"]["message"]
         depth = current["depth"]["message"]
         info = current["info"]["message"]
@@ -437,7 +615,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 or depth.header.frame_id != info.header.frame_id
                 or depth.width != info.width or depth.height != info.height
                 or abs(current["depth"]["stamp"] - current["info"]["stamp"]) > 0.2):
-            return None
+            return reject("camera_alignment")
         try:
             trans, rot = self.listener.lookupTransform("base_link", scan.header.frame_id,
                                                        scan.header.stamp)
@@ -446,7 +624,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             signature = (trans[0], trans[1], trans[2], roll, pitch, yaw)
             if (not all(_finite(x) for x in signature)
                     or abs(roll) > 0.1 or abs(pitch) > 0.1):
-                return None
+                return reject("laser_transform_invalid")
             if self.fusion is None or self.fusion_epoch != epoch:
                 self.extrinsics = signature
                 self.fusion = RollingScanFusion(extrinsics)
@@ -454,32 +632,34 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 self.scan_stamp = None
             elif not transform_matches(self.extrinsics, signature):
                 # Never continue across an extrinsic change without a restart.
-                return None
+                return reject("laser_transform_changed")
             if current["scan"]["stamp"] != self.scan_stamp:
                 aligned = nearest_odometry(odom_history, current["scan"]["stamp"])
                 if aligned is None or aligned.get("epoch") != epoch:
-                    return None
+                    return reject("scan_odom_alignment")
                 packet = {"stamp": current["scan"]["stamp"], "ranges": list(scan.ranges),
                           "angle_min": scan.angle_min, "angle_increment": scan.angle_increment,
                           "range_min": scan.range_min, "range_max": scan.range_max}
                 if not self.fusion.add_scan(packet, aligned["pose"], aligned["stamp"], now):
-                    return None
+                    return reject("fusion_add")
                 self.scan_stamp = current["scan"]["stamp"]
             depth_array = self.bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
-            depth_summary = depth_grid(depth_array, depth.encoding, current["depth"]["stamp"])
+            depth_summary = depth_summary_for_snapshot(
+                depth_array, depth.encoding, current["depth"]["stamp"], projection_only)
             if depth_summary is None:
-                return None
+                return reject("depth_grid")
             if self.depth_projection_config is not None:
-                depth_trans, depth_rot = self.listener.lookupTransform(
-                    "base_link", depth.header.frame_id, depth.header.stamp)
+                depth_trans, depth_rot = lookup_rigid_transform(
+                    self.listener, self.tf, self.rospy, depth.header.frame_id,
+                    depth.header.stamp, self.depth_extrinsics)
                 depth_roll, depth_pitch, depth_yaw = self.tf.transformations.euler_from_quaternion(depth_rot)
                 depth_signature = tuple(depth_trans) + (depth_roll, depth_pitch, depth_yaw)
                 if self.depth_extrinsics is None:
                     if not transform_matches(depth_signature, depth_signature):
-                        return None
+                        return reject("depth_transform_invalid")
                     self.depth_extrinsics = depth_signature
                 elif not transform_matches(self.depth_extrinsics, depth_signature):
-                    return None
+                    return reject("depth_transform_changed")
                 matrix = self.tf.transformations.quaternion_matrix(depth_rot)
                 matrix[:3, 3] = depth_trans
                 k = info.K
@@ -493,23 +673,24 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             depth_pose = nearest_odometry(odom_history, current["depth"]["stamp"])
             if (image_pose is None or image_pose.get("epoch") != epoch
                     or depth_pose is None or depth_pose.get("epoch") != epoch):
-                return None
+                return reject("camera_odom_alignment")
             with self.lock:
                 if self.epoch != epoch or self.clock_guard.faulted or self.odom_guard.faulted:
-                    return None
+                    return reject("epoch_changed")
                 snapshot_now = _monotonic()
                 latest_odom = refreshed_odometry(current["odom"], self.latest.get("odom"), snapshot_now)
             if latest_odom is None:
-                return None
+                return reject("refreshed_odom")
             pose = latest_odom["pose"]
             scene = self.fusion.snapshot(pose, latest_odom["stamp"], snapshot_now)
             odom = latest_odom["message"]
             state = base_state(odom, status, min(latest_odom["stamp"], current["status"]["stamp"]))
             if state is None:
-                return None
+                return reject("base_state")
             with self.lock:
                 if self.epoch != epoch or self.clock_guard.faulted or self.odom_guard.faulted:
-                    return None
+                    return reject("epoch_changed")
+            self.snapshot_last_issue = None
             return {"scene": scene, "state": state, "depth": depth_summary, "snapshot_at": snapshot_now, "epoch": epoch,
                     "pose": pose, "image_pose": image_pose["pose"], "depth_pose": depth_pose["pose"],
                     "color": current["color"]["message"], "scan": scan,
@@ -517,8 +698,20 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     "scan_at": current["scan"]["stamp"], "odom_at": latest_odom["stamp"],
                     "status_at": current["status"]["stamp"], "depth_at": current["depth"]["stamp"],
                     "color_at": current["color"]["stamp"]}
-        except Exception:  # noqa: BLE001 - missing/invalid observation cannot authorize motion
-            return None
+        except Exception as exc:  # noqa: BLE001 - missing/invalid observation cannot authorize motion
+            # Record only the exception type, never sensor values or exception text.
+            return reject("snapshot_exception_" + type(exc).__name__)
+
+    def enable_projection_only(self):
+        """Skip image-grid statistics only when a projected-depth gate is used."""
+        with self.lock:
+            if self.depth_projection_config is None:
+                raise ValueError("depth projection is not configured")
+            self.projection_only = True
+
+    def disable_projection_only(self):
+        with self.lock:
+            self.projection_only = False
 
     def current_pose(self):
         with self.lock:
@@ -538,16 +731,74 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             return (_valid_epoch(epoch) and epoch == self.epoch and not self.clock_guard.faulted
                     and not self.odom_guard.faulted)
 
+    def _newest_depth_safe_locked(self, sample, depth, odom, now):
+        """Project a newer depth frame before using an older fused snapshot.
+
+        The caller holds the observation lock so this check is tied to the
+        latest depth generation. It remains a sampled veto, not a clearance
+        certificate, and retains the configured unverified calibration.
+        """
+        try:
+            if self.depth_projection_config is None or not transform_matches(
+                    self.depth_extrinsics, self.depth_extrinsics):
+                return False
+            stamp, image = depth['stamp'], depth['message']
+            info_entry = self.latest['info']
+            info = info_entry['message']
+            if (not _finite(stamp) or not 0 <= now - stamp <= 0.1
+                    or not _finite(info_entry['stamp']) or abs(stamp - info_entry['stamp']) > 0.2
+                    or image.header.frame_id.lstrip('/') != 'camera_depth_optical_frame'
+                    or image.header.frame_id != info.header.frame_id
+                    or image.width != info.width or image.height != info.height):
+                return False
+            aligned = nearest_odometry(self.odom_history, stamp)
+            if aligned is None or aligned.get('epoch') != self.epoch:
+                return False
+            for pose in (sample['pose'], odom['pose']):
+                distance, angle = _pose_delta(aligned['pose'], pose)
+                if not _finite(distance) or not _finite(angle) or distance > 0.01 or angle > 0.02:
+                    return False
+            key = (stamp, id(image), id(getattr(image, 'data', None)), info_entry['stamp'], id(info),
+                   tuple(info.K), tuple(self.depth_extrinsics),
+                   tuple(sorted(self.depth_projection_config.items())))
+            cached = getattr(self, '_depth_veto_cache', None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            trans = self.depth_extrinsics[:3]
+            rotation = self.tf.transformations.quaternion_from_euler(*self.depth_extrinsics[3:])
+            matrix = self.tf.transformations.quaternion_matrix(rotation)
+            matrix[:3, 3] = trans
+            k = info.K
+            intrinsics = {'width': image.width, 'height': image.height, 'fx': k[0], 'fy': k[4],
+                          'cx': k[2], 'cy': k[5], 'rectified': True}
+            array = self.bridge.imgmsg_to_cv2(image, desired_encoding='passthrough')
+            corridor = project_depth_frame(array, image.encoding, intrinsics, matrix, stamp,
+                                           self.depth_projection_config)
+            candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': corridor}}
+            accepted = ProjectedDepthGate().assess(candidate, now).get('candidate') is True
+            self._depth_veto_cache = (key, accepted)
+            return accepted
+        except Exception:  # noqa: BLE001 - an unprocessed depth frame must veto
+            return False
+
     def is_current_sample(self, sample):
-        """Recheck a candidate against the latest local scan, base and pose."""
+        return self.current_valid_until(sample) is not None
+
+    def current_valid_until(self, sample):
+        """Recheck the candidate and return its earliest local expiry."""
+        def reject(reason):
+            self.current_last_issue = reason
+            return None
+
         try:
             with self.lock:
                 now = _monotonic()
                 if (not isinstance(sample, dict) or not _valid_epoch(sample.get("epoch"))
                         or sample.get("epoch") != self.epoch
                         or self.clock_guard.faulted or self.odom_guard.faulted):
-                    return False
-                odom, status, scan = self.latest["odom"], self.latest["status"], self.latest["scan"]
+                    return reject("epoch_or_guard")
+                odom, status, scan, depth = (self.latest["odom"], self.latest["status"],
+                                             self.latest["scan"], self.latest["depth"])
                 if (not all(_finite(sample.get(name)) for name in
                             ("snapshot_at", "scan_at", "status_at", "depth_at", "color_at"))
                         or not _finite(scan.get("stamp"))
@@ -560,21 +811,46 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         or not 0 <= now - sample["scan_at"] <= 0.5
                         or not 0 <= now - sample["depth_at"] <= 0.5
                         or not 0 <= now - sample["color_at"] <= 0.5):
-                    return False
-                if (scan["stamp"] != sample["scan_at"]
-                        and not newest_scan_veto(scan.get("message"), self.extrinsics)):
-                    return False
+                    return reject("timestamps")
+                # A newer frame must be projected and checked rather than
+                # silently authorizing motion from the earlier depth image.
+                if (not _finite(depth.get("stamp")) or depth["stamp"] < sample["depth_at"]
+                        or depth["stamp"] != sample["depth_at"]
+                        and not self._newest_depth_safe_locked(sample, depth, odom, now)):
+                    return reject("new_depth_unchecked")
+                if scan["stamp"] != sample["scan_at"]:
+                    aligned_scan = nearest_odometry(self.odom_history, scan["stamp"])
+                    if (not isinstance(sample.get("scene"), dict)
+                            or aligned_scan is None or aligned_scan.get("epoch") != self.epoch
+                            or not newest_scan_veto(scan.get("message"), self.extrinsics,
+                                                    sample.get("scene"), now, scan["stamp"],
+                                                    sample["pose"], aligned_scan["pose"], odom["pose"])):
+                        return reject("new_scan")
                 distance, rotation = _pose_delta(sample["pose"], odom["pose"])
                 state = base_state(odom["message"], status["message"], now)
-                return (distance <= 0.005 and rotation <= 0.01 and state is not None
-                        and state["motion_mode"] == 0 and state["error_code"] == 0
-                        and state["vehicle_state"] == 0 and state["control_mode"] == 1
-                        and state["battery_voltage"] >= 10
-                        and 0 <= state["linear_x_mps"] <= 0.02
-                        and abs(state["linear_y_mps"]) <= 0.005
-                        and abs(state["angular_z_radps"]) <= 0.02)
+                if not _finite(distance) or not _finite(rotation) or distance > 0.005 or rotation > 0.01:
+                    return reject("pose_changed")
+                if (state is None or state["motion_mode"] != 0 or state["error_code"] != 0
+                        or state["vehicle_state"] != 0 or state["control_mode"] != 1
+                        or state["battery_voltage"] < 10):
+                    return reject("base_state")
+                if (not 0 <= state["linear_x_mps"] <= 0.02
+                        or abs(state["linear_y_mps"]) > 0.005
+                        or abs(state["angular_z_radps"]) > 0.02):
+                    return reject("base_speed")
+                limits = {"latest_odom": odom["stamp"] + 0.1, "latest_scan": scan["stamp"] + 0.3,
+                          "latest_depth": depth["stamp"] + 0.1, "latest_status": status["stamp"] + 1.0,
+                          "snapshot": sample["snapshot_at"] + 0.25, "scan": sample["scan_at"] + 0.5,
+                          "status": sample["status_at"] + 1.0, "depth": sample["depth_at"] + 0.5,
+                          "color": sample["color_at"] + 0.5}
+                self.current_limit_kind = min(limits, key=limits.get)
+                deadline = limits[self.current_limit_kind]
+                if not _finite(deadline) or deadline <= now:
+                    return reject("timestamps")
+                self.current_last_issue = None
+                return deadline
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
-            return False
+            return reject("malformed")
 
     def continuity_snapshot(self):
         """Read odom, fault and epoch together without I/O or mixed generations."""
@@ -623,7 +899,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             ages = {name: max(0.0, now - record["stamp"])
                     for name, record in self.latest.items()}
             return {"epoch": self.epoch, "clock_fault": self.clock_guard.fault_reason,
-                    "odom_fault": self.odom_guard.fault_reason, "sensor_ages_sec": ages}
+                    "odom_fault": self.odom_guard.fault_reason, "sensor_ages_sec": ages,
+                    "snapshot_issue": getattr(self, "snapshot_last_issue", None)}
 
 
 def observe(seconds):

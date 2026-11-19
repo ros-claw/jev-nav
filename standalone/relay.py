@@ -12,6 +12,10 @@ must be zero; every other Twist field remains zero. JSON velocity limits use
 the exact input decimal, before conversion to floats. Frames are at most 512
 bytes before the newline. Stdin and stdout are nonblocking in this process.
 
+When --require-intent-deadline is set, each frame also contains an absolute
+``expires_at`` in the same monotonic clock domain. The relay latches zero at
+that deadline even if its ordinary heartbeat has not yet expired.
+
 An optional --max-motion-sec bounds relay time from the first nonzero frame.
 The READY line then includes motion_limit_sec; the deadline latches zero even
 if fresh heartbeats continue. Scheduler stalls, transport, host failure and
@@ -100,9 +104,10 @@ def _number(value):
 
 
 class RelayGate(object):
-    def __init__(self, started_at, max_motion_sec=None):
+    def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False):
         if (not _number(started_at) or (max_motion_sec is not None
-                and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))):
+                and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))
+                or type(require_intent_deadline) is not bool):
             raise ValueError('invalid start time')
         self.last_at = float(started_at)
         self.last_stamp = None
@@ -114,6 +119,8 @@ class RelayGate(object):
         self.had_motion = False
         self.motion_started_at = None
         self.max_motion_sec = max_motion_sec
+        self.require_intent_deadline = require_intent_deadline
+        self.intent_deadline = None
 
     def stop(self, reason):
         self.stopped = True
@@ -124,12 +131,18 @@ class RelayGate(object):
     def accept(self, frame, now):
         if self.stopped:
             return False
+        if (self.intent_deadline is not None and _number(now) and now >= self.intent_deadline):
+            self.stop('intent_deadline')
+            return False
         if (self.motion_started_at is not None and self.max_motion_sec is not None
                 and _number(now) and now >= self.motion_started_at + self.max_motion_sec):
             self.stop('motion_deadline')
             return False
+        keys = set(['sequence', 'stamp', 'linear', 'angular'])
+        if self.require_intent_deadline:
+            keys.add('expires_at')
         valid = (isinstance(frame, dict) and
-                 set(frame) == set(['sequence', 'stamp', 'linear', 'angular']) and
+                 set(frame) == keys and
                  isinstance(frame.get('sequence'), INTEGER_TYPES) and
                  not isinstance(frame.get('sequence'), bool) and
                  self.sequence < frame['sequence'] <= 9223372036854775807 and
@@ -140,6 +153,10 @@ class RelayGate(object):
                      0 <= now - frame['stamp'] < HEARTBEAT_SEC and
                      (self.last_stamp is None or frame['stamp'] > self.last_stamp) and
                      _safe_velocity(frame['linear'], frame['angular']))
+        if valid and self.require_intent_deadline:
+            expiry = frame['expires_at']
+            valid = (_number(expiry) and frame['stamp'] < expiry <= frame['stamp'] + HEARTBEAT_SEC
+                     and now < expiry)
         if not valid:
             self.stop('invalid_frame')
             return False
@@ -148,6 +165,7 @@ class RelayGate(object):
         self.last_stamp = float(frame['stamp'])
         self.linear = float(frame['linear'])
         self.angular = float(frame['angular'])
+        self.intent_deadline = float(frame['expires_at']) if self.require_intent_deadline else None
         if self.linear or self.angular:
             self.had_motion = True
             if self.motion_started_at is None:
@@ -157,7 +175,9 @@ class RelayGate(object):
         return True
 
     def command(self, now):
-        if not _number(now) or not 0 <= now - self.last_at < HEARTBEAT_SEC:
+        if (self.intent_deadline is not None and _number(now) and now >= self.intent_deadline):
+            self.stop('intent_deadline')
+        elif not _number(now) or not 0 <= now - self.last_at < HEARTBEAT_SEC:
             self.stop('heartbeat')
         elif (self.motion_started_at is not None and self.max_motion_sec is not None
               and now >= self.motion_started_at + self.max_motion_sec):
@@ -319,6 +339,7 @@ class _Shared(object):
         self.armed = False
         self.command = (0.0, 0.0)
         self.command_at = None
+        self.intent_deadline = None
         self.progress = None
         self.shutdown_at = None
 
@@ -344,11 +365,26 @@ class _Shared(object):
                 self.armed = True
                 self.command_at = now
 
-    def set_command(self, command, now):
+    def set_command(self, command, now, intent_deadline=None):
         with self.lock:
             if self.fault is None:
                 self.command = command
                 self.command_at = now
+                self.intent_deadline = intent_deadline
+
+    def command_for_publish(self, clock):
+        """Check the command deadline under the same lock as the command."""
+        with self.lock:
+            now = clock()
+            if not _number(now):
+                if self.fault is None:
+                    self.fault = 'clock_invalid'
+                self.command = (0.0, 0.0)
+            elif self.intent_deadline is not None and now >= self.intent_deadline:
+                if self.fault is None:
+                    self.fault = 'intent_deadline'
+                self.command = (0.0, 0.0)
+            return self.fault, self.command, self.shutdown_at
 
     def progressed(self, now):
         with self.lock:
@@ -409,7 +445,7 @@ def _ros_worker(shared, parent_pid):
                 if armed and (command_at is None or not 0 <= now - command_at < HEARTBEAT_SEC):
                     shared.stop('heartbeat')
                     fault = 'heartbeat'
-                latest_fault, _, _, latest_command, _, _, latest_shutdown = shared.snapshot()
+                latest_fault, latest_command, latest_shutdown = shared.command_for_publish(_monotonic)
                 if (fault is not None or latest_fault is not None or not ready or not armed or
                         shutdown_at is not None or latest_shutdown is not None):
                     command = (0.0, 0.0)
@@ -478,7 +514,7 @@ def _emit(fd, line):
         return False
 
 
-def main(max_motion_sec=None):
+def main(max_motion_sec=None, require_intent_deadline=False):
     """Run one session, using inherited pipe stdin and status messages on stdout."""
     global _stopping
     _stopping = False
@@ -508,7 +544,10 @@ def main(max_motion_sec=None):
         while not _stopping:
             fault, _, _, _, _, _, _ = shared.snapshot()
             try:
-                inputs, _, _ = select.select([] if fault else [input_fd], [], [], PERIOD_SEC)
+                wait = PERIOD_SEC
+                if gate is not None and gate.intent_deadline is not None:
+                    wait = min(wait, max(0.0, gate.intent_deadline - _monotonic()))
+                inputs, _, _ = select.select([] if fault else [input_fd], [], [], wait)
             except (OSError, select.error) as exc:
                 if getattr(exc, 'errno', None) == errno.EINTR or (exc.args and exc.args[0] == errno.EINTR):
                     continue
@@ -530,7 +569,7 @@ def main(max_motion_sec=None):
                             if gate.stopped:
                                 shared.stop(gate.reason)
                                 break
-                            shared.set_command(gate.command(now), now)
+                            shared.set_command(gate.command(now), now, gate.intent_deadline)
                 except (OSError, IOError) as exc:
                     if getattr(exc, 'errno', None) not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
                         shared.stop('pipe_error')
@@ -550,7 +589,8 @@ def main(max_motion_sec=None):
                     shared.stop('ros_stalled')
             fault, ready, armed, _, _, _, _ = shared.snapshot()
             if not fault and ready and not ready_sent:
-                gate = RelayGate(now, max_motion_sec=max_motion_sec)
+                gate = RelayGate(now, max_motion_sec=max_motion_sec,
+                                 require_intent_deadline=require_intent_deadline)
                 shared.arm(now)
                 ready_line = ('READY' if max_motion_sec is None else
                               'READY motion_limit_sec=%.6f' % max_motion_sec)
@@ -582,5 +622,6 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Bounded forward-only LIMO relay')
     parser.add_argument('--max-motion-sec', type=float, default=None)
+    parser.add_argument('--require-intent-deadline', action='store_true')
     arguments = parser.parse_args()
-    sys.exit(main(arguments.max_motion_sec))
+    sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline))

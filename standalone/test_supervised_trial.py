@@ -1,10 +1,37 @@
 import pytest
-from supervised_trial import parse_args, summarize_observations
+from supervised_trial import (
+    RealClock,
+    make_relay,
+    make_ros_monitor,
+    parse_args,
+    summarize_observations,
+)
 
 
 def test_default_is_observation_only():
     args = parse_args([])
-    assert args.execute is False
+    assert args.execute is False and args.longer_forward is False
+
+
+def test_longer_forward_trial_is_explicitly_selected():
+    args = parse_args(['--longer-forward'])
+    assert args.longer_forward is True and args.execute is False
+    relay = make_relay(RealClock(), motion_limit_sec=2.0)
+    assert relay.motion_limit_sec == 2.0 and relay.transport.process is None
+
+
+def test_trial_uses_independent_heartbeat_without_starting_a_process_at_construction():
+    from threaded_relay_adapter import ThreadedRelayAdapter
+    relay = make_relay(RealClock())
+    assert isinstance(relay, ThreadedRelayAdapter)
+    assert relay.transport.process is None
+
+
+def test_trial_monitor_allows_ros_rpc_scheduling_delay_without_changing_watchdog_freshness():
+    guard = make_ros_monitor(RealClock(), 11139, 'http://localhost:11311')
+    assert guard.backend.rpc_timeout == 0.2
+    assert guard.max_age == 0.3
+    assert guard.bind_timeout == 0.35
 
 
 @pytest.mark.parametrize('argv', [
