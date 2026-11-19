@@ -1,2 +1,4 @@
 # This patch embeds context from the upstream CRLF-terminated YDLidar SDK.
 patches/ydlidar-diagnostic-candidate.patch whitespace=-blank-at-eol,cr-at-eol
+# This patch embeds existing source lines, including context-only blank lines.
+patches/limo-base-command-watchdog.patch whitespace=-blank-at-eol,cr-at-eol

@@ -278,6 +278,31 @@ class ScanFusionTests(unittest.TestCase):
         self.assertEqual(result["rays"], [])
         self.assertEqual(result["occupied_hits"], [])
 
+    def test_float_subclass_cannot_hide_nonfinite_transformed_coordinates(self):
+        class MisleadingNaN(float):
+            def __lt__(self, other):
+                return True
+
+            def __gt__(self, other):
+                return True
+
+            def __rmul__(self, other):
+                return self
+
+            def __add__(self, other):
+                return self
+
+        class PoseCoordinate(float):
+            def __rsub__(self, other):
+                return MisleadingNaN(float("nan"))
+
+        evidence = fusion()
+        self.assertTrue(evidence.add_scan(scan(10, [1], 0, 0.1), (0, 0, 0), 10, 10))
+        result = evidence.snapshot((PoseCoordinate(0), 0, 0), 10, 10)
+        self.assertEqual(result["status"], "pose_invalid")
+        self.assertEqual(result["rays"], [])
+        self.assertEqual(result["occupied_hits"], [])
+
     def test_negative_pose_timestamp_is_never_valid(self):
         evidence = fusion()
         self.assertFalse(evidence.add_scan(scan(0, [1], 0, 0.1), (0, 0, 0), -0.01, 0))

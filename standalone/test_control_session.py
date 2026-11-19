@@ -57,6 +57,24 @@ def test_stale_pose_or_sensor_loss_latches_after_motion():
     assert restored['frame']['linear'] == 0 and restored['latched']
 
 
+def test_opt_in_shadow_age_budget_keeps_current_pose_bound():
+    session = ControlSession(10.0, 20.0, epoch=7, snapshot_max_age_sec=0.15)
+    approved = decision(10.05)
+    first = session.step(evidence(10.05), approved, (0, 0, 0), 10.05, 7)
+    assert first['frame']['linear'] > 0
+    recent = session.step(evidence(10.05), approved, (0.001, 0, 0), 10.18, 7)
+    assert recent['frame']['linear'] > 0 and not recent['latched']
+    assert session.step(evidence(10.05), approved, (0.001, 0, 0), 10.21, 7)['latched']
+
+
+def test_opt_in_shadow_age_budget_cannot_exceed_150ms():
+    try:
+        ControlSession(10.0, 20.0, epoch=7, snapshot_max_age_sec=0.16)
+    except ValueError:
+        return
+    raise AssertionError('unbounded snapshot age was accepted')
+
+
 def test_live_epoch_change_invalidates_even_a_fresh_old_epoch_sample():
     session = ControlSession(10.0, 20.0, epoch=7)
     approved = decision(10.05)

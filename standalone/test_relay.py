@@ -21,6 +21,19 @@ except ImportError:  # Python 3.12 removed imp; ROS Melodic still uses Python 2.
 
 
 class GateTests(unittest.TestCase):
+    def test_independent_motion_deadline_cannot_be_extended_by_heartbeats(self):
+        gate = relay.RelayGate(10.0, max_motion_sec=0.4)
+        for sequence, stamp in enumerate((10.05, 10.15, 10.25, 10.35, 10.44)):
+            frame = {'sequence': sequence, 'stamp': stamp, 'linear': 0.02, 'angular': 0.0}
+            self.assertTrue(gate.accept(frame, stamp))
+        self.assertEqual(gate.command(10.451), (0.0, 0.0))
+        self.assertEqual(gate.reason, 'motion_deadline')
+        self.assertFalse(gate.accept({'sequence': 6, 'stamp': 10.46, 'linear': 0.02, 'angular': 0.0}, 10.46))
+
+    def test_invalid_independent_motion_deadline_is_rejected(self):
+        for value in (0.0, -1.0, 31.0, float('nan'), True):
+            with self.assertRaises(ValueError):
+                relay.RelayGate(10.0, max_motion_sec=value)
     def test_fresh_motion_expires_and_cannot_resume(self):
         self.assertIsNotNone(relay, 'relay implementation is required')
         gate = relay.RelayGate(10.0)
@@ -267,7 +280,7 @@ rospy.signal_shutdown = lambda message: None
 sys.modules.update({'rospy': rospy, 'geometry_msgs': geometry,
                     'geometry_msgs.msg': geometry_msg, 'std_msgs': std,
                     'std_msgs.msg': std_msg})
-sys.exit(relay.main())
+sys.exit(relay.main(0.3 if mode == 'absolute_deadline' else None))
 """
 
 
@@ -349,6 +362,20 @@ class SubprocessTests(unittest.TestCase):
         last_nonzero = max(i for i, x in enumerate(commands) if x != 'CMD 0.0000 0.0000')
         self.assertGreaterEqual(len(commands) - last_nonzero - 1, 2)
         self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in commands[last_nonzero + 1:]))
+
+    def test_relay_enforces_independent_motion_deadline_with_fresh_heartbeats(self):
+        self.start('absolute_deadline')
+        self.await_line(1, 'READY motion_limit_sec=0.300000')
+        for sequence in range(1, 12):
+            self.send(sequence, 0.02)
+            self.pump(0.05)
+        self.await_line(1, 'STOP motion_deadline')
+        self.pump(0.15)
+        commands = [line for line in self.lines[2] if line.startswith('CMD ')]
+        self.assertIn('CMD 0.0200 0.0000', commands)
+        last_motion = max(i for i, line in enumerate(commands) if line == 'CMD 0.0200 0.0000')
+        self.assertGreaterEqual(len(commands) - last_motion - 1, 2)
+        self.assertTrue(all(line == 'CMD 0.0000 0.0000' for line in commands[last_motion + 1:]))
 
     def test_excess_or_turning_or_reverse_command_latches_zero(self):
         bad_commands = [(-0.000001, 0.0), (0.050001, 0.0),

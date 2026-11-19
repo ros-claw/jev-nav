@@ -34,6 +34,14 @@ The timeout and 50 ms polling period are initial test values, not
 measured stopping guarantees. The feature defaults to disabled to avoid
 changing existing deployments before integration and testing.
 
+When the watchdog is enabled, the candidate also requests Linux `TIOCEXCL`
+on its serial device and refuses to start if that request fails. Its isolated
+PTY checks cover the normal and failure paths, including a second driver and
+an ioctl failure injected before initialization. This prevents later ordinary
+opens, but cannot revoke an already-open descriptor, excludes neither a
+privileged bypass nor the short open-to-ioctl race, and is not a physical stop.
+The patch includes the isolated test sources and their reproduction commands.
+
 `worker/limo_command_watchdog.h` is the standalone policy used by the patch;
 `tests/test_command_watchdog.py` compiles and exercises it without ROS or a
 robot. The patched source has also been compiled in an isolated ROS Melodic
@@ -46,9 +54,10 @@ driver. It cannot stop the robot if that process, callback queue, serial write,
 computer or power fails. ROS 1 `Twist` lacks a timestamp and publisher identity:
 the watchdog cannot distinguish delayed commands or another publisher that
 continues sending. Restarting the driver resets its in-memory latch. A complete
-real deployment still needs command-source arbitration, the daemon-owned
-executor and authorization path, an independent chassis command-loss stop, and
-physical verification. A complete serial write is not a controller
+real deployment still needs a suitable command-source control path, an
+independent chassis command-loss stop, and physical verification. The
+standalone candidate connects directly to ROS without requiring rosclawd.
+A complete serial write is not a controller
 acknowledgement or proof of physical stopping.
 
 The candidate relay sends zero until a stable ROS subscriber connection and a

@@ -50,13 +50,15 @@ def _pose(value):
 
 
 class ControlSession(object):  # noqa: UP004 - ROS Melodic Python 2
-    def __init__(self, started_at, deadline, epoch):
-        if not _valid_epoch(epoch):
+    def __init__(self, started_at, deadline, epoch, snapshot_max_age_sec=0.1):
+        if (not _valid_epoch(epoch) or not _finite(snapshot_max_age_sec)
+                or not 0 < snapshot_max_age_sec <= 0.15):
             raise ValueError('invalid observation epoch')
         self.policy = ForwardPolicy(started_at, deadline)
         self.decision_gate = DecisionGate()
         self.lock = threading.Lock()
         self.epoch = epoch
+        self.snapshot_max_age_sec = snapshot_max_age_sec
         self.last_at = started_at
         self.sequence = 0
         self.had_motion = False
@@ -119,7 +121,7 @@ class ControlSession(object):  # noqa: UP004 - ROS Melodic Python 2
                         self.decision_gate.invalidate()
                         self.policy.step(None, None, None, None, now)
                         reason = 'observation_unavailable'
-                    elif not snapshot_is_fresh(sample, now, live_pose):
+                    elif not snapshot_is_fresh(sample, now, live_pose, self.snapshot_max_age_sec):
                         self._latch('observation_unavailable')
                     else:
                         try:

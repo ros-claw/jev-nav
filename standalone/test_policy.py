@@ -28,6 +28,18 @@ def sample(now=10.0):
     }, "rays": rays, "occupied_hits": hits}
 
 
+def crossing_scene(latest_y, older_y, latest_stamp=10.25, older_stamp=10.0):
+    rays = [{"start_base": (0.1, 0.0), "hit_base": (1.1, 2.0 * y), "stamp": stamp}
+            for stamp, values in ((latest_stamp, latest_y), (older_stamp, older_y))
+            for y in values]
+    return {"status": "ok", "coverage": {
+        "sensor_fresh": True, "scan_stamp": latest_stamp, "front_samples": 14,
+        "latest_valid_samples": len(latest_y),
+        "latest_valid_fraction": float(len(latest_y)) / 14,
+    }, "rays": rays,
+        "occupied_hits": [{"point_base": ray["hit_base"], "stamp": ray["stamp"]} for ray in rays]}
+
+
 def scan(stamp, ranges, angle_min=-0.3, angle_increment=0.6 / 32):
     return {"stamp": stamp, "ranges": ranges, "angle_min": angle_min,
             "angle_increment": angle_increment, "range_min": 0.1, "range_max": 10.0}
@@ -43,7 +55,15 @@ def fusion_scene(first, last, old_ranges, new_ranges):
 
 def healthy_state(now=10.2, linear=0.0):
     return {"stamp": now, "motion_mode": 0, "error_code": 0, "battery_voltage": 12.0,
-            "linear_x_mps": linear, "angular_z_radps": 0.0}
+            "linear_x_mps": linear, "linear_y_mps": 0.0, "angular_z_radps": 0.0}
+
+
+def test_lateral_motion_cannot_authorize_forward_command():
+    state = healthy_state()
+    state['linear_y_mps'] = 0.02
+    assert output(sample(10.2), state=state)['linear'] == 0.0
+    state.pop('linear_y_mps')
+    assert output(sample(10.2), state=state)['linear'] == 0.0
 
 
 def healthy_depth(now=10.2):
@@ -81,13 +101,87 @@ def test_latest_single_valid_ray_cannot_borrow_old_coverage():
     assert assess_front(scene, 10.2)["candidate"] is False
 
 
-def test_measured_42_percent_grid_occupancy_is_rejected_even_when_rays_are_spread():
+def test_sparse_padded_grid_uses_measured_cross_section_spacing_not_bin_fraction():
     latest = [0.0] * 33
     for index in (0, 2, 5, 7, 10, 12, 15, 17, 20, 22, 25, 27, 30, 32):
         latest[index] = 2.0
     scene = fusion_scene(10.0, 10.2, [2.0] * 33, latest)
     assert 0.42 < scene["coverage"]["latest_valid_fraction"] < 0.443
-    assert assess_front(scene, 10.2)["candidate"] is False
+    result = assess_front(scene, 10.2)
+    assert result["candidate"] is True
+    assert result["max_sample_gap_m"] < 0.035
+    assert result["geometric_clearance_verified"] is False
+
+
+def test_recent_scans_can_fill_small_sampling_gaps_but_not_a_large_latest_gap():
+    previous = [2.0 if i % 4 == 0 else 0.0 for i in range(33)]
+    latest = [2.0 if i % 4 == 2 else 0.0 for i in range(33)]
+    scene = fusion_scene(10.0, 10.2, previous, latest)
+    result = assess_front(scene, 10.2)
+    assert result['candidate'] is True
+    assert result['latest_max_sample_gap_m'] > 0.035
+    assert result['max_sample_gap_m'] <= 0.035
+    assert result['geometric_clearance_verified'] is False
+    very_sparse = [2.0 if i in (0, 1, 31, 32) else 0.0 for i in range(33)]
+    assert assess_front(fusion_scene(10.0, 10.2, [2.0] * 33, very_sparse), 10.2)['candidate'] is False
+    assert assess_front(fusion_scene(10.0, 10.4, previous, latest), 10.4)['candidate'] is False
+    assert assess_front(fusion_scene(10.0, 10.2, previous, latest), 10.46)['candidate'] is False
+
+
+@pytest.mark.parametrize("older_stamp,now,expected", [
+    (10.0, 10.25, True), (9.9999, 10.25, False),
+    (10.0, 10.4499, True), (10.0, 10.4501, False),
+])
+def test_rolling_gap_fill_has_independent_scan_and_wall_age_limits(older_stamp, now, expected):
+    latest_y = [-0.15, -0.09, -0.03, 0.03, 0.09, 0.15]
+    older_y = [-0.12, -0.06, 0.0, 0.06, 0.12]
+    result = assess_front(crossing_scene(latest_y, older_y, older_stamp=older_stamp), now)
+    assert result["candidate"] is expected
+
+
+def test_supervised_sampling_can_use_bounded_older_rays_with_latest_gap_still_checked():
+    latest_y = [-0.15, -0.09, -0.03, 0.03, 0.09, 0.15]
+    older_y = [-0.12, -0.06, 0.0, 0.06, 0.12]
+    scene = crossing_scene(latest_y, older_y, latest_stamp=10.39, older_stamp=10.0)
+    assert assess_front(scene, 10.5)['candidate'] is False
+    result = assess_front(scene, 10.5, latest_age_limit=0.5,
+                          history_age_limit=0.65, history_span_limit=0.4)
+    assert result['candidate'] is True
+    assert result['geometric_clearance_verified'] is False
+    assert not assess_front(scene, 10.5, history_span_limit=0.401)['candidate']
+    scene = crossing_scene([-0.15, -0.03, 0.09, 0.15], older_y, latest_stamp=10.39, older_stamp=10.0)
+    assert not assess_front(scene, 10.5, latest_age_limit=0.5,
+                            history_age_limit=0.65, history_span_limit=0.4)['candidate']
+
+
+def test_latest_scan_gap_at_limit_passes_but_over_limit_does_not():
+    older_y = [-0.14 + index * 0.01 for index in range(29)]
+    at_limit = crossing_scene([-0.14, -0.07, 0, 0.07, 0.14], older_y)
+    above_limit = crossing_scene([-0.14, -0.07001, 0, 0.07001, 0.14], older_y)
+    assert assess_front(at_limit, 10.25, half_width=0.14)["candidate"] is True
+    assert assess_front(above_limit, 10.25, half_width=0.14)["candidate"] is False
+
+
+@pytest.mark.parametrize("max_gap", [0.035000001, 0.04, 0.05])
+def test_max_gap_cannot_relax_the_required_35mm_limit(max_gap):
+    result = assess_front(sample(), 10.1, max_gap=max_gap)
+    assert result["candidate"] is False
+    assert result["reason"] == "invalid_evidence"
+
+
+def test_default_max_gap_boundary_remains_accepted():
+    assert assess_front(sample(), 10.1, max_gap=0.035)["candidate"] is True
+
+
+def test_smaller_caller_age_limit_also_expires_historical_gap_fill():
+    latest_y = [-0.15, -0.09, -0.03, 0.03, 0.09, 0.15]
+    older_y = [-0.12, -0.06, 0.0, 0.06, 0.12]
+    scene = crossing_scene(latest_y, older_y, latest_stamp=10.25, older_stamp=10.125)
+    at_limit = assess_front(scene, 10.25, max_age=0.125)
+    beyond_limit = assess_front(scene, 10.2501, max_age=0.125)
+    assert at_limit["candidate"] is True
+    assert beyond_limit["candidate"] is False
+    assert beyond_limit["reason"] == "forward_coverage_incomplete"
 
 
 def test_cached_snapshot_is_rejected_once_latest_scan_is_stale():
@@ -124,11 +218,38 @@ def test_known_near_forward_points_are_not_ignored(x):
     assert assess_front(scene, 10.1)["candidate"] is False
 
 
-def test_known_point_behind_the_base_is_not_a_front_obstacle():
+@pytest.mark.parametrize("x", [-0.18, -0.1, -0.01])
+def test_retained_hit_in_padded_rear_footprint_blocks(x):
     scene = sample()
-    scene["rays"].append({"start_base": (-0.1, 0.0), "hit_base": (-0.01, 0.0), "stamp": 9.9})
-    scene["occupied_hits"].append({"point_base": (-0.01, 0.0), "stamp": 9.9})
+    scene["rays"].append({"start_base": (x - 0.1, 0.0), "hit_base": (x, 0.0), "stamp": 9.9})
+    scene["occupied_hits"].append({"point_base": (x, 0.0), "stamp": 9.9})
+    result = assess_front(scene, 10.1)
+    assert result["candidate"] is False
+    assert result["reason"] == "forward_obstacle"
+
+
+@pytest.mark.parametrize("x,y", [(-0.18, -0.15), (-0.18, 0.15), (0.1, 0.14)])
+def test_narrow_sample_width_cannot_shrink_padded_obstacle_check(x, y):
+    scene = sample()
+    scene["rays"].append({"start_base": (x - 0.1, y), "hit_base": (x, y), "stamp": 9.9})
+    scene["occupied_hits"].append({"point_base": (x, y), "stamp": 9.9})
+    assert assess_front(scene, 10.1, half_width=0.05)["reason"] == "forward_obstacle"
+
+
+def test_known_point_behind_padded_footprint_is_not_a_forward_obstacle():
+    scene = sample()
+    scene["rays"].append({"start_base": (-0.3, 0.0), "hit_base": (-0.180001, 0.0), "stamp": 9.9})
+    scene["occupied_hits"].append({"point_base": (-0.180001, 0.0), "stamp": 9.9})
     assert assess_front(scene, 10.1)["candidate"] is True
+
+
+def test_rear_footprint_hit_blocks_after_history_coverage_window():
+    scene = sample(now=10.25)
+    scene["rays"].append({"start_base": (-0.2, 0.0), "hit_base": (-0.1, 0.0), "stamp": 9.7})
+    scene["occupied_hits"].append({"point_base": (-0.1, 0.0), "stamp": 9.7})
+    result = assess_front(scene, 10.25)
+    assert result["candidate"] is False
+    assert result["reason"] == "forward_obstacle"
 
 
 @pytest.mark.parametrize("coverage", [None, [], "invalid", {}])
@@ -142,6 +263,29 @@ def test_a_malformed_ray_cannot_be_silently_skipped():
     scene = sample()
     scene["rays"][0]["hit_base"] = (float("nan"), 0.0)
     assert assess_front(scene, 10.1)["candidate"] is False
+
+
+@pytest.mark.parametrize("invalid", [True, float("nan"), float("inf"), 10 ** 400])
+def test_shared_hit_coordinates_still_require_finite_numeric_values(invalid):
+    scene = sample()
+    shared_point = (invalid, 0.1)
+    scene["rays"][0]["hit_base"] = shared_point
+    scene["occupied_hits"][0]["point_base"] = shared_point
+    assert assess_front(scene, 10.1)["reason"] == "invalid_evidence"
+
+
+def test_equal_but_distinct_hit_must_not_accept_boolean_as_a_coordinate():
+    scene = sample()
+    scene["rays"][0]["hit_base"] = (1.0, 0.1)
+    scene["occupied_hits"][0]["point_base"] = (True, 0.1)
+    assert assess_front(scene, 10.1)["reason"] == "invalid_evidence"
+
+
+def test_old_hit_stamp_must_be_valid_even_if_equal_to_the_ray_stamp():
+    scene = sample()
+    scene["rays"].append({"start_base": (0.1, 1.0), "hit_base": (1.0, 2.0), "stamp": 1.0})
+    scene["occupied_hits"].append({"point_base": (1.0, 2.0), "stamp": True})
+    assert assess_front(scene, 10.1)["reason"] == "invalid_evidence"
 
 
 def test_a_ray_hit_missing_from_occupied_hits_cannot_be_treated_as_clear():

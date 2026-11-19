@@ -31,7 +31,7 @@ def main():
     config = {"forward_min_m": 0.18, "forward_max_m": 1.0, "half_width_m": 0.15,
               "ground_z_m": args.ground_z, "ground_tolerance_m": args.ground_tolerance,
               "obstacle_min_height_m": 0.03, "obstacle_max_height_m": 0.4,
-              "min_depth_m": 0.1, "max_depth_m": 8.0, "sample_stride": 2}
+              "min_depth_m": 0.3, "max_depth_m": 3.0, "sample_stride": 2}
     for _ in range(args.frames):
         depth = rospy.wait_for_message("/camera/depth/image_raw", Image, timeout=5)
         info = rospy.wait_for_message("/camera/depth/camera_info", CameraInfo, timeout=5)

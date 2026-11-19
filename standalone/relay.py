@@ -12,6 +12,11 @@ must be zero; every other Twist field remains zero. JSON velocity limits use
 the exact input decimal, before conversion to floats. Frames are at most 512
 bytes before the newline. Stdin and stdout are nonblocking in this process.
 
+An optional --max-motion-sec bounds relay time from the first nonzero frame.
+The READY line then includes motion_limit_sec; the deadline latches zero even
+if fresh heartbeats continue. Scheduler stalls, transport, host failure and
+actual chassis braking can delay or prevent a physical stop.
+
 The relay publishes /cmd_vel and subscribes to the candidate driver's
 /rosclaw_limo/command_watchdog (std_msgs/String v2); that topic name is a driver
 contract and does not require the ROSClaw service. Before READY it publishes
@@ -95,8 +100,9 @@ def _number(value):
 
 
 class RelayGate(object):
-    def __init__(self, started_at):
-        if not _number(started_at):
+    def __init__(self, started_at, max_motion_sec=None):
+        if (not _number(started_at) or (max_motion_sec is not None
+                and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))):
             raise ValueError('invalid start time')
         self.last_at = float(started_at)
         self.last_stamp = None
@@ -106,6 +112,8 @@ class RelayGate(object):
         self.stopped = False
         self.reason = None
         self.had_motion = False
+        self.motion_started_at = None
+        self.max_motion_sec = max_motion_sec
 
     def stop(self, reason):
         self.stopped = True
@@ -115,6 +123,10 @@ class RelayGate(object):
 
     def accept(self, frame, now):
         if self.stopped:
+            return False
+        if (self.motion_started_at is not None and self.max_motion_sec is not None
+                and _number(now) and now >= self.motion_started_at + self.max_motion_sec):
+            self.stop('motion_deadline')
             return False
         valid = (isinstance(frame, dict) and
                  set(frame) == set(['sequence', 'stamp', 'linear', 'angular']) and
@@ -138,6 +150,8 @@ class RelayGate(object):
         self.angular = float(frame['angular'])
         if self.linear or self.angular:
             self.had_motion = True
+            if self.motion_started_at is None:
+                self.motion_started_at = float(now)
         elif self.had_motion:
             self.stop('requested_stop')
         return True
@@ -145,6 +159,9 @@ class RelayGate(object):
     def command(self, now):
         if not _number(now) or not 0 <= now - self.last_at < HEARTBEAT_SEC:
             self.stop('heartbeat')
+        elif (self.motion_started_at is not None and self.max_motion_sec is not None
+              and now >= self.motion_started_at + self.max_motion_sec):
+            self.stop('motion_deadline')
         if self.stopped:
             return (0.0, 0.0)
         return (self.linear, self.angular)
@@ -461,10 +478,12 @@ def _emit(fd, line):
         return False
 
 
-def main():
+def main(max_motion_sec=None):
     """Run one session, using inherited pipe stdin and status messages on stdout."""
     global _stopping
     _stopping = False
+    if max_motion_sec is not None and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30):
+        raise ValueError('invalid motion deadline')
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
@@ -531,15 +550,17 @@ def main():
                     shared.stop('ros_stalled')
             fault, ready, armed, _, _, _, _ = shared.snapshot()
             if not fault and ready and not ready_sent:
-                gate = RelayGate(now)
+                gate = RelayGate(now, max_motion_sec=max_motion_sec)
                 shared.arm(now)
-                if _emit(output_fd, 'READY'):
+                ready_line = ('READY' if max_motion_sec is None else
+                              'READY motion_limit_sec=%.6f' % max_motion_sec)
+                if _emit(output_fd, ready_line):
                     ready_sent = True
                 else:
                     shared.stop('status_pipe')
             fault, _, _, _, _, _, _ = shared.snapshot()
             if fault and not fault_sent:
-                prefix = 'STOP ' if fault == 'requested_stop' else 'FAULT '
+                prefix = 'STOP ' if fault in ('requested_stop', 'motion_deadline') else 'FAULT '
                 _emit(output_fd, prefix + fault)
                 fault_sent = True
     except Exception:
@@ -558,4 +579,8 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    import argparse
+    parser = argparse.ArgumentParser(description='Bounded forward-only LIMO relay')
+    parser.add_argument('--max-motion-sec', type=float, default=None)
+    arguments = parser.parse_args()
+    sys.exit(main(arguments.max_motion_sec))
