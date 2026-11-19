@@ -59,7 +59,24 @@ processing, without publishing `/tf` or `/cmd_vel`. It does not need a saved
 map. The optional `--test-synthetic-obstacle` injects a point only into the
 private probe topic to check obstacle marking, then discards the grid. The
 private TF topic derives `odom → base_link` from odometry, since the current
-base configuration does not publish that transform. The depth height
-thresholds and camera rectification are unverified; the grid can retain old
-free cells and its depth-layer update-rate check is disabled. Unobserved space
-remains unknown, and this probe does not authorize or control motion.
+base configuration does not publish that transform. The standard obstacle
+layer can retain old free cells. The optional experimental native layer resets
+laser free space on each update and exposes the final grid and the scan's
+acquisition timestamp in a single `FreshGrid` message. It requires a recent
+scan and rejects unsafe laser and unknown-space configurations. A delayed,
+older scan can still replace a newer scan while both are within the age
+limit; monotonic scan ordering has not been enforced. The separate
+depth layer retains marked obstacles, but its frame freshness and validity are
+not bound to the grid. The depth height thresholds and camera rectification
+remain unverified; unobserved space remains unknown. None of these grids is a
+motion permit, and no real controller consumes them yet.
+
+To build the experimental layer, create a catkin workspace with
+`standalone/limo_fresh_layer` linked or copied into its `src` directory and
+run `catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python2`. Pass that workspace to
+`native_sensing_probe.py --fresh-layer-workspace PATH` to test live sensor
+inputs without motion. `fresh_laser_integration_probe.py --workspace PATH`
+checks behavior using private synthetic ROS topics; `--unsafe-inf-config` and
+`--unsafe-unknown-config` test that invalid configurations are rejected. The
+build is local to the chosen catkin workspace and is not installed by these
+commands.

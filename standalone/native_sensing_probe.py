@@ -90,19 +90,34 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--test-synthetic-obstacle', action='store_true',
                         help='inject a fake point only into the isolated probe grid')
+    parser.add_argument('--fresh-layer-workspace',
+                        help='catkin workspace containing the experimental fresh laser layer')
     args = parser.parse_args(argv)
     namespace = 'limo_native_probe_' + uuid.uuid4().hex[:12]
     root = os.path.dirname(os.path.abspath(__file__))
+    env = dict(os.environ)
+    launch_args = []
+    if args.fresh_layer_workspace:
+        workspace = os.path.abspath(args.fresh_layer_workspace)
+        devel = os.path.join(workspace, 'devel')
+        if not os.path.isfile(os.path.join(devel, 'lib', 'liblimo_fresh_layer.so')):
+            parser.error('built native layer not found in workspace')
+        sys.path.insert(0, os.path.join(devel, 'lib', 'python2.7', 'dist-packages'))
+        for name, prefix in (('CMAKE_PREFIX_PATH', devel),
+                             ('LD_LIBRARY_PATH', os.path.join(devel, 'lib')),
+                             ('ROS_PACKAGE_PATH', os.path.join(workspace, 'src'))):
+            env[name] = prefix + (':' + env[name] if env.get(name) else '')
+        launch_args.append('use_fresh:=true')
     lifetime = ['/usr/bin/timeout', '--signal=INT', '--kill-after=3s', '35s']
     commands = [lifetime + [sys.executable, os.path.join(root, 'native_probe_tf.py'),
                             '--namespace', namespace],
                 lifetime + ['/opt/ros/melodic/bin/roslaunch', os.path.join(root, 'native_costmap_probe.launch'),
-                            'namespace:=' + namespace]]
+                            'namespace:=' + namespace] + launch_args]
     processes, log = [], tempfile.TemporaryFile()  # noqa: SIM115 - closed after child cleanup
     rospy = None
     try:
         for command in commands:
-            processes.append(subprocess.Popen(command, stdout=log, stderr=log,
+            processes.append(subprocess.Popen(command, stdout=log, stderr=log, env=env,
                                               preexec_fn=os.setsid, close_fds=True))
         import rospy as ros
         from nav_msgs.msg import OccupancyGrid
@@ -130,11 +145,12 @@ def main(argv=None):
                 inputs[name]['last_at'] = _monotonic()
                 inputs[name]['last_age'] = age
 
-        def receive(grid):
+        def receive(grid, scan_stamp=None, scan_fresh=False, scan_age_at_receipt=None):
             now = _monotonic()
             with lock:
                 counts = collections.Counter(grid.data)
-                received.append((now, counts[-1], counts[0], counts[100], len(grid.data)))
+                received.append((now, counts[-1], counts[0], counts[100], len(grid.data),
+                                 grid.header.stamp.to_sec(), scan_stamp, scan_fresh, scan_age_at_receipt))
                 latest_grid[0] = grid
                 if target[0] is not None and grid.info.resolution > 0:
                     x = int(math.floor((target[0][0] - grid.info.origin.position.x) / grid.info.resolution))
@@ -142,11 +158,28 @@ def main(argv=None):
                     if 0 <= x < grid.info.width and 0 <= y < grid.info.height:
                         costs.append(grid.data[y * grid.info.width + x])
 
-        subscribers = [rospy.Subscriber('/' + namespace + '/rolling_costmap/costmap/costmap',
-                                        OccupancyGrid, receive, queue_size=1),
-                       rospy.Subscriber('/scan', LaserScan, lambda message: sensor('scan', message), queue_size=1),
+        subscribers = [rospy.Subscriber('/scan', LaserScan, lambda message: sensor('scan', message), queue_size=1),
                        rospy.Subscriber('/' + namespace + '/depth_points', PointCloud2,
                                         lambda message: sensor('depth_points', message), queue_size=1)]
+        if args.fresh_layer_workspace:
+            from limo_fresh_layer.msg import FreshGrid
+            def receive_bound(message):
+                checked, scan = message.header.stamp.to_sec(), message.scan_stamp.to_sec()
+                if (message.grid.header.stamp != message.header.stamp
+                        or message.grid.header.frame_id != message.header.frame_id
+                        or not all(not math.isnan(value) and not math.isinf(value) for value in (checked, scan))
+                        or message.scan_fresh and not 0 < scan <= checked
+                        or not message.scan_fresh and scan != 0):
+                    return
+                age = (rospy.Time.now() - message.scan_stamp).to_sec() if message.scan_fresh else None
+                if age is not None and (math.isnan(age) or math.isinf(age) or age < 0):
+                    return
+                receive(message.grid, scan, message.scan_fresh, age)
+            subscribers.append(rospy.Subscriber('/' + namespace + '/rolling_costmap/costmap/snapshot/fresh_grid',
+                                                FreshGrid, receive_bound, queue_size=1))
+        else:
+            subscribers.append(rospy.Subscriber('/' + namespace + '/rolling_costmap/costmap/costmap',
+                                                OccupancyGrid, receive, queue_size=1))
         deadline = _monotonic() + 20.0
         ready = False
         while _monotonic() < deadline and not rospy.is_shutdown():
@@ -157,11 +190,20 @@ def main(argv=None):
                 ready = (len(received) >= 8 and all(
                     item['count'] >= 3 and item['last_at'] is not None and now - item['last_at'] <= .7
                     for item in inputs.values()))
+                if args.fresh_layer_workspace:
+                    ready = (ready and any(item[7] and 0 <= item[5] - item[6] <= .3
+                                           and item[8] is not None and 0 <= item[8] <= .3
+                                           and now - item[0] <= .7 for item in received[-10:]))
             if ready:
                 break
             time.sleep(.05)
         if not ready:
-            raise RuntimeError('grid_timeout')
+            with lock:
+                detail = {'grid_samples': len(received),
+                          'scan_messages': inputs['scan']['count'],
+                          'depth_messages': inputs['depth_points']['count'],
+                          'bound_fresh_grid_samples': sum(1 for item in received if item[7])}
+            raise RuntimeError('grid_timeout:' + json.dumps(detail, sort_keys=True))
 
         from nav_msgs.msg import Odometry
         odometry = rospy.wait_for_message('/odom', Odometry, timeout=3)
@@ -197,17 +239,31 @@ def main(argv=None):
                              for name, item in inputs.items()}
         if any(item['since_last_receipt_sec'] > .7 for item in input_summary.values()):
             raise RuntimeError('probe_input_stale')
+        paired = None
+        scan_margin_ms = None
+        if args.fresh_layer_workspace:
+            paired = sum(1 for point in points if point[7] and point[6] is not None
+                         and point[8] is not None and 0 <= point[8] <= .3
+                         and 0 <= point[5] - point[6] <= .3)
+            if paired == 0:
+                raise RuntimeError('scan_evidence_unpaired')
+            margins = sorted(1000 * (.3 - point[8]) for point in points if point[7]
+                             and point[8] is not None and 0 <= point[8] <= .3)
+            scan_margin_ms = {'min': round(margins[0], 1), 'median': round(margins[len(margins)//2], 1)}
         for subscriber in subscribers:
             subscriber.unregister()
         elapsed = points[-1][0] - points[0][0]
         result = {'mode': 'isolated_sensing_probe', 'motion_requested': False,
                   'global_tf_published': False, 'physical_clearance_verified': False,
+                  'experimental_fresh_laser_layer': bool(args.fresh_layer_workspace),
                   'grid_samples': len(points), 'grid_rate_hz': round((len(points) - 1) / elapsed, 2)
                   if elapsed > 0 else None,
                   'unknown_cells': points[-1][1], 'free_cells': points[-1][2],
                   'occupied_cells': points[-1][3], 'total_cells': points[-1][4],
                   'inputs': input_summary,
                   'sampled_front_cells': front_cells,
+                  'grid_samples_with_bound_scan': paired,
+                  'scan_validity_remaining_ms_at_receipt': scan_margin_ms,
                   'synthetic_obstacle_lethal_samples': marked}
     finally:
         for process in reversed(processes):
@@ -226,6 +282,13 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except Exception as error:
+        known = ('probe_process_exited', 'grid_timeout', 'invalid_probe_pose',
+                 'synthetic_obstacle_not_marked', 'probe_input_stale', 'scan_evidence_unpaired')
+        reason = str(error) if isinstance(error, RuntimeError) else ''
+        detail = None
+        if reason.startswith('grid_timeout:'):
+            detail, reason = json.loads(reason.split(':', 1)[1]), 'grid_timeout'
         print(json.dumps({'mode': 'isolated_sensing_probe', 'error_type': type(error).__name__,
+                          'reason': reason if reason in known else None, 'detail': detail,
                           'motion_requested': False}))
         sys.exit(1)
