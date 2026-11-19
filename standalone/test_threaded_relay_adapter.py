@@ -138,6 +138,40 @@ def test_sensor_deadline_shortens_intent_and_reaches_wire_atomically():
         relay.close()
 
 
+def test_first_motion_write_can_be_awaited_without_extending_its_deadline():
+    relay, transport, clock = make()
+    try:
+        assert relay.arm(0.3)
+        now = clock.now()
+        assert relay.send_frame(0, now, 0.02, 0.0, valid_until=now + .12)
+        assert relay.wait_for_frame_write(0)
+        moving = [frame for _, _, frame in transport.snapshot() if frame['linear'] > 0]
+        assert moving and moving[0]['expires_at'] <= now + .12
+    finally:
+        relay.close()
+
+
+def test_first_motion_write_wait_fails_closed_when_the_writer_stalls():
+    entered, release = threading.Event(), threading.Event()
+    class StalledMotion(FakeTransport):
+        def write_line(self, data, timeout):
+            if json.loads(data)['linear'] > 0:
+                entered.set()
+                release.wait(1.0)
+            return FakeTransport.write_line(self, data, timeout)
+    relay, _, clock = make(StalledMotion())
+    try:
+        assert relay.arm(0.3)
+        now = clock.now()
+        assert relay.send_frame(0, now, 0.02, 0.0, valid_until=now + .08)
+        assert entered.wait(.1)
+        assert not relay.wait_for_frame_write(0)
+        assert not relay.healthy()
+    finally:
+        release.set()
+        relay.close()
+
+
 def test_control_clock_is_read_under_the_same_lock_as_worker_progress():
     from threaded_relay_adapter import ThreadedRelayAdapter
     class CheckedClock(Clock):

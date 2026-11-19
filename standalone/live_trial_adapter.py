@@ -762,7 +762,7 @@ class LiveTrial(object):
         if (self.source.is_current_epoch(before["epoch"]) is not True
                 or not checks._stationary_trace_valid(trace, start, first_end,
                                                        before["epoch"], before["image_pose"], max_gap_sec=0.15)):
-            self._trace_failed(trace, start, first_end, "stationary_trace_head")
+            self._trace_failed(trace, start, first_end, "stationary_trace_head", before)
         # The first history can take time to copy. Read the intervening tail so
         # odometry during that processing interval is checked as well.
         tail = self.source.stationary_trace(first_end, tail_end)
@@ -771,13 +771,13 @@ class LiveTrial(object):
         if (self.source.is_current_epoch(before["epoch"]) is not True
                 or not checks._stationary_trace_valid(tail, first_end, now,
                                                        before["epoch"], before["image_pose"], max_gap_sec=0.15)):
-            self._trace_failed(tail, first_end, now, "stationary_trace_tail")
+            self._trace_failed(tail, first_end, now, "stationary_trace_tail", before)
         self._stationary_proof_at = now
         self._stationary_proof_key = key
         return now
 
-    def _trace_failed(self, trace, start, now, step):
-        self._last_diagnostic = {"step": step}
+    def _trace_failed(self, trace, start, now, step, before):
+        self._last_diagnostic = {"step": step, "retryable": False}
         try:
             gaps = [trace[i]["stamp"] - trace[i - 1]["stamp"] for i in range(1, len(trace))]
             stats = {"samples": len(trace), "max_gap_sec": max(gaps) if gaps else None,
@@ -785,9 +785,44 @@ class LiveTrial(object):
                      "end_gap_sec": now - trace[-1]["stamp"] if trace else None}
             if all(value is None or checks._finite(value) for value in stats.values()):
                 self._last_diagnostic.update(stats)
+            # Retry only an absent history or a complete, stationary prefix
+            # whose tail may still be queued. A bad pose, speed, timestamp,
+            # sequence or epoch must not disappear on a later read.
+            if self.source.is_current_epoch(before['epoch']) is True:
+                empty_history = isinstance(trace, (tuple, list)) and not trace
+                delayed_tail = (trace and 0.15 < now - trace[-1]['stamp'] <= 0.3
+                                and checks._stationary_trace_valid(trace, start, trace[-1]['stamp'],
+                                                                   before['epoch'], before['image_pose'],
+                                                                   max_gap_sec=0.15))
+                if empty_history or delayed_tail:
+                    self._last_diagnostic['retryable'] = True
         except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             pass
         raise checks._StopError("sensor_unavailable")
+
+    def _stationary_with_retry(self, before):
+        """While stopped, allow delayed odometry to complete the same proof."""
+        deadline = self._now() + 0.3
+        for _ in range(31):
+            try:
+                now = self._stationary(before, self._now())
+                self._last_diagnostic = None
+                return now
+            except checks._StopError as exc:
+                now = self._now()
+                if (str(exc) != 'sensor_unavailable' or not isinstance(self._last_diagnostic, dict)
+                        or self._last_diagnostic.get('step') not in ('stationary_trace_head',
+                                                                     'stationary_trace_tail')
+                        or self._last_diagnostic.get('retryable') is not True
+                        or now >= deadline):
+                    raise
+                if self.relay.armed and (self.relay.healthy() is not True
+                                         or self.relay.send_zero_heartbeat() is not True):
+                    raise checks._StopError('relay_failure')
+                self.clock.sleep(min(0.01, deadline - now))
+                if self._now() <= now:
+                    raise checks._StopError('clock_invalid')
+        raise checks._StopError('sensor_unavailable')
 
     def _aligned_stationary_sample(self, before):
         deadline = self._now() + 3.0
@@ -796,7 +831,7 @@ class LiveTrial(object):
             raise checks._StopError("relay_failure")
         # Check the potentially long inference history before obtaining the
         # next sample. Later checks extend this proof with the short new tail.
-        self._stationary(before, self._now())
+        self._stationary_with_retry(before)
         for _ in range(301):
             now = self._now()
             self._model_fresh(before, now)
@@ -822,7 +857,7 @@ class LiveTrial(object):
                     or abs(sample["state"]["linear_y_mps"]) > 0.005
                     or abs(sample["state"]["angular_z_radps"]) > 0.01):
                 raise checks._StopError("sensor_unavailable")
-            now = self._stationary(before, now)
+            now = self._stationary_with_retry(before)
             fresh = _live_timestamps_fresh(sample, now)
             current = self.source.is_current_sample(sample) is True
             if not fresh or not current:
@@ -1171,6 +1206,12 @@ class LiveTrial(object):
                     raise checks._StopError("relay_failure")
                 self._motion_started = True
                 if sampler is not None and not sampler_started:
+                    # Let the pipe writer finish the first short-lived intent
+                    # before starting CPU-heavy perception in another thread.
+                    # The child still enforces the unmodified absolute expiry.
+                    wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
+                    if callable(wait_for_write) and wait_for_write(sequence) is not True:
+                        raise checks._StopError('relay_failure')
                     sampler.start()
                     sampler_started = True
                 sequence += 1

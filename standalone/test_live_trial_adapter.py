@@ -424,6 +424,41 @@ def test_longer_trial_streams_while_background_source_produces_samples():
         assert result['reason'] in ('sensor_unavailable', 'expiry_unavailable')
 
 
+def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
+    import time
+
+    import async_safety_sampler
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    events = []
+    class RecordingRelay(mod.RelayAdapter):
+        def wait_for_frame_write(self, sequence):
+            assert json.loads(self.transport.lines[-1])['linear'] > 0
+            events.append('written')
+            return True
+    original = async_safety_sampler.AsyncSafetySampler
+    class RecordingSampler(original):
+        def start(self):
+            events.append('sampler')
+            return original.start(self)
+    monkeypatch.setattr(async_safety_sampler, 'AsyncSafetySampler', RecordingSampler)
+    clock = RealClock()
+    relay = RecordingRelay(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                           motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(source(clock)[0], model, relay, FakeArbiter(), clock,
+                                   duration_sec=.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is True
+    assert events == ['written', 'sampler']
+
+
 def test_longer_trial_requests_decision_after_relay_is_ready_at_zero():
     mod = module()
     clock = Clock()
@@ -1192,6 +1227,40 @@ def test_temporary_missing_observation_before_arming_is_retried_without_motion()
     assert observation.source.calls > 2
     assert result['reason'] == 'motion_limit'
     assert json.loads(relay.transport.lines[0])['linear'] == 0.0
+
+
+def test_temporary_missing_stationary_history_is_retried_before_motion():
+    mod = module()
+    clock = Clock()
+    adapter, observation = source(clock)
+    calls = []
+    def trace_gap(trace):
+        calls.append(True)
+        return [] if len(calls) == 1 else trace
+    observation.source.trace_mutate = trace_gap
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert len(calls) > 1 and result['motion_requested'] is True
+    assert json.loads(relay.transport.lines[0])['linear'] == 0.0
+
+
+@pytest.mark.parametrize('moving', [False, True])
+def test_only_a_stationary_history_prefix_can_wait_for_a_delayed_tail(moving):
+    mod = module()
+    import forward_trial
+    clock = Clock()
+    adapter, observation = source(clock)
+    before = adapter.snapshot()
+    trace = observation.source.stationary_trace(99.8, 99.82)
+    if moving:
+        trace[-1]['linear_x_mps'] = .01
+    trial = mod.LiveTrial(adapter, None, None, None, clock)
+    with pytest.raises(forward_trial._StopError):
+        trial._trace_failed(trace, 99.8, 99.9733, 'stationary_trace_head', before)
+    assert trial._last_diagnostic['retryable'] is (not moving)
 
 
 def test_malformed_stationary_history_still_fails_without_motion():

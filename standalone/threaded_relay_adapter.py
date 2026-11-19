@@ -59,6 +59,7 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
         self._last_stamp = None
         self._intent = None
         self._intent_version = 0
+        self._written_version = 0
         self._had_intent = False
         self._evidence = {'zero_write_completed': False, 'stop_line': None,
                           'process_exited': False, 'physical_stop_verified': False,
@@ -192,6 +193,21 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
             self._cv.notifyAll()
             return True
 
+    def wait_for_frame_write(self, sequence):
+        """Wait for this submission's pipe write, never beyond its original expiry."""
+        with self._cv:
+            if (threading.current_thread().ident != self._owner or sequence != self._sequence
+                    or self._intent is None or self._stopping):
+                return False
+            version, expires = self._intent_version, self._intent['expires_at']
+            remaining = expires - self.clock.now()
+            if (remaining <= 0 or not self._wait_locked(
+                    lambda: self._written_version >= version or self._stopping, min(remaining, .1))
+                    or self._stopping or self.clock.now() >= expires):
+                self._stop_locked('wire_write_timeout')
+                return False
+            return True
+
     def stop_and_latch(self):
         with self._cv:
             self._stop_locked('requested_stop')
@@ -314,6 +330,7 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                     else:
                         self._evidence['wire_nonzero'] += 1
                         sent_version = version
+                        self._written_version = version
                     self._cv.notifyAll()
                     next_deadline = max(next_deadline + _PERIOD_SEC, self._last_progress)
         except BaseException:  # worker faults must discard the command and request zero
