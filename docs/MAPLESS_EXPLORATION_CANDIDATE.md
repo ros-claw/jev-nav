@@ -43,3 +43,9 @@ transition from a previous command can initially follow a wider arc. Its swept
 path, dynamic obstacles, and depth/camera calibration remain unverified. The
 installed front-only scan can still yield unknown values for every sector in
 the current controller, so these latency changes do not enable live motion.
+
+# Standalone observation
+
+For the separate direct-ROS observation and Decisions candidate, including
+sensor-driver diagnostics and current limitations, see
+[STANDALONE_EXPLORATION_CANDIDATE.md](STANDALONE_EXPLORATION_CANDIDATE.md).

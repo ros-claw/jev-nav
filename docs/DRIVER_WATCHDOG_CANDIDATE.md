@@ -18,8 +18,11 @@ the active command period, so a later task may start without restarting the
 driver. Nonzero motion also waits for a supported, recent chassis mode report;
 the serial reader and command handler serialize mode changes with motion writes.
 If the reported mode changes or becomes stale while a motion command is active,
-the watchdog latches and requests zero. The proposed 0.5-second mode freshness
-limit is not measured for the target hardware. Timestamps are captured before
+the watchdog latches and requests zero. On this LIMO, 16 consecutive status
+samples were approximately 0.50045–0.50058 seconds apart; the original strict
+0.5-second limit was therefore too short. The proposed configurable limit now
+defaults to 1.5 seconds, while the motion-command timeout remains 0.3 seconds.
+These values still need hardware testing. Timestamps are captured before
 the driver mutex; they do not detect frames that already sat in the device or
 kernel receive buffer.
 
@@ -34,7 +37,9 @@ changing existing deployments before integration and testing.
 `worker/limo_command_watchdog.h` is the standalone policy used by the patch;
 `tests/test_command_watchdog.py` compiles and exercises it without ROS or a
 robot. The patched source has also been compiled in an isolated ROS Melodic
-workspace. No patched driver has been installed or physically exercised.
+workspace. A separately built candidate was also started on the stationary
+robot for a zero-only relay handshake; no nonzero motion or physical stopping
+test has been performed, and the original driver binary was not overwritten.
 
 This watchdog lives in the same process and ROS callback queue as the serial
 driver. It cannot stop the robot if that process, callback queue, serial write,

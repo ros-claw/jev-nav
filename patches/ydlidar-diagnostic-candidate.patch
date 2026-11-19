@@ -1,0 +1,493 @@
+--- a/sdk/src/CYdLidar.cpp
++++ b/sdk/src/CYdLidar.cpp
+@@ -168,6 +168,10 @@
+ 
+   // Fill in scan data:
+   if (IS_OK(op_result)) {
++    if (count < 2 || count > YDlidarDriver::MAX_SCAN_NODES ||
++        (m_FixedResolution && m_FixedSize < 2)) {
++      return false;
++    }
+     uint64_t scan_time = m_PointTime * (count - 1);
+     tim_scan_end += m_OffsetTime * 1e9;
+     tim_scan_end -= m_PointTime;
+@@ -269,21 +273,9 @@
+           outscan.stamp = tim_scan_start + i * m_PointTime;
+         }
+ 
+-        if (m_FixedResolution) {
+-          int index = std::ceil((angle - outscan.config.min_angle) /
+-                                outscan.config.angle_increment);
+-
+-          if (index >= 0 && index < all_node_count) {
+-            outscan.points.push_back(point);
+-          }
+-        } else {
+-          outscan.points.push_back(point);
+-        }
+-      }
+-    }
+-
+-    if (m_FixedResolution) {
+-      outscan.points.resize(all_node_count);
++        // Keep exactly the acquired points; grid assignment is done by the ROS node.
++        outscan.points.push_back(point);
++      }
+     }
+ 
+     handleDeviceInfoPackage(count);
+--- a/src/ydlidar_node.cpp
++++ b/src/ydlidar_node.cpp
+@@ -10,6 +10,9 @@
+ #include "ros/ros.h"
+ #include "sensor_msgs/LaserScan.h"
+ #include "CYdLidar.h"
++#include <algorithm>
++#include <cmath>
++#include <limits>
+ #include <vector>
+ #include <iostream>
+ #include <string>
+@@ -145,14 +148,55 @@
+             scan_msg.time_increment = scan.config.time_increment;
+             scan_msg.range_min = (scan.config.min_range);
+             scan_msg.range_max = (scan.config.max_range);
+-            int size = (scan.config.max_angle - scan.config.min_angle)/ scan.config.angle_increment + 1;
+-            scan_msg.ranges.resize(size);
+-            scan_msg.intensities.resize(size);
+-            for(int i=0; i < scan.points.size(); i++) {
+-                int index = std::ceil((scan.points[i].angle - scan.config.min_angle)/scan.config.angle_increment);
+-                if(index >=0 && index < size) {
+-                     scan_msg.ranges[index] = scan.points[i].range;
+-                     scan_msg.intensities[index] = scan.points[i].intensity;
++            const double min_angle = scan.config.min_angle;
++            const double max_angle = scan.config.max_angle;
++            const double increment = scan.config.angle_increment;
++            if (!std::isfinite(min_angle) || !std::isfinite(max_angle) ||
++                !std::isfinite(increment) || !(max_angle > min_angle) || !(increment > 0) ||
++                !std::isfinite(scan.config.min_range) || !std::isfinite(scan.config.max_range) ||
++                !(scan.config.min_range > 0) || !(scan.config.max_range > scan.config.min_range)) {
++                ROS_WARN_THROTTLE(5.0, "Discarding LiDAR scan with invalid geometry");
++                rate.sleep();
++                ros::spinOnce();
++                continue;
++            }
++            const double intervals = (max_angle - min_angle) / increment;
++            const double rounded = std::round(intervals);
++            if (!std::isfinite(intervals) || rounded < 1 || rounded > 100000 ||
++                std::fabs(intervals - rounded) > std::max(0.001, rounded * 1e-5)) {
++                ROS_WARN_THROTTLE(5.0, "Discarding LiDAR scan with invalid angular grid");
++                rate.sleep();
++                ros::spinOnce();
++                continue;
++            }
++            const size_t size = static_cast<size_t>(rounded) + 1;
++            // NaN denotes that no SDK point was assigned to this bucket.
++            // Zero denotes an assigned point rejected by the SDK/range check.
++            scan_msg.ranges.assign(size, std::numeric_limits<float>::quiet_NaN());
++            scan_msg.intensities.assign(size, 0.0f);
++            for (size_t i = 0; i < scan.points.size(); ++i) {
++                const LaserPoint &point = scan.points[i];
++                if (!std::isfinite(point.angle) || point.angle < min_angle || point.angle > max_angle) {
++                    continue;
++                }
++                // SDK metadata uses float precision; the exact last angle can
++                // divide a few ulps above the last grid index.
++                size_t index = static_cast<size_t>(std::ceil((point.angle - min_angle) / increment));
++                if (index >= size) index = size - 1;
++                const bool hit = std::isfinite(point.range) && point.range > 0 &&
++                                 point.range >= scan.config.min_range && point.range <= scan.config.max_range;
++                float &current = scan_msg.ranges[index];
++                if (!hit) {
++                    if (std::isnan(current)) current = 0.0f;
++                    continue;
++                }
++                const float intensity = std::isfinite(point.intensity) && point.intensity >= 0
++                                            ? point.intensity : 0.0f;
++                if (std::isnan(current) || current <= 0 || point.range < current) {
++                    current = point.range;
++                    scan_msg.intensities[index] = intensity;
++                } else if (point.range == current) {
++                    scan_msg.intensities[index] = std::max(scan_msg.intensities[index], intensity);
+                 }
+             }
+             scan_pub.publish(scan_msg);
+--- /dev/null
++++ b/tests/fakes/ros/ros.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <sstream>
++#include <string>
++
++namespace sensor_msgs { struct LaserScan; }
++namespace ros {
++struct Time { unsigned int sec; unsigned int nsec; };
++struct Publisher {
++  void publish(const sensor_msgs::LaserScan &message) const;
++};
++struct NodeHandle {
++  explicit NodeHandle(const char * = "") {}
++  template<class T> Publisher advertise(const char *, int) { return Publisher(); }
++  template<class T> void param(const char *, T &value, const T &fallback) { value = fallback; }
++};
++struct Rate { explicit Rate(int) {} void sleep() {} };
++void init(int, char **, const char *);
++bool ok();
++void spinOnce();
++}
++#define ROS_INFO(...) do {} while (0)
++#define ROS_ERROR(...) do {} while (0)
++#define ROS_ERROR_STREAM(...) do {} while (0)
++#define ROS_WARN_THROTTLE(...) do {} while (0)
+--- /dev/null
++++ b/tests/fakes/sensor_msgs/LaserScan.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include <string>
++#include <vector>
++#include "ros/ros.h"
++namespace sensor_msgs {
++struct LaserScan {
++  struct Header { ros::Time stamp; std::string frame_id; } header;
++  float angle_min, angle_max, angle_increment, scan_time, time_increment, range_min, range_max;
++  std::vector<float> ranges, intensities;
++};
++}
+--- /dev/null
++++ b/tests/fakes/CYdLidar.h
+@@ -0,0 +1,39 @@
++#pragma once
++#include <stdint.h>
++#include <vector>
++#include <string>
++namespace ydlidar {
++typedef int result_t;
++enum { TYPE_TOF, TYPE_TRIANGLE };
++struct LaserPoint { float angle, range, intensity; };
++struct LaserScan {
++  uint64_t stamp;
++  struct Config {
++    float min_angle, max_angle, angle_increment, scan_time, time_increment, min_range, max_range;
++  } config;
++  std::vector<LaserPoint> points;
++};
++extern LaserScan fake_scan;
++struct CYdLidar {
++  void setSerialPort(const std::string &) {}
++  void setSerialBaudrate(int) {}
++  void setMaxRange(double) {}
++  void setMinRange(double) {}
++  void setMaxAngle(double) {}
++  void setMinAngle(double) {}
++  void setReversion(bool) {}
++  void setFixedResolution(bool) {}
++  void setAutoReconnect(bool) {}
++  void setScanFrequency(double) {}
++  void setIgnoreArray(const std::vector<float> &) {}
++  void setSampleRate(int) {}
++  void setInverted(bool) {}
++  void setSingleChannel(bool) {}
++  void setLidarType(int) {}
++  bool initialize() { return true; }
++  bool turnOn() { return true; }
++  bool doProcessSimple(LaserScan &scan, bool &error) { error = false; scan = fake_scan; return true; }
++  void turnOff() {}
++  void disconnecting() {}
++};
++}
+--- /dev/null
++++ b/tests/test_ros_pipeline.cpp
+@@ -0,0 +1,149 @@
++// Exercise the actual node's publishing code with an in-memory SDK/ROS harness.
++// No real serial ports, ROS master, hardware, or topics are used.
++#include <cmath>
++#include <cstdlib>
++#include <iostream>
++#include <limits>
++#include <string>
++#include <vector>
++#include "CYdLidar.h"
++#include "sensor_msgs/LaserScan.h"
++
++ydlidar::LaserScan ydlidar::fake_scan;
++static sensor_msgs::LaserScan published;
++static int published_count = 0;
++static int ok_count = 0;
++namespace ros {
++void init(int, char **, const char *) {}
++bool ok() { return ok_count++ == 0; }
++void spinOnce() {}
++void Publisher::publish(const sensor_msgs::LaserScan &message) const {
++  published = message;
++  ++published_count;
++}
++}
++
++#define main ydlidar_node_main
++#include "../src/ydlidar_node.cpp"
++#undef main
++
++static void require(bool condition, const char *reason) {
++  if (!condition) {
++    std::cerr << "FAIL: " << reason << std::endl;
++    std::exit(1);
++  }
++}
++
++static void point(float angle, float range, float intensity) {
++  ydlidar::LaserPoint value;
++  value.angle = angle;
++  value.range = range;
++  value.intensity = intensity;
++  ydlidar::fake_scan.points.push_back(value);
++}
++
++static void run_node() {
++  char name[] = "test";
++  char *argv[] = {name, NULL};
++  ok_count = 0;
++  published_count = 0;
++  require(ydlidar_node_main(1, argv) == 0, "node returned a failure");
++}
++
++static void reset_scan() {
++  ydlidar::fake_scan.points.clear();
++  ydlidar::fake_scan.config.min_angle = -2;
++  ydlidar::fake_scan.config.max_angle = 2;
++  ydlidar::fake_scan.config.angle_increment = 1;
++  ydlidar::fake_scan.config.min_range = 0.1;
++  ydlidar::fake_scan.config.max_range = 10;
++  ydlidar::fake_scan.config.scan_time = 0.1;
++  ydlidar::fake_scan.config.time_increment = 0.02;
++  ydlidar::fake_scan.stamp = 10;
++}
++
++static void missing_and_invalid() {
++  reset_scan();
++  point(-2, 1, 5);
++  point(0, 0, 0);
++  point(2, 2, 6);
++  run_node();
++  require(published_count == 1 && published.ranges.size() == 5, "incorrect scan size");
++  require(std::isnan(published.ranges[1]) && std::isnan(published.ranges[3]),
++          "unsampled bins must be NaN rather than a fabricated zero");
++  require(published.ranges[2] == 0, "actual SDK invalid sample must remain zero");
++  require(published.ranges[0] == 1 && published.ranges[4] == 2, "actual hits must survive");
++}
++
++static void duplicate_buckets() {
++  reset_scan();
++  point(0, 1, 5);
++  point(0, 0, 0);
++  point(0, 2, 9);
++  run_node();
++  require(published_count == 1 && published.ranges[2] == 1,
++          "duplicate valid/invalid samples must retain closest positive hit");
++  require(published.intensities[2] == 5, "intensity must match the retained hit");
++  reset_scan();
++  point(0, 2, 9);
++  point(0, 1, 5);
++  point(0, 0, 0);
++  run_node();
++  require(published_count == 1 && published.ranges[2] == 1,
++          "duplicate resolution must not depend on input ordering");
++}
++
++static void rounded_endpoints() {
++  reset_scan();
++  ydlidar::fake_scan.config.min_angle = -1.57079637f;
++  ydlidar::fake_scan.config.max_angle = 1.57079637f;
++  ydlidar::fake_scan.config.angle_increment =
++      (ydlidar::fake_scan.config.max_angle - ydlidar::fake_scan.config.min_angle) / 373;
++  point(ydlidar::fake_scan.config.min_angle, 1, 5);
++  point(ydlidar::fake_scan.config.max_angle, 2, 6);
++  point(ydlidar::fake_scan.config.max_angle + 0.1f, 3, 7);
++  point(std::numeric_limits<float>::quiet_NaN(), 4, 8);
++  run_node();
++  require(published_count == 1 && published.ranges.size() == 374,
++          "rounded float increment must retain the full grid");
++  require(published.ranges[0] == 1 && published.ranges[373] == 2,
++          "both exact endpoints must survive, out-of-range angle must not overwrite");
++}
++
++static void invalid_geometry() {
++  reset_scan();
++  ydlidar::fake_scan.config.angle_increment = 0;
++  run_node();
++  require(published_count == 0, "zero angle increment must fail closed without publishing");
++}
++
++static void half_window_does_not_invent_coverage() {
++  reset_scan();
++  ydlidar::fake_scan.config.min_angle = -1.57079637f;
++  ydlidar::fake_scan.config.max_angle = 1.57079637f;
++  const float span = ydlidar::fake_scan.config.max_angle - ydlidar::fake_scan.config.min_angle;
++  ydlidar::fake_scan.config.angle_increment = span / 360;
++  for (int i = 0; i <= 180; ++i) {
++    const float angle = i == 180 ? ydlidar::fake_scan.config.max_angle
++                                 : ydlidar::fake_scan.config.min_angle + span * i / 180;
++    point(angle, 1, 1);
++  }
++  run_node();
++  size_t unknown = 0, hits = 0;
++  for (size_t i = 0; i < published.ranges.size(); ++i) {
++    if (std::isnan(published.ranges[i])) ++unknown;
++    if (published.ranges[i] == 1) ++hits;
++  }
++  require(published.ranges.size() == 361 && hits == 181 && unknown == 180,
++          "half-window oversampling must expose holes, not fill or invent returns");
++}
++
++int main(int argc, char **argv) {
++  const std::string chosen = argc > 1 ? argv[1] : "all";
++  if (chosen == "all" || chosen == "missing") missing_and_invalid();
++  if (chosen == "all" || chosen == "duplicate") duplicate_buckets();
++  if (chosen == "all" || chosen == "endpoints") rounded_endpoints();
++  if (chosen == "all" || chosen == "invalid") invalid_geometry();
++  if (chosen == "all" || chosen == "half") half_window_does_not_invent_coverage();
++  std::cout << "ROS publishing checks passed: " << chosen << std::endl;
++}
+--- /dev/null
++++ b/tests/test_sdk_points.cpp
+@@ -0,0 +1,78 @@
++// Exercise real CYdLidar::doProcessSimple with in-memory link-time scan stubs.
++// The real driver instance is never connected or started, and no serial port
++// is opened. Link wrappers replace both isscanning() and grabScanData().
++#include <bits/stdc++.h>
++#define private public
++#include "CYdLidar.h"
++#undef private
++
++static std::vector<node_info> synthetic_nodes;
++
++extern "C" bool __wrap__ZNK7ydlidar13YDlidarDriver10isscanningEv(const ydlidar::YDlidarDriver *) {
++  return true;
++}
++
++extern "C" result_t __wrap__ZN7ydlidar13YDlidarDriver12grabScanDataEP9node_infoRmj(
++    ydlidar::YDlidarDriver *, node_info *buffer, size_t &count, uint32_t) {
++  if (count < synthetic_nodes.size()) return RESULT_FAIL;
++  count = synthetic_nodes.size();
++  std::copy(synthetic_nodes.begin(), synthetic_nodes.end(), buffer);
++  return RESULT_OK;
++}
++
++static node_info node(unsigned int angle_degrees, unsigned int distance_q2) {
++  node_info value = {};
++  value.angle_q6_checkbit = angle_degrees * 64U * 2U;
++  value.distance_q2 = distance_q2;
++  return value;
++}
++
++static void require(bool condition, const char *reason) {
++  if (!condition) {
++    std::cerr << "FAIL: " << reason << std::endl;
++    std::exit(1);
++  }
++}
++
++int main(int argc, char **argv) {
++  const std::string chosen = argc > 1 ? argv[1] : "under";
++  ydlidar::YDlidarDriver driver;
++  CYdLidar laser;
++  laser.lidarPtr = &driver;
++  laser.isScanning = true;
++  laser.m_ParseSuccess = true;
++  laser.m_FixedSize = 8;
++  laser.setFixedResolution(true);
++  laser.setMinAngle(-90);
++  laser.setMaxAngle(90);
++  if (chosen == "under") {
++    synthetic_nodes.push_back(node(0, 4000));
++    synthetic_nodes.push_back(node(30, 0));
++    synthetic_nodes.push_back(node(330, 8000));
++  } else if (chosen == "over") {
++    for (unsigned int i = 0; i < 10; ++i) synthetic_nodes.push_back(node(i, 4000));
++  } else if (chosen == "boundaries") {
++    laser.m_FixedSize = 374;
++    synthetic_nodes.push_back(node(90, 4000));
++    synthetic_nodes.push_back(node(270, 8000));
++  } else if (chosen == "empty") {
++    synthetic_nodes.push_back(node(0, 4000));
++  } else {
++    return 2;
++  }
++  LaserScan scan;
++  bool error = true;
++  const bool success = laser.doProcessSimple(scan, error);
++  laser.lidarPtr = NULL;  // driver is a stack object and was never connected
++  if (chosen == "empty") {
++    require(!success, "a scan with fewer than two raw nodes must be rejected");
++  } else {
++    require(success && !error, "synthetic scan rejected");
++    require(scan.points.size() == synthetic_nodes.size(),
++            "SDK must not pad or truncate actual point samples");
++    if (chosen == "under") {
++      require(scan.points[1].range == 0, "real SDK-invalid sample must remain present");
++    }
++  }
++  std::cout << "SDK point checks passed: " << chosen << std::endl;
++}
+--- /dev/null
++++ b/tests/test_laserscan_serialization.cpp
+@@ -0,0 +1,28 @@
++// Check actual ROS LaserScan wire serialization entirely in memory.
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <limits>
++#include <vector>
++#include <ros/serialization.h>
++#include <sensor_msgs/LaserScan.h>
++
++int main() {
++  sensor_msgs::LaserScan scan;
++  scan.ranges.push_back(std::numeric_limits<float>::quiet_NaN());
++  scan.ranges.push_back(0.0f);
++  scan.ranges.push_back(2.0f);
++  const uint32_t length = ros::serialization::serializationLength(scan);
++  std::vector<uint8_t> bytes(length);
++  ros::serialization::OStream output(bytes.data(), length);
++  ros::serialization::serialize(output, scan);
++  sensor_msgs::LaserScan restored;
++  ros::serialization::IStream input(bytes.data(), length);
++  ros::serialization::deserialize(input, restored);
++  if (restored.ranges.size() != 3 || !std::isnan(restored.ranges[0]) ||
++      restored.ranges[1] != 0.0f || restored.ranges[2] != 2.0f) {
++    std::cerr << "FAIL: LaserScan wire serialization changed the range categories" << std::endl;
++    return 1;
++  }
++  std::cout << "ROS LaserScan NaN/zero/hit serialization passed" << std::endl;
++}
+--- /dev/null
++++ b/tests/run_candidate_tests.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++# Offline-only tests: the SDK scan and ROS publisher are in-memory substitutes.
++# Usage: bash tests/run_candidate_tests.sh /absolute/path/to/isolated/catkin/build
++set -euo pipefail
++
++if [ "$#" -ne 1 ] || [ ! -d "$1/ydlidar_ros/CMakeFiles/ydlidar_node.dir/sdk/src" ]; then
++  printf 'Pass the isolated catkin build directory as the only argument.\n' >&2
++  exit 2
++fi
++package_dir=$(cd "$(dirname "$0")/.." && pwd)
++build_dir=$(cd "$1" && pwd)
++test_dir="$build_dir/ydlidar-offline-tests"
++objects="$build_dir/ydlidar_ros/CMakeFiles/ydlidar_node.dir/sdk/src"
++mkdir -p "$test_dir"
++cd "$package_dir"
++source /opt/ros/melodic/setup.bash
++
++g++ -std=c++11 -Itests/fakes tests/test_ros_pipeline.cpp -o "$test_dir/ros_pipeline"
++"$test_dir/ros_pipeline"
++
++g++ -std=c++11 -Isdk/include tests/test_sdk_points.cpp "$objects"/*.o "$objects"/impl/unix/*.o \
++  -Wl,--wrap=_ZN7ydlidar13YDlidarDriver12grabScanDataEP9node_infoRmj \
++  -Wl,--wrap=_ZNK7ydlidar13YDlidarDriver10isscanningEv -pthread -lrt -o "$test_dir/sdk_points"
++for scenario in under over boundaries empty; do "$test_dir/sdk_points" "$scenario"; done
++
++g++ -std=c++11 -I/opt/ros/melodic/include tests/test_laserscan_serialization.cpp \
++  -L/opt/ros/melodic/lib -lroscpp_serialization -lrostime -lcpp_common -lboost_system \
++  -pthread -o "$test_dir/laserscan_serialization"
++"$test_dir/laserscan_serialization"

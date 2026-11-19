@@ -12,12 +12,15 @@
 
 class LimoCommandWatchdog {
  public:
-  explicit LimoCommandWatchdog(double timeout_seconds)
-      : timeout_(timeout_seconds), last_(0.0), seen_(false), active_(false),
+  explicit LimoCommandWatchdog(double timeout_seconds, double mode_timeout_seconds = 1.5)
+      : timeout_(timeout_seconds), mode_timeout_(mode_timeout_seconds), last_(0.0), seen_(false), active_(false),
         primed_(false), pending_(false), pending_zero_(false), prior_deadline_(0.0),
         prior_active_(false), latched_(false), zero_writes_(0), last_zero_write_at_(0.0) {
     if (!std::isfinite(timeout_) || timeout_ < 0.1 || timeout_ > 1.0) {
       throw std::invalid_argument("command timeout must be between 0.1 and 1.0 seconds");
+    }
+    if (!std::isfinite(mode_timeout_) || mode_timeout_ < 0.7 || mode_timeout_ > 5.0) {
+      throw std::invalid_argument("mode timeout must be between 0.7 and 5.0 seconds");
     }
   }
 
@@ -76,6 +79,11 @@ class LimoCommandWatchdog {
   double last_zero_write_at() const { return last_zero_write_at_; }
   const std::string& zero_source() const { return zero_source_; }
 
+  bool mode_report_fresh(double report_at, double now) const {
+    return std::isfinite(report_at) && std::isfinite(now) && report_at > 0.0 &&
+           now >= report_at && now - report_at < mode_timeout_;
+  }
+
   bool accept_source(const std::string& source, bool zero) {
     if (latched_) return false;
     if (source.empty() || source[0] != '/' || source.size() > 80 ||
@@ -98,6 +106,7 @@ class LimoCommandWatchdog {
 
  private:
   const double timeout_;
+  const double mode_timeout_;
   double last_;
   bool seen_;
   bool active_;

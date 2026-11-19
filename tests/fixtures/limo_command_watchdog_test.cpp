@@ -8,6 +8,15 @@
 
 int main() {
   LimoCommandWatchdog gate(0.3);
+  // Live /limo_status is approximately 2 Hz, so one normal interval must
+  // not be classified as missing. A genuinely stale mode still expires.
+  assert(gate.mode_report_fresh(10.0, 10.51));
+  assert(!gate.mode_report_fresh(10.0, 11.51));
+  assert(!gate.mode_report_fresh(10.0, 9.99));
+  assert(!gate.mode_report_fresh(0.0, 10.0));
+  LimoCommandWatchdog configured_mode(0.3, 2.0);
+  assert(configured_mode.mode_report_fresh(10.0, 11.8));
+  assert(!configured_mode.mode_report_fresh(10.0, 12.01));
   assert(gate.should_stop(10.0));
   assert(!gate.is_latched());
   assert(!gate.accept(0.1, 0.0, 0.0, 10.0));

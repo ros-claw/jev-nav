@@ -1,0 +1,520 @@
+#!/usr/bin/env python2
+"""Standalone, bounded, forward-only LIMO exploration candidate.
+
+The Decisions API chooses the action; local code checks current sensor
+samples and streams bounded commands through a separate relay. Observation
+mode does not create a velocity publisher. The current implementation does
+not execute turns, verify 3-D clearance or prove physical stopping.
+"""
+
+from __future__ import division, print_function
+
+import argparse
+import base64
+import collections
+import json
+import math
+import os
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+WORKER = os.path.join(ROOT, "worker")
+if not os.path.isdir(WORKER):
+    WORKER = os.path.join(ROOT, "worktrees", "limo-mcp", "worker")
+if WORKER not in sys.path:
+    sys.path.insert(0, WORKER)
+
+from limo_mapless_worker import run_decision_process, summarize_forward_view
+from limo_scan_fusion import RollingScanFusion
+from observation_guards import ClockGuard, OdomGuard, sensors_aligned
+from policy import ForwardPolicy, assess_front
+from relay import _monotonic
+
+try:
+    NUMBER_TYPES = (int, long, float)  # noqa: F821 - ROS Melodic Python 2
+except NameError:
+    NUMBER_TYPES = (int, float)
+
+
+def _finite(value):
+    try:
+        return (not isinstance(value, bool) and isinstance(value, NUMBER_TYPES)
+                and not math.isnan(value) and not math.isinf(value))
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def nearest_odometry(samples, stamp, max_skew=0.05):
+    if not _finite(stamp) or not _finite(max_skew) or max_skew < 0:
+        return None
+    valid = [sample for sample in samples if isinstance(sample, dict) and _finite(sample.get("stamp"))]
+    if not valid:
+        return None
+    closest = min(valid, key=lambda sample: abs(sample["stamp"] - stamp))
+    return closest if abs(closest["stamp"] - stamp) <= max_skew else None
+
+
+def source_time(ros_now, mono_now, sensor_stamp, max_age):
+    """Map ROS wall time to the local monotonic clock without rejuvenating it."""
+    if (not all(_finite(x) for x in (ros_now, mono_now, sensor_stamp, max_age))
+            or max_age <= 0 or sensor_stamp <= 0):
+        return None
+    age = ros_now - sensor_stamp
+    if not 0 <= age <= max_age:
+        return None
+    return mono_now - age
+
+
+def depth_grid(array, encoding, stamp):
+    """Summarize each depth-image region; these ratios don't establish clearance."""
+    try:
+        import numpy as np
+        if (not _finite(stamp) or len(array.shape) != 2
+                or array.shape[0] < 3 or array.shape[1] < 3
+                or encoding not in ("16UC1", "32FC1")):
+            return None
+        values = array.astype("float32")
+        if encoding == "16UC1":
+            values *= 0.001
+        valid = np.isfinite(values) & (values > 0.05) & (values <= 20.0)
+        grid = []
+        for row in np.array_split(valid, 3, axis=0):
+            grid.append([float(np.count_nonzero(cell)) / float(cell.size)
+                         for cell in np.array_split(row, 3, axis=1)])
+        return {"stamp": stamp, "valid_grid": grid,
+                "min_m": float(np.min(values[valid])) if np.any(valid) else None}
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def build_decision_evidence(sample, jpeg):
+    try:
+        stamps = [sample[name] for name in
+                  ("scan_at", "odom_at", "status_at", "depth_at", "color_at")]
+        if (not all(_finite(stamp) for stamp in stamps) or not isinstance(jpeg, bytes)
+                or not jpeg.startswith(b"\xff\xd8") or len(jpeg) > 2000000):
+            return None
+        state = sample["state"]
+        base = {name: state[name] for name in ("linear_x_mps", "angular_z_radps", "battery_voltage")}
+        if not all(_finite(value) for value in base.values()):
+            return None
+        return {"image_b64": base64.b64encode(jpeg).decode("ascii"),
+                "captured_at": min(stamps),
+                "laser": {"front_min_m": None, "left_min_m": None,
+                          "right_min_m": None, "rear_min_m": None,
+                          "forward_view": sample["forward_view"]},
+                "base": base}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def physical_forward_view(ranges, angle_min, increment, range_min, range_max, tx, ty, yaw):
+    """Use the sensor's physical sector and the fusion no-return convention."""
+    cleaned = []
+    for index, distance in enumerate(ranges):
+        angle = angle_min + index * increment
+        if (-math.pi / 2 <= angle <= math.pi / 2 and _finite(distance)
+                and range_min <= distance < range_max):
+            cleaned.append(distance)
+        else:
+            cleaned.append(float("nan"))
+    view = summarize_forward_view(cleaned, angle_min, increment, range_min, range_max, tx, ty, yaw)
+    view["rear_total_rays"] = 0
+    view["rear_valid_rays"] = 0
+    view["rear_nearest_to_base_m"] = None
+    return view
+
+
+def transform_matches(first, second):
+    if (not isinstance(first, (tuple, list)) or not isinstance(second, (tuple, list))
+            or len(first) != 6 or len(second) != 6
+            or not all(_finite(v) for v in tuple(first) + tuple(second))):
+        return False
+    if any(abs(first[i] - second[i]) > 0.001 for i in range(3)):
+        return False
+    return all(abs(math.atan2(math.sin(first[i] - second[i]),
+                              math.cos(first[i] - second[i]))) <= 0.001
+               for i in range(3, 6))
+
+
+def _pose_delta(first, second):
+    if (not isinstance(first, (tuple, list)) or not isinstance(second, (tuple, list))
+            or len(first) != 3 or len(second) != 3
+            or not all(_finite(v) for v in tuple(first) + tuple(second))):
+        raise ValueError("invalid pose")
+    distance = math.hypot(second[0] - first[0], second[1] - first[1])
+    yaw = second[2] - first[2]
+    return distance, abs(math.atan2(math.sin(yaw), math.cos(yaw)))
+
+
+def snapshot_is_fresh(sample, now, live_pose):
+    """Recheck pose freshness after potentially slow processing."""
+    try:
+        if (not isinstance(sample, dict) or not all(_finite(v) for v in
+                (now, sample.get("snapshot_at"), sample.get("odom_at")))
+                or not 0 <= now - sample["snapshot_at"] <= 0.1
+                or not 0 <= now - sample["odom_at"] <= 0.1):
+            return False
+        distance, rotation = _pose_delta(sample["pose"], live_pose)
+        return distance <= 0.01 and rotation <= 0.03
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+class DecisionGate(object):  # noqa: UP004 - ROS Melodic Python 2
+    def __init__(self):
+        self.choice = "stop"
+        self.stamp = None
+        self.pose = None
+        self.valid = False
+
+    def accept(self, result, captured_at, observed_pose, now, current_pose):
+        if (not isinstance(result, dict) or result.get("ok") is not True
+                or result.get("choice") not in ("forward", "left", "right", "stop")
+                or not _finite(captured_at) or not _finite(now)
+                or result.get("captured_at") != captured_at
+                or not 0 <= now - captured_at < 8.0
+                or (self.stamp is not None and captured_at <= self.stamp)):
+            return False
+        if result["choice"] != "stop":
+            try:
+                distance, rotation = _pose_delta(observed_pose, current_pose)
+            except (TypeError, ValueError):
+                return False
+            if distance > 0.15 or rotation > 0.35:
+                return False
+        self.choice = result["choice"]
+        self.stamp = captured_at
+        self.pose = observed_pose
+        self.valid = True
+        return True
+
+    def invalidate(self):
+        self.valid = False
+
+    def current(self, now, pose):
+        if (not self.valid or not _finite(now) or self.stamp is None
+                or not 0 <= now - self.stamp < 8.0):
+            self.invalidate()
+            return None
+        if self.choice != "stop":
+            try:
+                distance, rotation = _pose_delta(self.pose, pose)
+            except (TypeError, ValueError):
+                self.invalidate()
+                return None
+            if distance > 0.15 or rotation > 0.35:
+                self.invalidate()
+                return None
+        return {"choice": self.choice, "stamp": self.stamp}
+
+
+class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
+    """Read ROS sensors directly; this object never creates a velocity publisher."""
+
+    def __init__(self):
+        import rospy
+        import tf
+        from cv_bridge import CvBridge
+        from limo_base.msg import LimoStatus
+        from nav_msgs.msg import Odometry
+        from sensor_msgs.msg import CameraInfo, Image, LaserScan
+
+        self.rospy, self.tf, self.bridge = rospy, tf, CvBridge()
+        self.listener = tf.TransformListener()
+        self.lock = threading.Lock()
+        self.latest = {}
+        self.odom_history = collections.deque(maxlen=150)
+        self.fusion = None
+        self.extrinsics = None
+        self.scan_stamp = None
+        self.epoch = 0
+        self.fusion_epoch = None
+        self.clock_guard = ClockGuard(max_offset_jump_sec=0.02)
+        self.odom_guard = OdomGuard(max_linear_mps=0.12, max_angular_radps=0.1,
+                                    position_slack_m=0.002, yaw_slack_rad=0.003,
+                                    max_gap_sec=0.3)
+        self.limits = {"scan": 0.5, "odom": 0.25, "status": 1.5,
+                       "depth": 0.8, "color": 0.8, "info": 1.0}
+        topics = [("scan", "/scan", LaserScan), ("odom", "/odom", Odometry),
+                  ("status", "/limo_status", LimoStatus),
+                  ("depth", "/camera/depth/image_raw", Image),
+                  ("color", "/camera/color/image_raw", Image),
+                  ("info", "/camera/depth/camera_info", CameraInfo)]
+        self.subscriptions = [rospy.Subscriber(topic, typ, self._receive, callback_args=name,
+                                               queue_size=1)
+                              for name, topic, typ in topics]
+
+    def _receive(self, message, name):
+        try:
+            with self.lock:
+                received = _monotonic()
+                ros_now = self.rospy.Time.now().to_sec()
+                if not self.clock_guard.observe(ros_now, received):
+                    self.latest.clear()
+                    self.epoch += 1
+                    return
+                stamp = source_time(ros_now, received, message.header.stamp.to_sec(), self.limits[name])
+                if stamp is None:
+                    self.latest.pop(name, None)
+                    self.epoch += 1
+                    return
+                entry = {"message": message, "stamp": stamp}
+                if name == "odom":
+                    if (message.header.frame_id.lstrip("/") != "odom"
+                            or message.child_frame_id.lstrip("/") != "base_link"):
+                        self.latest.pop(name, None)
+                        self.epoch += 1
+                        return
+                    p = message.pose.pose.position
+                    q = message.pose.pose.orientation
+                    quaternion = (q.x, q.y, q.z, q.w)
+                    if (not all(_finite(x) for x in (p.x, p.y) + quaternion)
+                            or not 0.99 <= sum(x * x for x in quaternion) <= 1.01):
+                        self.latest.pop(name, None)
+                        self.epoch += 1
+                        return
+                    roll, pitch, yaw = self.tf.transformations.euler_from_quaternion(quaternion)
+                    if abs(roll) > 0.1 or abs(pitch) > 0.1:
+                        self.latest.pop(name, None)
+                        self.epoch += 1
+                        return
+                    entry["pose"] = (p.x, p.y, yaw)
+                    if not self.odom_guard.observe(message.header.seq, stamp, entry["pose"]):
+                        self.latest.clear()
+                        self.odom_history.clear()
+                        self.epoch += 1
+                        return
+                previous = self.latest.get(name)
+                if previous is not None and stamp <= previous["stamp"]:
+                    self.latest.pop(name, None)
+                    self.epoch += 1
+                    return
+                self.latest[name] = entry
+                if name == "odom":
+                    self.odom_history.append(entry)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            with self.lock:
+                self.latest.pop(name, None)
+                self.epoch += 1
+            return
+
+    def snapshot(self):
+        """Take aligned observations, independently of model/network activity."""
+        with self.lock:
+            if self.clock_guard.faulted or self.odom_guard.faulted:
+                return None
+            current = dict(self.latest)
+            odom_history = list(self.odom_history)
+            epoch = self.epoch
+        now = _monotonic()
+        if any(name not in current for name in self.limits):
+            return None
+        if any(not 0 <= now - current[name]["stamp"] <= self.limits[name]
+               for name in self.limits):
+            return None
+        if not sensors_aligned({name: current[name]["stamp"] for name in ("scan", "color", "depth")},
+                               odom_history, now, max_sensor_age_sec=0.5,
+                               max_sensor_skew_sec=0.25, max_odom_skew_sec=0.05,
+                               max_translation_m=0.02, max_rotation_rad=0.02,
+                               max_linear_mps=0.12, max_angular_radps=0.1):
+            return None
+        scan = current["scan"]["message"]
+        if scan.header.frame_id.lstrip("/") != "laser_link":
+            return None
+        odom = current["odom"]["message"]
+        status = current["status"]["message"]
+        depth = current["depth"]["message"]
+        info = current["info"]["message"]
+        color = current["color"]["message"]
+        if (depth.header.frame_id.lstrip("/") != "camera_depth_optical_frame"
+                or color.header.frame_id.lstrip("/") != "camera_color_optical_frame"
+                or depth.header.frame_id != info.header.frame_id
+                or depth.width != info.width or depth.height != info.height
+                or abs(current["depth"]["stamp"] - current["info"]["stamp"]) > 0.2):
+            return None
+        try:
+            trans, rot = self.listener.lookupTransform("base_link", scan.header.frame_id,
+                                                       scan.header.stamp)
+            roll, pitch, yaw = self.tf.transformations.euler_from_quaternion(rot)
+            extrinsics = (trans[0], trans[1], yaw)
+            signature = (trans[0], trans[1], trans[2], roll, pitch, yaw)
+            if (not all(_finite(x) for x in signature)
+                    or abs(roll) > 0.1 or abs(pitch) > 0.1):
+                return None
+            if self.fusion is None or self.fusion_epoch != epoch:
+                self.extrinsics = signature
+                self.fusion = RollingScanFusion(extrinsics)
+                self.fusion_epoch = epoch
+                self.scan_stamp = None
+            elif not transform_matches(self.extrinsics, signature):
+                # Never continue across an extrinsic change without a restart.
+                return None
+            if current["scan"]["stamp"] != self.scan_stamp:
+                aligned = nearest_odometry(odom_history, current["scan"]["stamp"])
+                if aligned is None:
+                    return None
+                packet = {"stamp": current["scan"]["stamp"], "ranges": list(scan.ranges),
+                          "angle_min": scan.angle_min, "angle_increment": scan.angle_increment,
+                          "range_min": scan.range_min, "range_max": scan.range_max}
+                if not self.fusion.add_scan(packet, aligned["pose"], aligned["stamp"], now):
+                    return None
+                self.scan_stamp = current["scan"]["stamp"]
+            pose = current["odom"]["pose"]
+            scene = self.fusion.snapshot(pose, current["odom"]["stamp"], now)
+            depth_array = self.bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
+            depth_summary = depth_grid(depth_array, depth.encoding, current["depth"]["stamp"])
+            if depth_summary is None:
+                return None
+            twist = odom.twist.twist
+            state = {"stamp": min(current["odom"]["stamp"], current["status"]["stamp"]),
+                     "motion_mode": int(status.motion_mode), "error_code": int(status.error_code),
+                     "battery_voltage": float(status.battery_voltage),
+                     "linear_x_mps": float(twist.linear.x), "angular_z_radps": float(twist.angular.z)}
+            image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
+            if image_pose is None:
+                return None
+            with self.lock:
+                if self.epoch != epoch or self.clock_guard.faulted or self.odom_guard.faulted:
+                    return None
+            return {"scene": scene, "state": state, "depth": depth_summary, "snapshot_at": now, "epoch": epoch,
+                    "pose": pose, "image_pose": image_pose["pose"],
+                    "color": current["color"]["message"], "scan": scan,
+                    "laser_extrinsics": extrinsics,
+                    "scan_at": current["scan"]["stamp"], "odom_at": current["odom"]["stamp"],
+                    "status_at": current["status"]["stamp"], "depth_at": current["depth"]["stamp"],
+                    "color_at": current["color"]["stamp"]}
+        except Exception:  # noqa: BLE001 - missing/invalid observation cannot authorize motion
+            return None
+
+    def current_pose(self):
+        with self.lock:
+            odom = self.latest.get("odom")
+            if self.clock_guard.faulted or self.odom_guard.faulted:
+                return None
+        if odom is None or not 0 <= _monotonic() - odom["stamp"] <= 0.1:
+            return None
+        return odom["pose"]
+
+    def break_epoch(self):
+        with self.lock:
+            self.epoch += 1
+
+    def is_current_epoch(self, epoch):
+        with self.lock:
+            return (epoch == self.epoch and not self.clock_guard.faulted
+                    and not self.odom_guard.faulted)
+
+
+def observe(seconds):
+    """Run model and sensor diagnostics without publishing any velocity commands."""
+    import cv2
+    import rospy
+
+    rospy.init_node("limo_standalone_observer", anonymous=True, disable_signals=True)
+    if rospy.get_param("/use_sim_time", False):
+        raise ValueError("standalone observation requires ROS wall time")
+    source = RosObservation()
+    started = _monotonic()
+    policy = ForwardPolicy(started, started + seconds)
+    gate = DecisionGate()
+    gate_lock = threading.Lock()
+    shutdown = threading.Event()
+    query_running = threading.Event()
+    next_query, next_report = started, started
+    query_result = {"status": "waiting"}
+    os.environ.setdefault("ROSCLAW_LIMO_DECISIONS_KEY_FILE",
+                          os.path.expanduser("~/rosclaw/jev/.env"))
+
+    def query(sample):
+        try:
+            image = source.bridge.imgmsg_to_cv2(sample["color"], desired_encoding="bgr8")
+            ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            scan = sample["scan"]
+            model_sample = dict(sample)
+            model_sample["forward_view"] = physical_forward_view(
+                scan.ranges, scan.angle_min, scan.angle_increment, scan.range_min,
+                scan.range_max, *sample["laser_extrinsics"])
+            evidence = build_decision_evidence(model_sample, encoded.tostring()) if ok else None
+            if evidence is None or evidence["captured_at"] < started:
+                with gate_lock:
+                    gate.invalidate()
+                query_result["status"] = "invalid_observation"
+                return
+            result = run_decision_process(
+                ["/usr/bin/python3", os.path.join(WORKER, "limo_mapless_decision.py")], evidence,
+                cancelled=shutdown.is_set, clock=_monotonic, timeout=6.0)
+            with gate_lock:
+                accepted = (source.is_current_epoch(sample["epoch"])
+                            and gate.accept(result, evidence["captured_at"], sample["image_pose"],
+                                            _monotonic(), source.current_pose()))
+                if not accepted:
+                    gate.invalidate()
+            query_result["status"] = "accepted" if accepted else "unavailable_or_expired"
+        except Exception:  # noqa: BLE001 - unavailable model remains no decision
+            with gate_lock:
+                gate.invalidate()
+            query_result["status"] = "unavailable_or_expired"
+        finally:
+            query_running.clear()
+
+    try:
+        while not rospy.is_shutdown() and _monotonic() < started + seconds:
+            sample = source.snapshot()
+            now = _monotonic()
+            if sample is not None:
+                if now >= next_query and not query_running.is_set():
+                    query_running.set()
+                    thread = threading.Thread(target=query, args=(sample,))
+                    thread.daemon = True
+                    thread.start()
+                    next_query = now + 2.0
+                with gate_lock:
+                    decision = gate.current(now, sample["pose"])
+                if snapshot_is_fresh(sample, now, source.current_pose()):
+                    command = policy.step(sample["scene"], sample["state"], sample["depth"], decision, now)
+                else:
+                    command = {"linear": 0.0, "angular": 0.0, "reason": "pose_or_snapshot_stale"}
+                front = assess_front(sample["scene"], now)
+                if now >= next_report:
+                    coverage = sample["scene"].get("coverage", {})
+                    print(json.dumps({"mode": "observe_only", "decision": decision,
+                                      "model_status": query_result["status"],
+                                      "would_command": command, "front": front,
+                                      "latest_scan_valid_fraction": coverage.get("latest_valid_fraction"),
+                                      "latest_scan_bin_counts": {
+                                          "nan": coverage.get("latest_nan_bins"),
+                                          "zero": coverage.get("latest_zero_bins"),
+                                          "valid": coverage.get("latest_finite_valid_samples"),
+                                          "other": coverage.get("latest_other_bins")},
+                                      "depth": sample["depth"]}, allow_nan=False))
+                    sys.stdout.flush()
+                    next_report = now + 1.0
+            else:
+                source.break_epoch()
+                with gate_lock:
+                    gate.invalidate()
+                if now >= next_report:
+                    print(json.dumps({"mode": "observe_only", "reason": "waiting_for_aligned_sensors"}))
+                    sys.stdout.flush()
+                    next_report = now + 1.0
+            time.sleep(0.1)
+    finally:
+        shutdown.set()
+        rospy.signal_shutdown("observation complete")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Standalone LIMO sensor and Decisions diagnostic")
+    parser.add_argument("--seconds", type=float, default=12.0)
+    arguments = parser.parse_args()
+    if not _finite(arguments.seconds) or not 1 <= arguments.seconds <= 60:
+        parser.error("--seconds must be between 1 and 60")
+    observe(arguments.seconds)
+
+
+if __name__ == "__main__":
+    main()
