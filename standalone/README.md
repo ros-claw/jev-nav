@@ -52,3 +52,14 @@ Melodic environment, and run the repository's non-live suite with Python 3.
 `threaded_relay_pty_check.py` exercises a real relay and candidate driver
 against a fake serial chassis only inside its documented isolated namespace;
 its results are not physical stopping or clearance tests.
+
+`native_sensing_probe.py` is a separate, bounded observation experiment. It
+creates a private TF topic and rolling grid using ROS native lidar and depth
+processing, without publishing `/tf` or `/cmd_vel`. It does not need a saved
+map. The optional `--test-synthetic-obstacle` injects a point only into the
+private probe topic to check obstacle marking, then discards the grid. The
+private TF topic derives `odom → base_link` from odometry, since the current
+base configuration does not publish that transform. The depth height
+thresholds and camera rectification are unverified; the grid can retain old
+free cells and its depth-layer update-rate check is disabled. Unobserved space
+remains unknown, and this probe does not authorize or control motion.
