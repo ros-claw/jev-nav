@@ -44,6 +44,7 @@ try:
 except NameError:
     INTEGER_TYPES = (int,)
 NUMBER_TYPES = INTEGER_TYPES + (float,)
+LATEST_INPUT_MAX_AGE_SEC = 0.15
 
 
 def _valid_epoch(value):
@@ -501,6 +502,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
         self._depth_veto_cache = None
+        self._scan_veto_cache = []
         self.projection_only = False
         self.epoch = 0
         self.fusion_epoch = None
@@ -745,7 +747,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             stamp, image = depth['stamp'], depth['message']
             info_entry = self.latest['info']
             info = info_entry['message']
-            if (not _finite(stamp) or not 0 <= now - stamp <= 0.1
+            if (not _finite(stamp) or not 0 <= now - stamp <= LATEST_INPUT_MAX_AGE_SEC
                     or not _finite(info_entry['stamp']) or abs(stamp - info_entry['stamp']) > 0.2
                     or image.header.frame_id.lstrip('/') != 'camera_depth_optical_frame'
                     or image.header.frame_id != info.header.frame_id
@@ -781,6 +783,39 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         except Exception:  # noqa: BLE001 - an unprocessed depth frame must veto
             return False
 
+    def _cached_newest_scan_safe_locked(self, sample, scan, aligned, odom, now):
+        """Reuse a scan assessment only for the same owned scene and poses."""
+        try:
+            scene = sample['scene']
+            message = scan['message']
+            rays, hits = scene['rays'], scene['occupied_hits']
+            if (not isinstance(rays, list) or not isinstance(hits, list)
+                    or len(rays) != len(hits) or len(rays) > 200000):
+                return False
+            scene_signature = tuple((tuple(ray['start_base']), tuple(ray['hit_base']), ray['stamp'],
+                                     tuple(hit['point_base']), hit['stamp']) for ray, hit in zip(rays, hits))
+            key = (self.epoch, scan['stamp'], tuple(sample['pose']), tuple(aligned['pose']),
+                   tuple(odom['pose']), tuple(self.extrinsics), message.header.frame_id,
+                   message.angle_min, message.angle_increment,
+                   message.range_min, message.range_max, message.time_increment, tuple(message.ranges),
+                   scene.get('status'), scene.get('coverage', {}).get('sensor_fresh'), scene_signature)
+            entries = getattr(self, '_scan_veto_cache', [])
+            for cached_scene, cached_key, expires, accepted in entries:
+                if cached_scene is scene and cached_key == key and now < expires:
+                    return accepted
+            accepted = newest_scan_veto(message, self.extrinsics, scene, now, scan['stamp'],
+                                        sample['pose'], aligned['pose'], odom['pose'])
+            expiry = min(now + 0.1, scan['stamp'] + 0.3)
+            if accepted:
+                stamps = [ray['stamp'] for ray in scene['rays'] if _finite(ray.get('stamp'))
+                          and 0 <= now - ray['stamp'] <= 0.65 and 0 <= scan['stamp'] - ray['stamp'] <= 0.4]
+                if stamps:
+                    expiry = min(expiry, min(stamps) + 0.65)
+            self._scan_veto_cache = (entries + [(scene, key, expiry, accepted)])[-4:]
+            return accepted
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return False
+
     def is_current_sample(self, sample):
         return self.current_valid_until(sample) is not None
 
@@ -799,19 +834,21 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return reject("epoch_or_guard")
                 odom, status, scan, depth = (self.latest["odom"], self.latest["status"],
                                              self.latest["scan"], self.latest["depth"])
-                if (not all(_finite(sample.get(name)) for name in
-                            ("snapshot_at", "scan_at", "status_at", "depth_at", "color_at"))
-                        or not _finite(scan.get("stamp"))
-                        or not 0 <= now - scan["stamp"] <= 0.3
-                        or scan["stamp"] < sample["scan_at"]
-                        or status["stamp"] < sample["status_at"]
-                        or not 0 <= now - odom["stamp"] <= 0.1
-                        or not 0 <= now - status["stamp"] <= 1.0
-                        or not 0 <= now - sample["snapshot_at"] <= 0.25
-                        or not 0 <= now - sample["scan_at"] <= 0.5
-                        or not 0 <= now - sample["depth_at"] <= 0.5
-                        or not 0 <= now - sample["color_at"] <= 0.5):
-                    return reject("timestamps")
+                if not all(_finite(sample.get(name)) for name in
+                           ("snapshot_at", "scan_at", "status_at", "depth_at", "color_at")):
+                    return reject("invalid_sample_timestamps")
+                ages = (("latest_scan", scan.get("stamp"), 0.3),
+                        ("latest_odom", odom.get("stamp"), LATEST_INPUT_MAX_AGE_SEC),
+                        ("latest_status", status.get("stamp"), 1.0),
+                        ("snapshot", sample["snapshot_at"], 0.25),
+                        ("scan", sample["scan_at"], 0.5),
+                        ("depth", sample["depth_at"], 0.5),
+                        ("color", sample["color_at"], 0.5))
+                for name, stamp, limit in ages:
+                    if not _finite(stamp) or not 0 <= now - stamp <= limit:
+                        return reject("stale_" + name)
+                if scan["stamp"] < sample["scan_at"] or status["stamp"] < sample["status_at"]:
+                    return reject("timestamp_regression")
                 # A newer frame must be projected and checked rather than
                 # silently authorizing motion from the earlier depth image.
                 if (not _finite(depth.get("stamp")) or depth["stamp"] < sample["depth_at"]
@@ -822,9 +859,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     aligned_scan = nearest_odometry(self.odom_history, scan["stamp"])
                     if (not isinstance(sample.get("scene"), dict)
                             or aligned_scan is None or aligned_scan.get("epoch") != self.epoch
-                            or not newest_scan_veto(scan.get("message"), self.extrinsics,
-                                                    sample.get("scene"), now, scan["stamp"],
-                                                    sample["pose"], aligned_scan["pose"], odom["pose"])):
+                            or not self._cached_newest_scan_safe_locked(sample, scan, aligned_scan, odom, now)):
                         return reject("new_scan")
                 distance, rotation = _pose_delta(sample["pose"], odom["pose"])
                 state = base_state(odom["message"], status["message"], now)
@@ -838,8 +873,10 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         or abs(state["linear_y_mps"]) > 0.005
                         or abs(state["angular_z_radps"]) > 0.02):
                     return reject("base_speed")
-                limits = {"latest_odom": odom["stamp"] + 0.1, "latest_scan": scan["stamp"] + 0.3,
-                          "latest_depth": depth["stamp"] + 0.1, "latest_status": status["stamp"] + 1.0,
+                limits = {"latest_odom": odom["stamp"] + LATEST_INPUT_MAX_AGE_SEC,
+                          "latest_scan": scan["stamp"] + 0.3,
+                          "latest_depth": depth["stamp"] + LATEST_INPUT_MAX_AGE_SEC,
+                          "latest_status": status["stamp"] + 1.0,
                           "snapshot": sample["snapshot_at"] + 0.25, "scan": sample["scan_at"] + 0.5,
                           "status": sample["status_at"] + 1.0, "depth": sample["depth_at"] + 0.5,
                           "color": sample["color_at"] + 0.5}

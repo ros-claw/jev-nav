@@ -72,6 +72,23 @@ def test_observation_adapter_owns_jpeg_and_scan_without_fabricating_fields():
     assert adapter.last_issue == 'current_after_copy'
 
 
+def test_deferred_adapter_check_still_cannot_authorize_motion_with_stale_source():
+    mod = module()
+    clock = Clock()
+    observation = Observation(clock)
+    observation.current = False
+    adapter = mod.ObservationAdapter(observation, lambda color: b'\xff\xd8offline\xff\xd9',
+                                     recheck_snapshot=False)
+    assert isinstance(adapter.snapshot(), dict)
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is False
+    assert all(json.loads(line)['linear'] == 0 for line in relay.transport.lines)
+
+
 def test_observation_adapter_owns_mutable_scan_and_scene_evidence():
     adapter, observation = source(Clock())
     raw_snapshot = observation.snapshot
@@ -164,6 +181,66 @@ def test_live_timestamps_allow_processing_delay_but_reject_stale_sensors():
     sample['snapshot_at'] = 99.85
     sample['scan_at'] = 99.49
     assert not mod._live_timestamps_fresh(sample, 100.0)
+
+
+def test_old_snapshot_odometry_can_only_be_reused_with_a_fresh_live_recheck():
+    mod = module()
+    sample = source(Clock())[0].snapshot()
+    sample['snapshot_at'] = 99.9
+    sample['odom_at'] = 99.7
+    assert not mod._live_timestamps_fresh(sample, 100.0)
+    assert mod._live_timestamps_fresh(sample, 100.0, latest_odom_rechecked=True)
+
+
+def test_accepted_snapshot_cannot_outlive_its_historical_coverage():
+    from test_policy import fusion_scene
+    mod = module()
+    sample = source(Clock())[0].snapshot()
+    sample['scan_at'] = sample['raw_scan']['stamp'] = sample['scene']['coverage']['scan_stamp'] = 99.8
+    old = [2.0 if i % 4 == 0 else 0.0 for i in range(33)]
+    latest = [2.0 if i % 4 == 2 else 0.0 for i in range(33)]
+    sample['scene'] = fusion_scene(99.41, 99.8, old, latest)
+    sample['scene']['coverage']['scan_pose'] = sample['pose']
+    sample['raw_scan']['ranges'] = latest
+    reason, assessment, _ = mod._assess_sample(sample, 100.0, mod.StrictDepthGate(), True)
+    assert reason is None
+    assert assessment['valid_until'] == pytest.approx(100.06)
+    reason, _, _ = mod._assess_sample(sample, 100.07, mod.StrictDepthGate(), True)
+    assert reason == 'sensor_unavailable'
+
+
+def test_redundant_historical_rays_do_not_shorten_current_coverage():
+    mod = module()
+    sample = source(Clock())[0].snapshot()
+    sample['scan_at'] = sample['raw_scan']['stamp'] = sample['scene']['coverage']['scan_stamp'] = 99.8
+    for item in sample['scene']['rays'] + sample['scene']['occupied_hits']:
+        item['stamp'] = 99.8
+    old_ray = copy.deepcopy(sample['scene']['rays'][0])
+    old_ray['stamp'] = 99.41
+    sample['scene']['rays'].append(old_ray)
+    sample['scene']['occupied_hits'].append({'point_base': old_ray['hit_base'], 'stamp': old_ray['stamp']})
+    reason, assessment, _ = mod._assess_sample(sample, 100.0, mod.StrictDepthGate(), True)
+    assert reason is None
+    assert assessment['valid_until'] == pytest.approx(100.3)
+
+
+def test_only_identified_snapshot_timing_gaps_are_retryable():
+    mod = module()
+    class FailedSource(object):
+        last_issue = 'source_refreshed_odom'
+        detail = None
+        def current_issue(self):
+            return self.detail
+    failing = FailedSource()
+    assert mod._transient_snapshot_gap(failing)
+    failing.last_issue = 'current_after_copy'
+    # Another thread can update the observer's diagnostic; never use that
+    # shared value to soften a failed current-sample check.
+    for problem in ('stale_snapshot', 'new_scan', 'new_depth_unchecked', 'epoch_or_guard', 'base_state'):
+        failing.detail = problem
+        assert not mod._transient_snapshot_gap(failing)
+    failing.last_issue = 'source_guard_fault'
+    assert not mod._transient_snapshot_gap(failing)
 
 
 def test_previous_scan_can_be_checked_at_capture_time_when_latest_scan_is_rechecked():
@@ -839,6 +916,35 @@ def test_motion_rechecks_latest_observation_after_guard_and_before_each_command(
     assert result['reason'] == 'sensor_unavailable'
     assert len([frame for frame in frames if frame['linear'] > 0]) == 1
     assert frames[-1]['linear'] == 0.0
+
+
+@pytest.mark.parametrize('latest_odom_valid', [False, True])
+def test_first_motion_uses_live_odom_recheck_after_old_snapshot_odom_ages(latest_odom_valid):
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.current_valid_until = lambda sample: clock.now() + .1 if latest_odom_valid else None
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    class DelayedOdomTrial(mod.LiveTrial):
+        calls = 0
+        def _aligned_stationary_sample(self, before):
+            sample, now = mod.LiveTrial._aligned_stationary_sample(self, before)
+            self.calls += 1
+            if self.calls >= 2:
+                # The full snapshot is younger than 250 ms, while the odom
+                # it carried has aged out; the live check is still required.
+                sample['odom_at'] = now - .1
+                clock.sleep(.16)
+            return sample, self._now()
+    result = DelayedOdomTrial(adapter, model, relay, FakeArbiter(), clock,
+                              enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)['linear'] > 0]
+    if latest_odom_valid:
+        assert result['motion_requested'] is True and moving
+    else:
+        assert result['motion_requested'] is False and not moving
 
 
 def test_motion_loop_prepares_next_sample_during_the_frame_interval():

@@ -28,7 +28,13 @@ during a single trial. A fresh full image is supplied for the model; later
 safety snapshots continue checking projected depth and lidar without repeated
 JPEG encoding or unused image-grid statistics. A newer depth frame must be
 projected and checked; a newer lidar frame must have its own measured sampled
-cross-section coverage before an older fused sample can still be used.
+cross-section coverage before an older fused sample can still be used. The
+supervised runner defers the adapter's intermediate current-frame check to
+avoid duplicate work; it still rechecks current sensors immediately before
+each motion command. Intent validity also ends when historical rays required
+for the accepted coverage expire. If snapshots cannot be produced and
+checked fast enough, the relay stops instead of continuing an expired intent;
+smooth real-robot operation has not yet been established.
 
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also

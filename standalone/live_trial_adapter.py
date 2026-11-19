@@ -41,8 +41,10 @@ class ObservationAdapter(object):
     """Translate an existing RosObservation without creating ROS connections."""
     simulation_only = False
 
-    def __init__(self, observation, jpeg_encoder, take_scene_ownership=False, projection_only_after_model=False):
-        if type(take_scene_ownership) is not bool or type(projection_only_after_model) is not bool:
+    def __init__(self, observation, jpeg_encoder, take_scene_ownership=False, projection_only_after_model=False,
+                 recheck_snapshot=True):
+        if (type(take_scene_ownership) is not bool or type(projection_only_after_model) is not bool
+                or type(recheck_snapshot) is not bool):
             raise ValueError("scene ownership must be explicit")
         self.observation = observation
         self.jpeg_encoder = jpeg_encoder
@@ -50,6 +52,9 @@ class ObservationAdapter(object):
         # every snapshot, as RosObservation's fusion snapshot does.
         self.take_scene_ownership = take_scene_ownership
         self.projection_only_after_model = projection_only_after_model
+        # Only a consumer that separately rechecks current inputs before
+        # every motion command may explicitly defer this expensive check.
+        self.recheck_snapshot = recheck_snapshot
         self.last_issue = None
         self._encode_images = True
 
@@ -89,7 +94,7 @@ class ObservationAdapter(object):
                                   "angle_min": scan.angle_min, "angle_increment": scan.angle_increment,
                                   "range_min": scan.range_min, "range_max": scan.range_max,
                                   "time_increment": scan.time_increment, "ranges": list(scan.ranges)}
-            if not self.observation.is_current_sample(result):
+            if self.recheck_snapshot and not self.observation.is_current_sample(result):
                 self.last_issue = "current_after_copy"
                 return None
             self.last_issue = None
@@ -472,15 +477,24 @@ def _depth_reason(sample):
     return None
 
 
-def _live_timestamps_fresh(sample, now):
-    """Allow bounded processing latency; callers also recheck current odom and scan."""
+def _live_timestamps_fresh(sample, now, latest_odom_rechecked=False):
+    """Allow bounded processing latency; a waived odom age requires a live recheck before sending."""
     try:
         ages = {"snapshot_at": 0.25, "color_at": 0.5, "scan_at": 0.5,
                 "odom_at": 0.25, "status_at": 1.0, "depth_at": 0.5}
+        if latest_odom_rechecked:
+            del ages["odom_at"]
         return isinstance(sample, dict) and all(checks._fresh(sample[name], now, age)
                                                 for name, age in ages.items())
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
+
+
+def _transient_snapshot_gap(source):
+    """Retry only timing gaps; the previous proof keeps its original expiry."""
+    issue = getattr(source, 'last_issue', None)
+    return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
+                     'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException')
 
 
 class StrictDepthGate(object):
@@ -566,6 +580,54 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None, require_image=Tru
         return reject("malformed_sample")
 
 
+def _validated_front_expiry(sample):
+    """Expiry of the already validated 0.6 m forward cross-section.
+
+    The caller must first validate the complete scene with ``assess_front``.
+    Removing expired rays cannot increase coverage. Find the first acquisition
+    time whose removal would break the accepted maximum-gap bound, keeping the
+    latest scan's separate freshness limit. Hits were checked independently.
+    """
+    try:
+        scan_at, snapshot_at = sample['scan_at'], sample['snapshot_at']
+        crossings = []
+        for ray in sample['scene']['rays']:
+            stamp = ray['stamp']
+            if (not checks._finite(stamp) or not 0 <= snapshot_at - stamp <= 0.65
+                    or not 0 <= scan_at - stamp <= 0.4):
+                continue
+            start, end = ray['start_base'], ray['hit_base']
+            if start[0] <= 0.60 < end[0]:
+                y = start[1] + (0.60 - start[0]) / (end[0] - start[0]) * (end[1] - start[1])
+                if not checks._finite(y):
+                    return None
+                if -0.15 <= y <= 0.15:
+                    crossings.append((y, stamp))
+        if not crossings or not any(stamp == scan_at for _, stamp in crossings):
+            return None
+        def largest_gap(values):
+            ordered = sorted(values)
+            if not ordered:
+                return 0.3
+            gaps = [ordered[0] + 0.15, 0.15 - ordered[-1]]
+            gaps.extend(ordered[index] - ordered[index - 1] for index in range(1, len(ordered)))
+            return max(gaps)
+        if (largest_gap([y for y, _ in crossings]) > 0.035 + 1e-12
+                or largest_gap([y for y, stamp in crossings if stamp == scan_at]) > 0.07 + 1e-12):
+            return None
+        deadline = scan_at + 0.5
+        for stamp in sorted(set(stamp for _, stamp in crossings)):
+            expires = stamp + 0.65
+            if expires >= deadline:
+                break
+            remaining = [y for y, other in crossings if other > stamp]
+            if largest_gap(remaining) > 0.035 - 1e-12:
+                return expires
+        return deadline
+    except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def _assess_sample(sample, now, depth_gate, require_image):
     """Validate one owned sample without mutating another thread's state."""
     detail = {}
@@ -581,8 +643,22 @@ def _assess_sample(sample, now, depth_gate, require_image):
                 or assessment["depth_at"] != sample["depth_at"]
                 or assessment.get("geometric_clearance_verified") is not False):
             return "depth_gate_invalid", None, detail
-        return (None if assessment["candidate"] else assessment["reason"],
-                copy.deepcopy(assessment), detail)
+        assessment = copy.deepcopy(assessment)
+        if not assessment['candidate']:
+            return assessment['reason'], assessment, detail
+        # Do not extend a gap-filled front proof beyond the first expiry that
+        # actually breaks the coverage. Redundant older rays need not shorten
+        # a proof that is already supported by newer readings.
+        coverage_until = _validated_front_expiry(sample)
+        if not checks._finite(coverage_until):
+            detail['check'] = 'front_coverage_expiry'
+            return 'sensor_unavailable', None, detail
+        previous_until = assessment.get('valid_until', coverage_until)
+        if not checks._finite(previous_until) or min(previous_until, coverage_until) <= now:
+            detail['check'] = 'front_coverage_expiry'
+            return 'sensor_unavailable', None, detail
+        assessment['valid_until'] = min(previous_until, coverage_until)
+        return None, assessment, detail
     except Exception:
         return "depth_gate_invalid", None, detail
 
@@ -902,12 +978,8 @@ class LiveTrial(object):
                 def validate_background(candidate, captured_at):
                     reason, assessment, _ = _assess_sample(candidate, captured_at, self.depth_gate, False)
                     return reason, assessment
-                def transient_background(source):
-                    issue = getattr(source, 'last_issue', None)
-                    return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
-                                     'source_snapshot_exception_ExtrapolationException')
                 sampler = AsyncSafetySampler(self.source, validate_background, self.clock,
-                                             transient_unavailable=transient_background)
+                                             transient_unavailable=_transient_snapshot_gap)
             while True:
                 now = self._now()
                 if now >= deadline:
@@ -995,7 +1067,11 @@ class LiveTrial(object):
                 if first_sent_at is not None and now >= first_sent_at + self.MOTION_LIMIT_SEC:
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
-                if not _live_timestamps_fresh(current, now):
+                # The final live-sensor check below is mandatory for every
+                # command, including the first. It validates the newer odom
+                # age and pose, so the older snapshot odom need not also be
+                # artificially capped while the full snapshot remains fresh.
+                if not _live_timestamps_fresh(current, now, latest_odom_rechecked=True):
                     self._last_diagnostic = {"step": "motion_final_timestamps"}
                     if first_sent_at is None and now < pre_motion_retry_until:
                         self.clock.sleep(0.01)
@@ -1012,7 +1088,7 @@ class LiveTrial(object):
                 if last_sent_at is None and self.relay.last_stamp is not None and now == self.relay.last_stamp:
                     self.clock.sleep(0.001)
                     now = self._now()
-                    if now >= deadline or not _live_timestamps_fresh(current, now):
+                    if now >= deadline or not _live_timestamps_fresh(current, now, latest_odom_rechecked=True):
                         raise checks._StopError("sensor_unavailable")
                     if (self.source.is_current_epoch(current["epoch"]) is not True
                             or self.source.is_current_sample(current) is not True):
@@ -1033,7 +1109,7 @@ class LiveTrial(object):
                           "relay": proposed_first + self.MOTION_LIMIT_SEC,
                           "model_color": sample["color_at"] + checks.MODEL_MAX_AGE_SEC,
                           "model_scan": sample["scan_at"] + checks.MODEL_MAX_AGE_SEC,
-                          "snapshot": current["snapshot_at"] + 0.25, "odom": current["odom_at"] + 0.25,
+                          "snapshot": current["snapshot_at"] + 0.25,
                           "scan": current["scan_at"] + 0.5, "status": current["status_at"] + 1.0,
                           "color": current["color_at"] + 0.5, "depth": current["depth_at"] + 0.5}
                 gate_limit = self._last_depth_assessment.get("valid_until")

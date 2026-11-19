@@ -173,6 +173,11 @@ def test_current_sample_rejects_new_scan_odom_drift_or_base_fault():
               'color_at': now, 'pose': (0.0, 0.0, 0.0),
               'scene': {'status': 'ok', 'coverage': {'sensor_fresh': True}, 'rays': [], 'occupied_hits': []}}
     assert observer.is_current_sample(sample)
+    observer.latest['odom']['stamp'] = now - 0.12
+    assert observer.is_current_sample(sample)
+    observer.latest['odom']['stamp'] = now - 0.16
+    assert not observer.is_current_sample(sample)
+    observer.latest['odom']['stamp'] = now
     observer.latest['depth']['stamp'] = now + 0.01
     assert not observer.is_current_sample(sample)
     assert observer.current_last_issue == 'new_depth_unchecked'
@@ -456,6 +461,47 @@ def test_fast_recent_history_agrees_with_scalar_new_scan_check(monkeypatch):
         monkeypatch.setattr(explore, '_np', original_numpy)
         assert explore.newest_scan_veto(scan, (0.105, 0.0, 0.1, 0.0, 0.0, 0.0),
                                        scene, 10.2, 10.2, pose, pose, pose) == expected
+
+
+def test_new_scan_cache_reuses_only_same_scene_pose_and_unexpired_rays(monkeypatch):
+    import explore
+    calls = []
+    def check_scan(*args):
+        calls.append(True)
+        return args[0].header.frame_id == 'laser_link'
+    monkeypatch.setattr(explore, 'newest_scan_veto', check_scan)
+    observer = RosObservation.__new__(RosObservation)
+    observer.epoch = 2
+    observer.extrinsics = (0.1, 0.0, 0.1, 0.0, 0.0, 0.0)
+    scene = {'rays': [{'start_base': (0.1, 0.0), 'hit_base': (2.0, 0.0), 'stamp': 10.0}],
+             'occupied_hits': [{'point_base': (2.0, 0.0), 'stamp': 10.0}]}
+    sample = {'scene': scene, 'pose': (0.0, 0.0, 0.0)}
+    class Scan(object):
+        header = type('Header', (object,), {'frame_id': 'laser_link'})()
+        angle_min = 0.0
+        angle_increment = 0.1
+        range_min = 0.1
+        range_max = 8.0
+        time_increment = 0.0
+        ranges = [2.0] * 33
+    scan = {'stamp': 10.1, 'message': Scan()}
+    aligned = {'pose': (0.0, 0.0, 0.0)}
+    odom = {'pose': (0.0, 0.0, 0.0)}
+    assert observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.1)
+    assert observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.11)
+    assert len(calls) == 1
+    scan['message'].header.frame_id = 'unexpected_frame'
+    assert not observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.115)
+    assert len(calls) == 2
+    scan['message'].header.frame_id = 'laser_link'
+    odom['pose'] = (0.001, 0.0, 0.0)
+    assert observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.12)
+    assert len(calls) == 3
+    scene['rays'][0]['hit_base'] = (1.9, 0.0)
+    assert observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.13)
+    assert len(calls) == 4
+    assert observer._cached_newest_scan_safe_locked(sample, scan, aligned, odom, 10.66)
+    assert len(calls) == 5
 
 
 def test_depth_grid_reports_spatial_gaps_not_just_global_fraction():
