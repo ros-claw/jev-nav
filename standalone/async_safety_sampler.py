@@ -59,6 +59,7 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
         self._assessment = None
         self._fault = None
         self._closed = False
+        self._changed = threading.Event()
 
     def start(self):
         with self._lock:
@@ -92,6 +93,7 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
                     with self._lock:
                         self._fault = reason if isinstance(reason, str) and reason else 'sensor_unavailable'
                         self._latest = self._assessment = None
+                        self._changed.set()
                     return
                 if not isinstance(assessment, dict):
                     raise ValueError('sensor_unavailable')
@@ -99,11 +101,21 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
                     if self._stop.is_set():
                         return
                     self._latest, self._assessment = sample, assessment
+                    self._changed.set()
                 self._stop.wait(.01)
         except BaseException:
             with self._lock:
                 self._fault = 'sensor_unavailable'
                 self._latest = self._assessment = None
+                self._changed.set()
+
+    def wait_next(self, previous, timeout):
+        """Wake when a new result or fault is available."""
+        with self._lock:
+            if self._fault is not None or self._closed or self._latest is not previous:
+                return
+            self._changed.clear()
+        self._changed.wait(timeout)
 
     def poll(self):
         with self._lock:
@@ -117,6 +129,7 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
         self._stop.set()
         with self._lock:
             self._closed = True
+            self._changed.set()
             thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)

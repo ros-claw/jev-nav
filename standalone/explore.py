@@ -933,7 +933,54 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 return None
         return None
 
-    def _current_valid_until_once(self, sample, failure):
+    def prepare_command_evidence(self, sample):
+        """Build the same final proof on the perception worker."""
+        failure, evidence = [None], {}
+        deadline = self._current_valid_until_once(sample, failure, evidence)
+        return (evidence, None) if deadline is not None else (None, failure[0])
+
+    def read_command_evidence(self, sample, evidence):
+        """Recheck freshness and continuity without projecting a sensor frame."""
+        try:
+            with self.lock:
+                now = _monotonic()
+                if (sample['epoch'] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
+                    return None, 'epoch_or_guard'
+                if evidence is None:
+                    return None, 'prepared_pending'
+                if self.epoch != evidence['epoch']:
+                    return None, 'epoch_or_guard'
+                if self.latest.get('scan') is not evidence['scan']:
+                    return None, 'prepared_scan_advanced'
+                if self.latest.get('depth') is not evidence['depth']:
+                    return None, 'prepared_depth_advanced'
+                if not _same_depth_intrinsics(self.latest.get('info'), evidence['info']):
+                    return None, 'camera_info_changed'
+                if (self.extrinsics != evidence['extrinsics'] or self.depth_extrinsics != evidence['depth_extrinsics']
+                        or self.depth_projection_config != evidence['config']):
+                    return None, 'transform_changed'
+                if not 0 <= now - evidence['checked_at'] or now >= evidence['valid_until']:
+                    return None, 'prepared_pending'
+                odom, status = self.latest['odom'], self.latest['status']
+                if (odom['stamp'] < evidence['odom_at'] or status['stamp'] < evidence['status_at']
+                        or not 0 <= now - odom['stamp'] <= LATEST_INPUT_MAX_AGE_SEC
+                        or not 0 <= now - status['stamp'] <= 1.0):
+                    return None, 'stale_latest_state'
+                for pose in evidence['poses']:
+                    distance, turn = _pose_delta(pose, odom['pose'])
+                    if not _finite(distance) or not _finite(turn) or distance > .005 or turn > .01:
+                        return None, 'pose_changed'
+                state = base_state(odom['message'], status['message'], now)
+                if (state is None or state['motion_mode'] != 0 or state['error_code'] != 0
+                        or state['vehicle_state'] != 0 or state['control_mode'] != 1
+                        or state['battery_voltage'] < 10 or not 0 <= state['linear_x_mps'] <= .02
+                        or abs(state['linear_y_mps']) > .005 or abs(state['angular_z_radps']) > .02):
+                    return None, 'base_state'
+                return evidence['valid_until'], None
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return None, 'malformed'
+
+    def _current_valid_until_once(self, sample, failure, evidence=None):
         """Validate a captured generation without blocking sensor callbacks.
 
         Heavy checks use an owned view of the input records. New laser or
@@ -1083,6 +1130,15 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                            if limit_kind == 'captured_sensors' else limit_kind)
                 if not _finite(result) or result <= now:
                     return reject('timestamps')
+                if evidence is not None:
+                    evidence.update({
+                        'epoch': self.epoch, 'scan': selected_scan, 'depth': selected_depth,
+                        'info': self.latest.get('info'), 'odom_at': odom['stamp'], 'status_at': status['stamp'],
+                        'poses': (sample['pose'], captured['odom']['pose'], scan_odom['pose'], depth_odom['pose']),
+                        'valid_until': result, 'checked_at': now,
+                        'extrinsics': probe.extrinsics, 'depth_extrinsics': probe.depth_extrinsics,
+                        'config': probe.depth_projection_config,
+                    })
                 # Only reuse caches from a view which survived the generation,
                 # pose and state rechecks above; their keys and expiries are
                 # still checked again on every later lookup.

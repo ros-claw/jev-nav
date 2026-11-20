@@ -84,6 +84,14 @@ not connected to a motion controller. Sampled centers do not prove continuous
 3-D coverage or a swept-footprint clearance. Full scan/depth coverage and
 independent fault propagation remain open problems.
 
+The supervised runner's opt-in `--longer-forward --prepared-forward` mode
+performs projection and full sensor validation in the existing background
+worker. Before submitting, the controller checks the original proof expiry,
+current sensor generations, odometry, base state and command monitors. It
+withholds commands if a new frame supersedes the prepared proof. The first live
+tests of this mode completed at zero because proofs were repeatedly superseded.
+See the [November 20 trial records](../docs/2026-11-20-perception-renewal-progress.md).
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

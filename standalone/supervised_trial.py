@@ -29,6 +29,8 @@ def parse_args(argv=None):
                         help='allow up to two seconds of forward motion in this trial')
     parser.add_argument('--single-threaded', action='store_true',
                         help='experiment with synchronous sensing in the longer trial')
+    parser.add_argument('--prepared-forward', action='store_true',
+                        help='run final sensor processing in the longer trial worker')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -38,6 +40,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.single_threaded and not args.longer_forward:
         parser.error('--single-threaded requires --longer-forward')
+    if args.prepared_forward and (not args.longer_forward or args.single_threaded):
+        parser.error('--prepared-forward requires --longer-forward without --single-threaded')
     if args.execute:
         digest = args.driver_sha256
         if (args.driver_pid is None or args.driver_pid <= 1
@@ -53,7 +57,7 @@ def parse_args(argv=None):
 
 def trial_period(args):
     # Refresh sooner in the synchronous experiment, without extending any TTL.
-    return 0.025 if args.single_threaded else 0.05
+    return 0.025 if args.single_threaded or args.prepared_forward else 0.05
 
 
 def trial_exit_code(result, observed):
@@ -216,6 +220,7 @@ def main(argv=None):
         ExistingDecisionHelper,
         LiveTrial,
         LongerForwardTrial,
+        PreparedLongerForwardTrial,
         SynchronousLongerForwardTrial,
         ObservationAdapter,
     )
@@ -256,7 +261,8 @@ def main(argv=None):
     relay = make_relay(clock, motion_limit_sec=2.0 if args.longer_forward else 0.3)
     report = {'clear_room': True, 'operator_present': True, 'emergency_stop_available': True,
               'source': 'operator_report', 'independently_verified': False}
-    trial_class = (SynchronousLongerForwardTrial if args.single_threaded else
+    trial_class = (PreparedLongerForwardTrial if args.prepared_forward else
+                   SynchronousLongerForwardTrial if args.single_threaded else
                    LongerForwardTrial if args.longer_forward else LiveTrial)
     trial = trial_class(source, model, relay, ros_guard, clock, enable_motion=True,
                         duration_sec=2.0 if args.longer_forward else 0.6,

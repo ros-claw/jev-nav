@@ -250,6 +250,12 @@ class ObservationAdapter(object):
     def current_limit_kind(self):
         return getattr(self.observation, "current_limit_kind", None)
 
+    def prepare_command_evidence(self, sample):
+        return self.observation.prepare_command_evidence(sample)
+
+    def read_command_evidence(self, sample):
+        return self.observation.read_command_evidence(sample, sample.get('_command_evidence'))
+
     def current_valid_until(self, sample):
         if not self._acquire_processing():
             self._processing_issue = 'processing_busy'
@@ -845,6 +851,7 @@ class LiveTrial(object):
     ARM_BEFORE_MODEL = False
     IMMEDIATE_SYNC_SAMPLING = False
     DISTANCE_RESERVE_SEC = 0.0
+    PREPARED_COMMANDS = False
 
     def __init__(self, source, model, relay, arbiter, clock, enable_motion=False,
                  duration_sec=0.6, speed_mps=0.02, period_sec=0.05, serial_guard=None, depth_gate=None,
@@ -1220,11 +1227,33 @@ class LiveTrial(object):
                                                  'sensor_rejections': {}}
             if self.ASYNC_SAMPLING:
                 from async_safety_sampler import AsyncSafetySampler
+                stationary_until = [self._stationary_proof_at]
+
                 def validate_background(candidate, captured_at):
                     reason, assessment, detail = _assess_sample(candidate, captured_at, self.depth_gate, False)
                     if (not self._motion_started and reason == 'sensor_unavailable'
                             and detail.get('check') == 'front_forward_coverage_incomplete'):
                         return _INITIAL_COVERAGE_PENDING, None
+                    if reason is None and self.PREPARED_COMMANDS:
+                        if not self._motion_started:
+                            start = stationary_until[0]
+                            end = self.clock.now()
+                            trace = self.source.stationary_trace(start, end)
+                            if not self._motion_started:
+                                if not checks._stationary_trace_valid(
+                                        trace, start, end, sample['epoch'], sample['image_pose'], max_gap_sec=.15):
+                                    return 'stationary_trace_invalid', None
+                                stationary_until[0] = end
+                                candidate['_stationary_checked_at'] = end
+                        began = self.clock.now()
+                        proof, issue = self.source.prepare_command_evidence(candidate)
+                        if proof is None and issue not in (
+                                'scan_generation_changed', 'depth_generation_changed',
+                                'depth_replaced_during_retry', 'stale_snapshot', 'timestamps'):
+                            if self._motion_started or issue not in ('new_scan', 'new_depth_unchecked'):
+                                return issue or 'sensor_unavailable', None
+                        candidate['_command_evidence'] = proof
+                        candidate['_command_proof_info'] = (began, self.clock.now(), issue)
                     return reason, assessment
                 sampler = AsyncSafetySampler(self.source, validate_background, self.clock,
                                              transient_unavailable=_transient_snapshot_gap)
@@ -1250,19 +1279,25 @@ class LiveTrial(object):
                             result['initial_preparation']['waiting'] += 1
                             if self.relay.send_zero_heartbeat() is not True:
                                 raise checks._StopError('relay_failure')
-                            self.clock.sleep(.01)
+                            if self.PREPARED_COMMANDS:
+                                sampler.wait_next(None, .01)
+                            else:
+                                self.clock.sleep(.01)
                             continue
                         if pending['sample'] is initial_sample_used:
                             result['initial_preparation']['same_sample'] += 1
                             if self.relay.send_zero_heartbeat() is not True:
                                 raise checks._StopError('relay_failure')
-                            self.clock.sleep(.01)
+                            if self.PREPARED_COMMANDS:
+                                sampler.wait_next(current, .01)
+                            else:
+                                self.clock.sleep(.01)
                             continue
                         current = pending['sample']
                         initial_sample_used = current
                         result['initial_preparation']['ready'] += 1
                         self._last_depth_assessment = pending['assessment']
-                        now = self._stationary_with_retry(sample)
+                        now = self._now() if self.PREPARED_COMMANDS else self._stationary_with_retry(sample)
                         distance, yaw = checks._delta(sample['image_pose'], current['pose'])
                         if (current['epoch'] != sample['epoch'] or distance > .005 or yaw > .01
                                 or current['state']['linear_x_mps'] > .005
@@ -1411,7 +1446,7 @@ class LiveTrial(object):
                 if missing:
                     self._last_diagnostic = {"step": "intent_deadline", "missing": missing}
                     raise checks._StopError("expiry_unavailable")
-                guarded = getattr(self.source, 'serialize_processing', False) is True
+                guarded = getattr(self.source, 'serialize_processing', False) is True and not self.PREPARED_COMMANDS
                 if guarded:
                     begin_guard = getattr(self.source, 'begin_command_check', None)
                     end_guard = getattr(self.source, 'end_command_check', None)
@@ -1431,13 +1466,25 @@ class LiveTrial(object):
                         raise checks._StopError('sensor_unavailable')
                 try:
                     check_started = self._now()
-                    final_sensor_until = current_limit(current) if callable(current_limit) else None
-                    sensor_checked = self._now()
+                    if not self.PREPARED_COMMANDS:
+                        final_sensor_until = current_limit(current) if callable(current_limit) else None
+                        sensor_checked = self._now()
                     # These calls revalidate the monitor caches. Use the
                     # current deadlines after sensor work, not those read
                     # before it while a new watchdog packet could arrive.
                     limits["ros_monitor"] = ros_limit() if callable(ros_limit) else None
                     limits["serial_monitor"] = serial_limit() if callable(serial_limit) else None
+                    prepared_issue = None
+                    if self.PREPARED_COMMANDS:
+                        if first_sent_at is None and current.get('_command_evidence') is not None:
+                            start = current.get('_stationary_checked_at')
+                            end = self._now()
+                            if (not checks._finite(start) or not checks._stationary_trace_valid(
+                                    self.source.stationary_trace(start, end), start, end,
+                                    sample['epoch'], sample['image_pose'], max_gap_sec=.15)):
+                                raise checks._StopError('stationary_trace_invalid')
+                        final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
+                        sensor_checked = self._now()
                     now = self._now()
                     check = {"sample_at": current["snapshot_at"], "sensor_check_started_at": check_started,
                              "sensor_checked_at": sensor_checked, "checked_at": now,
@@ -1445,6 +1492,9 @@ class LiveTrial(object):
                              "limits": dict(limits, latest_sensors=final_sensor_until
                                             if checks._finite(final_sensor_until) else None),
                              "submitted": False}
+                    if self.PREPARED_COMMANDS:
+                        check["prepared_proof"] = current.get('_command_proof_info')
+                        check["prepared_issue"] = prepared_issue
                     renewal_checks.append(check)
                     if last_valid_until is not None and now >= last_valid_until:
                         raise checks._StopError("intent_expired")
@@ -1455,13 +1505,19 @@ class LiveTrial(object):
                         raise checks._StopError("expiry_unavailable")
                     if not checks._finite(final_sensor_until):
                         issue = getattr(self.source, "current_issue", None)
-                        detail = issue() if callable(issue) else None
+                        detail = prepared_issue if self.PREPARED_COMMANDS else issue() if callable(issue) else None
                         self._last_diagnostic = {"step": "motion_final_latest", "detail": detail}
                         if first_sent_at is None and 'initial_preparation' in result:
                             label = detail if isinstance(detail, str) and 0 < len(detail) <= 128 else 'unavailable'
                             reasons = result['initial_preparation']['sensor_rejections']
                             reasons[label] = reasons.get(label, 0) + 1
-                        if first_sent_at is not None:
+                        if self.PREPARED_COMMANDS and detail in (
+                                'prepared_pending', 'prepared_scan_advanced', 'prepared_depth_advanced'):
+                            # Withhold a new command while waiting for a
+                            # complete proof. The previous deadline stands.
+                            sampler.wait_next(current, .005)
+                            continue
+                        if first_sent_at is not None or self.PREPARED_COMMANDS:
                             raise checks._StopError("sensor_unavailable")
                         limiting, valid_until = "latest_sensors", now
                     else:
@@ -1471,7 +1527,7 @@ class LiveTrial(object):
                     # Starting with only one short frame leaves no time for
                     # the next observation. While stopped, wait for a longer
                     # *already valid* window; never extend an expiry.
-                    min_window = .08 if guarded and first_sent_at is None else .03
+                    min_window = .08 if (guarded or self.PREPARED_COMMANDS) and first_sent_at is None else .03
                     if first_sent_at is None and 'initial_preparation' in result:
                         window = valid_until - now
                         largest = result['initial_preparation']['largest_window_sec']
@@ -1635,6 +1691,12 @@ class SynchronousLongerForwardTrial(LongerForwardTrial):
     IMMEDIATE_SYNC_SAMPLING = True
     # Commanded-speed distance over one TTL; excludes odometry lag, stopping
     # latency, speed error and braking, and is not a physical travel bound.
+    DISTANCE_RESERVE_SEC = 0.16
+
+
+class PreparedLongerForwardTrial(LongerForwardTrial):
+    """Overlap perception with renewal while retaining the relay's deadlines."""
+    PREPARED_COMMANDS = True
     DISTANCE_RESERVE_SEC = 0.16
 
 

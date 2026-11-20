@@ -36,6 +36,35 @@ def observer_and_sample():
     return observer, sample
 
 
+@pytest.mark.parametrize('changed,reason', [
+    ('scan', 'prepared_scan_advanced'), ('depth', 'prepared_depth_advanced'),
+    ('epoch', 'epoch_or_guard'), ('pose', 'pose_changed'),
+    ('state', 'base_state'), ('expiry', 'prepared_pending'),
+])
+def test_prepared_command_requires_unchanged_sensor_generation_and_current_state(changed, reason, monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    sample['scan_at'] = now
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    evidence, issue = observer.prepare_command_evidence(sample)
+    assert issue is None and evidence is not None
+    assert observer.read_command_evidence(sample, evidence) == (evidence['valid_until'], None)
+    if changed in ('scan', 'depth'):
+        observer.latest[changed] = dict(observer.latest[changed])
+    elif changed == 'epoch':
+        observer.epoch += 1
+        assert observer.read_command_evidence(sample, None) == (None, 'epoch_or_guard')
+    elif changed == 'pose':
+        observer.latest['odom']['pose'] = (.006, 0., 0.)
+    elif changed == 'state':
+        observer.latest['status']['message'].error_code = 1
+    else:
+        monkeypatch.setattr(explore, '_monotonic', lambda: evidence['valid_until'])
+    assert observer.read_command_evidence(sample, evidence) == (None, reason)
+
+
 @pytest.mark.parametrize('changed', ('odom', 'scan', 'depth', 'status', 'epoch', 'guard', 'transform', 'calibration'))
 def test_slow_scan_check_does_not_block_sensors_or_accept_unchecked_updates(changed, monkeypatch):
     observer, sample = observer_and_sample()

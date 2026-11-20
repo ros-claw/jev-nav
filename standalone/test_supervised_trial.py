@@ -39,6 +39,14 @@ def test_trial_uses_independent_heartbeat_without_starting_a_process_at_construc
     assert relay.transport.process is None
 
 
+def test_prepared_mode_requires_explicit_longer_trial():
+    with pytest.raises(SystemExit):
+        parse_args(['--prepared-forward'])
+    with pytest.raises(SystemExit):
+        parse_args(['--longer-forward', '--prepared-forward', '--single-threaded'])
+    assert trial_period(parse_args(['--longer-forward', '--prepared-forward'])) == .025
+
+
 def test_trial_monitor_allows_ros_rpc_scheduling_delay_without_changing_watchdog_freshness():
     guard = make_ros_monitor(RealClock(), 11139, 'http://localhost:11311')
     assert guard.backend.rpc_timeout == 0.2

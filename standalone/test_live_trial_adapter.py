@@ -715,6 +715,49 @@ def test_longer_trial_streams_while_background_source_produces_samples():
         assert result['reason'] in ('sensor_unavailable', 'expiry_unavailable')
 
 
+def test_prepared_forward_threads_separate_proof_from_renewal_and_stop_on_obstacle():
+    import time
+    from relay import _monotonic
+    mod = module()
+
+    class RealClock(object):
+        now = staticmethod(_monotonic)
+        sleep = staticmethod(time.sleep)
+
+    clock = RealClock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'),
+                             clock, motion_limit_sec=2.)
+    control_thread = threading.current_thread()
+    active_proofs = []
+
+    def prepare(_sample):
+        assert threading.current_thread() is not control_thread
+        if relay.had_motion:
+            active_proofs.append(True)
+        if len(active_proofs) >= 5:
+            return None, 'front_blocked'
+        return clock.now() + .13, None
+
+    def read(sample):
+        assert threading.current_thread() is control_thread
+        return sample['_command_evidence'], None
+
+    adapter.prepare_command_evidence = prepare
+    adapter.read_command_evidence = read
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.PreparedLongerForwardTrial(
+        adapter, model, relay, FakeArbiter(), clock, enable_motion=True,
+        duration_sec=.8, period_sec=.02, serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'front_blocked' and result['sampler_closed']
+    moving = [check for check in result['renewal_checks'] if check['submitted']]
+    assert len(moving) >= 2
+    assert all(check['valid_until'] <= check['limits']['latest_sensors'] for check in moving)
+    assert json.loads(relay.transport.lines[-1])['linear'] == 0.
+
+
 def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
     import time
 
