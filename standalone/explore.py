@@ -1117,14 +1117,16 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         with self.lock:
             if self.epoch != epoch or self.epoch != sample['epoch'] or self.clock_guard.faulted or self.odom_guard.faulted:
                 return None, 'epoch_or_guard'
-            if self.latest.get(stream) is not entry:
-                return None, 'prepared_' + stream + '_advanced'
             if stream == 'depth' and not _same_depth_intrinsics(self.latest.get('info'), info):
                 return None, 'prepared_depth_advanced'
             if not entry or 'odom' not in self.latest:
                 return None, 'prepared_pending'
             probe = copy.copy(self)
             probe.latest = dict(self.latest)
+            if stream == 'depth' and info is not None:
+                # Keep calibration from the same capture as the image. The
+                # command-side check still accounts for every newer receipt.
+                probe.latest['info'] = info
             probe.odom_history = list(self.odom_history)[-150:]
             probe.depth_projection_config = copy.copy(self.depth_projection_config)
             odom = self.latest['odom']
@@ -1210,16 +1212,39 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def read_command_evidence(self, sample, evidence, allow_pending=False, nonblocking=False):
         """Recheck freshness and continuity without projecting a sensor frame."""
-        view = getattr(self, '_split_inputs', None) if nonblocking else None
-        locked = view is None
-        if locked and not self.lock.acquire(not nonblocking):
+        if nonblocking and getattr(self, '_split_inputs', None) is not None:
+            previous_deadline = None
+            for _ in range(2):
+                view = self._split_inputs
+                deadline, issue = self._check_command_view(sample, evidence, allow_pending, view)
+                if issue is not None:
+                    return None, issue
+                if view[0] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
+                    return None, 'epoch_or_guard'
+                if previous_deadline is not None:
+                    deadline = min(deadline, previous_deadline)
+                if view is self._split_inputs:
+                    if _monotonic() >= deadline:
+                        component = evidence.get('limiting')
+                        return None, 'prepared_' + component + '_expired' if component else 'prepared_pending'
+                    return deadline, None
+                previous_deadline = deadline
             return None, 'prepared_state_busy'
+
+        if not self.lock.acquire(not nonblocking):
+            return None, 'prepared_state_busy'
+        try:
+            view = self.epoch, self.latest, getattr(self, '_sensor_receipts', {})
+            return self._check_command_view(sample, evidence, allow_pending, view)
+        finally:
+            self.lock.release()
+
+    def _check_command_view(self, sample, evidence, allow_pending, view):
         try:
             now = _monotonic()
             if (sample['epoch'] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
                 return None, 'epoch_or_guard'
-            epoch, latest_inputs, receipts = view if view is not None else (
-                self.epoch, self.latest, getattr(self, '_sensor_receipts', {}))
+            epoch, latest_inputs, receipts = view
             if epoch != self.epoch:
                 return None, 'epoch_or_guard'
             if evidence is None:
@@ -1263,17 +1288,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     or state['battery_voltage'] < 10 or not 0 <= state['linear_x_mps'] <= .02
                     or abs(state['linear_y_mps']) > .005 or abs(state['angular_z_radps']) > .02):
                 return None, 'base_state'
-            if view is not None:
-                if epoch != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
-                    return None, 'epoch_or_guard'
-                if view is not self._split_inputs:
-                    return None, 'prepared_state_busy'
             return deadline, None
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None, 'malformed'
-        finally:
-            if locked:
-                self.lock.release()
 
     def _current_valid_until_once(self, sample, failure, evidence=None):
         """Validate a captured generation without blocking sensor callbacks.

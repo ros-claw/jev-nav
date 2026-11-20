@@ -292,6 +292,7 @@ def main(argv=None):
     if args.split_sensor_checks:
         result['split_workers_closed'] = split_workers_closed
         result['split_check_counts'] = observation._split_validation.counts()
+        result['split_check_timeline'] = observation._split_validation.timeline()
     if args.preproject_depth:
         result['depth_worker_closed'] = depth_worker_closed
         result['depth_preprojection_counts'] = dict(observation.depth_preprojection_counts)

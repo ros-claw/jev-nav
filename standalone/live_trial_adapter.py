@@ -1701,14 +1701,15 @@ class LiveTrial(object):
                     # before starting CPU-heavy perception in another thread.
                     # The child still enforces the unmodified absolute expiry.
                     wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
-                    if not initial_split and not guarded and callable(wait_for_write) and wait_for_write(sequence) is not True:
+                    if not guarded and callable(wait_for_write) and wait_for_write(sequence) is not True:
                         raise checks._StopError('relay_failure')
+                    check["first_write_confirmed_at"] = self._now() if callable(wait_for_write) else None
                     if initial_split:
                         current['_front_coverage_valid_until'] = self._last_depth_assessment['front_coverage_valid_until']
                         initial_evidence['valid_until'] = min(initial_evidence['valid_until'], valid_until)
                         self.source.seed_split_validation(current, initial_evidence)
                         check["seed_installed_at"] = self._now()
-                        sampler.start(current, self._last_depth_assessment, initial_delay=.050)
+                        sampler.start(current, self._last_depth_assessment)
                     else:
                         sampler.start()
                     check["sampler_started_at"] = self._now()

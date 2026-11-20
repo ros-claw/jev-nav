@@ -111,6 +111,37 @@ def test_split_pending_frame_does_not_extend_prior_proof(monkeypatch):
     assert relay.command(deadline) == (0., 0.) and relay.reason == 'intent_deadline'
 
 
+def test_split_worker_checks_owned_frame_after_new_depth_arrives(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    sample['scan_at'] = now
+    sample['_front_coverage_valid_until'] = now + .22
+    observer.latest['depth']['generation'] = 4
+    monkeypatch.setattr(explore, '_monotonic', lambda: now + .02)
+    examined = []
+
+    def check_depth(_probe, _sample, frame, _odom, _at):
+        examined.append(frame)
+        return True
+
+    monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', check_depth)
+    _, captured_depth = observer._capture_split_input('depth', sample)
+    original = observer.latest['depth']
+    observer.latest['depth'] = {'stamp': now + .01, 'received_at': now + .015, 'generation': 5}
+    _, captured_scan = observer._capture_split_input('scan', sample)
+    scan, issue = observer._check_split_input('scan', sample, captured_scan)
+    assert issue is None
+    depth, issue = observer._check_split_input('depth', sample, captured_depth)
+    assert issue is None and examined == [original] and depth['entry'] is original
+    proof, issue = observer._combine_split_proof(sample, scan, depth)
+    assert issue is None and proof['valid_until'] == now + .015 + .07
+
+    observer.latest['depth'] = dict(observer.latest['depth'], generation=7)
+    assert observer._combine_split_proof(sample, scan, depth) == (None, 'prepared_depth_advanced')
+
+
 def test_command_evidence_does_not_wait_for_a_busy_ros_lock():
     observer, sample = observer_and_sample()
     with observer.lock:
@@ -133,6 +164,51 @@ def test_published_command_view_can_be_read_under_ros_lock_and_rejects_epoch_cha
             evidence['valid_until'], None)
         observer.epoch += 1
         assert observer.read_command_evidence(sample, evidence, nonblocking=True) == (None, 'epoch_or_guard')
+
+
+@pytest.mark.parametrize('update,expected', [
+    ('fresh_odom', None),
+    ('outside_pose', 'pose_changed'),
+    ('continuous', 'prepared_state_busy'),
+    ('epoch', 'epoch_or_guard'),
+    ('unsafe_old_state', 'base_state'),
+])
+def test_published_command_view_rechecks_one_concurrent_update(update, expected, monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    sample['scan_at'] = now
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._sensor_receipts = {}
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    evidence, issue = observer.prepare_initial_command_evidence(sample)
+    assert issue is None
+    evidence['valid_until'] = now + .045
+    observer._publish_split_inputs()
+    original_base_state = explore.base_state
+    checked = []
+
+    def publish_during_check(odom, status, checked_at):
+        checked.append(odom)
+        if len(checked) == 1 or update == 'continuous':
+            previous = observer.latest['odom']
+            pose = (.006, 0., 0.) if update == 'outside_pose' else previous['pose']
+            observer.latest['odom'] = dict(previous, message=Value(), pose=pose)
+            observer.latest['odom']['message'].twist = odom.twist
+            if update == 'epoch':
+                observer.epoch += 1
+            observer._publish_split_inputs()
+        state = original_base_state(odom, status, checked_at)
+        if update == 'unsafe_old_state' and len(checked) == 1:
+            state['error_code'] = 1
+        return state
+
+    monkeypatch.setattr(explore, 'base_state', publish_during_check)
+    result = observer.read_command_evidence(sample, evidence, allow_pending=True, nonblocking=True)
+    assert result == (evidence['valid_until'] if expected is None else None, expected)
+    assert len(checked) == (2 if update in ('fresh_odom', 'continuous') else 1)
+    if len(checked) == 2:
+        assert checked[0] is not checked[1]
 
 
 def test_seeded_sensors_keep_their_individual_expiry(monkeypatch):

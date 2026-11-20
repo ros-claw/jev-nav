@@ -60,6 +60,7 @@ class SplitSensorValidation(object):
         self._closed = False
         self._counts = collections.Counter()
         self._reads = collections.Counter()
+        self._timeline = collections.deque(maxlen=192)
         self._changed = threading.Event()
         self.revision = 0
         self._input_ready = {stream: threading.Event() for stream in self.STREAMS}
@@ -86,10 +87,12 @@ class SplitSensorValidation(object):
                         continue
                 retry = False
                 for anchor in anchors:
+                    started = _monotonic()
                     generation, inputs = self.capture(stream, anchor.sample)
                     if generation == anchor.generations.get(stream):
                         continue
                     part, issue = self.check(stream, anchor.sample, inputs)
+                    completed = _monotonic()
                     unprocessed = issue in ('depth_preprojection_pending', 'depth_alignment_pending',
                                             'scan_alignment_pending',
                                             'prepared_scan_advanced', 'prepared_depth_advanced')
@@ -97,6 +100,13 @@ class SplitSensorValidation(object):
                     anchor.generations[stream] = None if unprocessed else generation
                     with self._cv:
                         self._counts[stream + ':' + (issue or 'ready')] += 1
+                        event = {'stream': stream, 'sample_at': anchor.sample['snapshot_at'],
+                                 'started_at': started, 'completed_at': completed, 'issue': issue}
+                        if isinstance(part, dict):
+                            entry = part['entry']
+                            event.update({'frame_at': entry['stamp'], 'received_at': entry.get('received_at'),
+                                          'generation': entry.get('generation'), 'valid_until': part['expires']})
+                        self._timeline.append(event)
                         if issue in self.LATCH and self._fault is None:
                             self._fault = issue
                         if anchor in (self._active, self._staged):
@@ -131,13 +141,29 @@ class SplitSensorValidation(object):
     def prepare(self, sample, budget=.075):
         deadline = min(_monotonic() + budget, sample['snapshot_at'] + .25)
         with self._cv:
+            if self._closed or self._fault is not None:
+                return None, self._fault or 'split_worker_closed'
             if self._staged is not None and _monotonic() < self._staged.expires:
                 return None, 'split_proof_pending'
             anchor = _Anchor(sample)
             self._staged = anchor
             self._wake_locked()
-            while True:
-                proof, issue = self._read_anchor_locked(anchor)
+        while True:
+            with self._cv:
+                revision = self.revision
+                parts, issue = self._parts_locked(anchor)
+            proof = None
+            if parts is not None:
+                proof, issue = self._combine_anchor(anchor, parts)
+            with self._cv:
+                if self._closed or self._fault is not None:
+                    return None, self._fault or 'split_worker_closed'
+                if self._staged is not anchor:
+                    return None, 'split_proof_pending'
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    self._staged = None
+                    return None, 'split_proof_pending'
                 if proof is not None and (not isinstance(proof, dict) or proof['valid_until'] - _monotonic() > .035):
                     return proof, None
                 if proof is not None:
@@ -148,30 +174,37 @@ class SplitSensorValidation(object):
                 if issue not in PENDING_PROOF:
                     self._staged = None
                     return None, issue
-                remaining = deadline - _monotonic()
-                if remaining <= 0:
-                    self._staged = None
-                    return None, 'split_proof_pending'
-                self._cv.wait(remaining)
+                if revision == self.revision:
+                    self._cv.wait(min(.005, remaining) if issue == 'prepared_state_busy' else remaining)
 
-    def _read_anchor_locked(self, anchor, nonblocking=False):
+    def _parts_locked(self, anchor, record=False):
         if self._closed or self._fault is not None:
             return None, self._fault or 'split_worker_closed'
         if anchor is None or _monotonic() >= anchor.expires:
-            if nonblocking:
+            if record:
                 self._reads['no_live_anchor'] += 1
             return None, 'prepared_pending'
         if anchor.issue is not None:
             return None, anchor.issue
         if any(anchor.parts.get(name) is None for name in self.STREAMS):
-            if nonblocking:
+            if record:
                 for stream in self.STREAMS:
                     if anchor.parts.get(stream) is None:
                         self._reads['missing_' + stream] += 1
             return None, 'prepared_pending'
-        if nonblocking:
-            return self.combine(anchor.sample, anchor.parts['scan'], anchor.parts['depth'], nonblocking=True)
-        return self.combine(anchor.sample, anchor.parts['scan'], anchor.parts['depth'])
+        return (anchor.parts['scan'], anchor.parts['depth']), None
+
+    def _combine_anchor(self, anchor, parts):
+        scan, depth = parts
+        proof, issue = self.combine(anchor.sample, scan, depth, nonblocking=True)
+        if self._closed or self._fault is not None:
+            return None, self._fault or 'split_worker_closed'
+        if anchor.issue is not None:
+            return None, anchor.issue
+        if (anchor not in (self._active, self._staged) or _monotonic() >= anchor.expires
+                or any(anchor.parts.get(name) is None for name in self.STREAMS)):
+            return None, 'prepared_pending'
+        return proof, issue
 
     def read(self, sample):
         if not self._cv.acquire(False):
@@ -179,11 +212,14 @@ class SplitSensorValidation(object):
             return None, 'prepared_pending'
         try:
             anchor = next((a for a in (self._active, self._staged) if a is not None and a.sample is sample), None)
-            proof, issue = self._read_anchor_locked(anchor, nonblocking=True)
-            self._reads[issue or 'ready'] += 1
-            return proof, issue
+            parts, issue = self._parts_locked(anchor, record=True)
         finally:
             self._cv.release()
+        proof = None
+        if parts is not None:
+            proof, issue = self._combine_anchor(anchor, parts)
+        self._reads[issue or 'ready'] += 1
+        return proof, issue
 
     def commit(self, sample):
         """Switch the active anchor only after a command using it is submitted."""
@@ -199,6 +235,10 @@ class SplitSensorValidation(object):
     def counts(self):
         with self._cv:
             return dict(self._counts, **{'read:' + key: value for key, value in self._reads.items()})
+
+    def timeline(self):
+        with self._cv:
+            return list(self._timeline)
 
     def wait_for_change(self, revision, timeout):
         """Wait for either stream to complete a check, without taking its lock."""

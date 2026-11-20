@@ -88,3 +88,32 @@ def test_replacement_keeps_active_proof_until_submission():
         assert workers.read(old) == (None, 'prepared_pending')
     finally:
         assert workers.close()
+
+
+def test_staged_proof_validation_does_not_block_active_proof():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def combine(sample, scan, depth, nonblocking=False):
+        if sample['name'] == 'staged':
+            entered.set()
+            assert release.wait(.5)
+        return (scan, depth), None
+
+    workers = SplitSensorValidation(
+        lambda stream, _: (1, stream),
+        lambda _stream, sample, _: (sample['name'], None), combine)
+    old = {'snapshot_at': _monotonic(), 'name': 'active'}
+    staged = {'snapshot_at': _monotonic(), 'name': 'staged'}
+    outcome = []
+    preparation = threading.Thread(target=lambda: outcome.append(workers.prepare(staged, budget=.20)))
+    try:
+        workers.seed(old, 'active', 'active')
+        preparation.start()
+        assert entered.wait(.20)
+        assert workers.read(old) == (('active', 'active'), None)
+    finally:
+        release.set()
+        preparation.join(.5)
+        assert workers.close()
+    assert outcome == [(('staged', 'staged'), None)]
