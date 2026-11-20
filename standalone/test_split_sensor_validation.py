@@ -2,7 +2,7 @@ import threading
 import time
 
 from relay import _monotonic
-from split_sensor_validation import SplitSensorValidation, pending_sensor_deadline
+from split_sensor_validation import SensorWakeup, SplitSensorValidation, pending_sensor_deadline
 
 
 def test_pending_successors_use_the_oldest_recorded_receipt():
@@ -18,6 +18,25 @@ def test_pending_successors_use_the_oldest_recorded_receipt():
     assert pending_sensor_deadline(second, checked, 10.09, .3, receipts) == 10.13
     assert pending_sensor_deadline(second, checked, 10.14, .3, receipts) is None
     assert pending_sensor_deadline(dict(second, generation=11), checked, 10.09, .3, receipts) is None
+
+
+def test_sensor_wakeup_clears_notifications_and_wakes_a_waiter():
+    event = SensorWakeup()
+    try:
+        event.set()
+        event.set()
+        assert event.wait(0.)
+        event.clear()
+        assert not event.wait(0.)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(event.wait(.2)))
+        worker.start()
+        event.set()
+        worker.join(.25)
+        assert result == [True]
+    finally:
+        event.close()
+    event.set()
 
 
 def test_depth_advance_rechecks_depth_without_recomputing_scan():
@@ -83,9 +102,15 @@ def test_replacement_keeps_active_proof_until_submission():
         workers.seed(old, 'old', 'old')
         assert workers.prepare(new, budget=.15) == (('new', 'new'), None)
         assert workers.read(old) == (('old', 'old'), None)
-        workers.commit(new)
-        assert workers.read(new) == (('new', 'new'), None)
-        assert workers.read(old) == (None, 'prepared_pending')
+        with workers._cv:
+            writer = threading.Thread(target=workers.commit, args=(new,))
+            writer.start()
+            writer.join(.25)
+            assert not writer.is_alive()
+            assert workers.read(new) == (('new', 'new'), None)
+            assert workers.read(old) == (None, 'prepared_pending')
+        final = {'snapshot_at': _monotonic(), 'name': 'final'}
+        assert workers.prepare(final, budget=.15) == (('final', 'final'), None)
     finally:
         assert workers.close()
 
@@ -117,3 +142,43 @@ def test_staged_proof_validation_does_not_block_active_proof():
         preparation.join(.5)
         assert workers.close()
     assert outcome == [(('staged', 'staged'), None)]
+
+
+def test_projected_obstacle_latches_before_a_newer_completed_frame_can_be_used():
+    workers = SplitSensorValidation(
+        lambda stream, _: (1, stream),
+        lambda _stream, _sample, value: (value, None),
+        lambda _sample, scan, depth, **_kwargs: ((scan, depth), None))
+    try:
+        sample = {'snapshot_at': _monotonic()}
+        workers.note_depth_obstacle()
+        assert workers._fault is None
+        workers.seed(sample, 'scan', 'depth')
+        workers.note_depth_obstacle()
+        with workers._cv:
+            assert workers.read(sample) == (None, 'depth_obstacle')
+        assert workers.counts()['depth:producer_obstacle'] == 1
+    finally:
+        assert workers.close()
+
+
+def test_staged_scan_proof_can_be_paired_while_a_newer_scan_is_checked():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def check(stream, _sample, value):
+        if stream == 'scan':
+            entered.set()
+            assert release.wait(.5)
+        return value, None
+
+    workers = SplitSensorValidation(
+        lambda stream, _: (1, stream), check,
+        lambda _sample, scan, depth, **_kwargs: ((scan, depth), None))
+    try:
+        sample = {'snapshot_at': _monotonic()}
+        assert workers.prepare(sample, budget=.15, scan_seed='initial scan') == (('initial scan', 'depth'), None)
+        assert entered.wait(.15)
+    finally:
+        release.set()
+        assert workers.close()

@@ -213,7 +213,9 @@ class ObservationAdapter(object):
             scan, color = sample["scan"], sample["color"]
             result = {key: (value if self.take_scene_ownership else _copy_scene(value))
                       if key == "scene" else copy.deepcopy(value)
-                      for key, value in sample.items() if key not in ("scan", "color")}
+                      for key, value in sample.items() if key not in ("scan", "color", "_scan_capture")}
+            if "_scan_capture" in sample:
+                result["_scan_capture"] = sample["_scan_capture"]
             # These fields must come from the actual observation, never defaults.
             result["depth_pose"] = copy.deepcopy(sample["depth_pose"])
             result["state"]["vehicle_state"] = sample["state"]["vehicle_state"]

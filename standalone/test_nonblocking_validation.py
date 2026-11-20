@@ -153,7 +153,7 @@ def test_snapshot_uses_completed_depth_with_its_original_timestamp_and_calibrati
     observer.depth_projection_config = {'sample_stride': 4}
     completed = CompletedDepth(2, depth, calibration, observer.depth_extrinsics,
                                (('sample_stride', 4),), {'stamp': depth['stamp']})
-    observer._completed_depth = completed
+    observer._completed_depth_frames = (completed,)
     current = {'depth': {'stamp': now}, 'info': calibration}
     assert observer._fresh_completed_depth(current, 2, now) is completed
     assert completed.projection['stamp'] == depth['stamp'] < current['depth']['stamp']
@@ -162,6 +162,37 @@ def test_snapshot_uses_completed_depth_with_its_original_timestamp_and_calibrati
     assert observer._fresh_completed_depth(dict(current, info=None), 2, now) is None
     observer.depth_projection_config['sample_stride'] = 8
     assert observer._fresh_completed_depth(current, 2, now) is None
+
+
+def test_split_capture_uses_aligned_completed_depth_while_newer_frame_waits(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer._depth_projector = observer._depth_worker = Value()
+    observer.depth_extrinsics = (0., 0., 0., 0., 0., 0.)
+    observer.depth_projection_config = {'sample_stride': 4}
+    observer.latest['odom']['stamp'] = now - .069
+    observer.odom_history[0]['stamp'] = now - .069
+    old = {'stamp': now - .068, 'received_at': now - .06, 'generation': 10}
+    newer = {'stamp': now - .010, 'received_at': now - .004, 'generation': 11}
+    observer.latest['depth'] = newer
+    header = Value()
+    header.frame_id = 'camera_depth_optical_frame'
+    info = Value()
+    info.header, info.width, info.height, info.K = header, 320, 240, (1.,) * 9
+    info_entry = {'stamp': now - .011, 'message': info}
+    observer.latest['info'] = info_entry
+    observer._completed_depth_frames = tuple(
+        explore.CompletedDepth(2, frame, info_entry, observer.depth_extrinsics,
+                               (('sample_stride', 4),), {'stamp': frame['stamp']})
+        for frame in (newer, old))
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    _, captured = observer._capture_split_input('depth', sample)
+    assert captured[1] is old
+    assert captured[3].projection['stamp'] == old['stamp']
+    observer.odom_history.append({'stamp': now - .008, 'pose': (0., 0., 0.), 'epoch': 2})
+    _, captured = observer._capture_split_input('depth', sample)
+    assert captured[1] is newer
 
 
 def test_split_worker_uses_published_odometry_while_ros_lock_is_held(monkeypatch):
@@ -508,6 +539,43 @@ def test_scan_proof_can_outlive_irrelevant_old_rays_only_after_future_recheck(mo
         assert observer._scan_veto_valid_until > now + .05
     else:
         assert observer._scan_veto_valid_until <= now + .031
+
+
+@pytest.mark.parametrize('future_covered', (True, False))
+def test_split_scan_covers_measured_scan_period_only_with_live_ray_support(monkeypatch, future_covered):
+    import explore
+    observer, sample = observer_and_sample()
+    observer._split_validation = Value()
+    observer.extrinsics = (.1, 0., .1, 0., 0., 0.)
+    now = sample['snapshot_at']
+    stamp = now - .11
+    # The ray expires before the acquisition deadline and was seen within
+    # the historical ray window of the new scan.
+    ray = {'start_base': (.1, 0.), 'hit_base': (2., 0.), 'stamp': now - .50}
+    sample['scene'] = {'status': 'ok', 'coverage': {'sensor_fresh': True}, 'rays': [ray],
+                       'occupied_hits': [{'point_base': ray['hit_base'], 'stamp': ray['stamp']}]}
+    message = Value()
+    message.header = Value()
+    message.header.frame_id = 'laser_link'
+    message.angle_min, message.angle_increment = -.3, .02
+    message.range_min, message.range_max, message.time_increment = .1, 8., 0.
+    message.ranges = [2.] * 33
+    calls = []
+
+    def check(_scan, _extrinsics, _scene, at, *_args, **_kwargs):
+        calls.append(at)
+        return len(calls) == 1 or future_covered
+
+    monkeypatch.setattr(explore, 'newest_scan_veto', check)
+    scan = {'stamp': stamp, 'message': message}
+    odom = observer.latest['odom']
+    assert observer._cached_newest_scan_safe_locked(sample, scan, odom, odom, now)
+    assert len(calls) == 2
+    assert calls[-1] < stamp + .30 and calls[-1] > now + .15
+    if future_covered:
+        assert observer._scan_veto_valid_until == calls[-1]
+    else:
+        assert observer._scan_veto_valid_until == ray['stamp'] + .65
 
 
 @pytest.mark.parametrize('dense', (True, False))

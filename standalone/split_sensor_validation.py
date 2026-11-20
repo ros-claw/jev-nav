@@ -3,6 +3,11 @@
 from __future__ import division
 
 import collections
+import errno
+import fcntl
+import math
+import select
+import socket
 import threading
 
 from relay import _monotonic
@@ -47,6 +52,47 @@ class _Anchor(object):
         self.issue = None
 
 
+class SensorWakeup(object):
+    """Wake one waiter on input without Python 2's timed sleep polling."""
+
+    def __init__(self):
+        self._reader, self._writer = socket.socketpair()
+        for endpoint in (self._reader, self._writer):
+            endpoint.setblocking(False)
+            fd = endpoint.fileno()
+            fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+        self._poller = select.poll()
+        self._poller.register(self._reader, select.POLLIN)
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def set(self):
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._writer.send(b'x')
+            except socket.error as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+
+    def clear(self):
+        try:
+            self._reader.recv(65536)
+        except socket.error as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+
+    def wait(self, timeout):
+        return bool(self._poller.poll(max(0, int(math.ceil(timeout * 1000)))))
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._reader.close()
+            self._writer.close()
+
+
 class SplitSensorValidation(object):
     STREAMS = ('scan', 'depth')
     STOPS = ('new_scan', 'new_depth_unchecked', 'epoch_or_guard', 'transform_changed')
@@ -55,15 +101,17 @@ class SplitSensorValidation(object):
     def __init__(self, capture, check, combine):
         self.capture, self.check, self.combine = capture, check, combine
         self._cv = threading.Condition()
-        self._active = self._staged = None
+        self._anchors = (None, None)
+        self._pending_commit = None
         self._fault = None
         self._closed = False
         self._counts = collections.Counter()
         self._reads = collections.Counter()
         self._timeline = collections.deque(maxlen=192)
-        self._changed = threading.Event()
+        self._changed = SensorWakeup()
+        self._stage_changed = SensorWakeup()
         self.revision = 0
-        self._input_ready = {stream: threading.Event() for stream in self.STREAMS}
+        self._input_ready = {stream: SensorWakeup() for stream in self.STREAMS}
         self._threads = []
         for name in self.STREAMS:
             thread = threading.Thread(target=self._run, args=(name,), name='limo-proof-' + name)
@@ -79,8 +127,9 @@ class SplitSensorValidation(object):
                 with self._cv:
                     if self._closed or self._fault is not None:
                         return
+                    self._promote_locked()
                     now = _monotonic()
-                    anchors = [anchor for anchor in (self._active, self._staged)
+                    anchors = [anchor for anchor in self._anchors
                                if anchor is not None and anchor.issue is None and now < anchor.expires]
                     if not anchors:
                         self._cv.wait()
@@ -109,7 +158,7 @@ class SplitSensorValidation(object):
                         self._timeline.append(event)
                         if issue in self.LATCH and self._fault is None:
                             self._fault = issue
-                        if anchor in (self._active, self._staged):
+                        if anchor in self._anchors:
                             if not (unprocessed or issue == 'scan_coverage_pending') or stream not in anchor.parts:
                                 anchor.parts[stream] = part
                             if issue in self.STOPS and anchor.issue is None:
@@ -125,6 +174,7 @@ class SplitSensorValidation(object):
     def _changed_locked(self):
         self.revision += 1
         self._changed.set()
+        self._stage_changed.set()
         self._cv.notifyAll()
 
     def _wake_locked(self):
@@ -135,49 +185,50 @@ class SplitSensorValidation(object):
     def seed(self, sample, scan, depth):
         """Publish the already checked initial proof without changing expiry."""
         with self._cv:
-            self._active = _Anchor(sample, {'scan': scan, 'depth': depth})
+            self._anchors = (_Anchor(sample, {'scan': scan, 'depth': depth}), self._anchors[1])
             self._wake_locked()
 
-    def prepare(self, sample, budget=.075):
+    def prepare(self, sample, budget=.075, scan_seed=None):
         deadline = min(_monotonic() + budget, sample['snapshot_at'] + .25)
         with self._cv:
             if self._closed or self._fault is not None:
                 return None, self._fault or 'split_worker_closed'
-            if self._staged is not None and _monotonic() < self._staged.expires:
+            self._promote_locked()
+            if self._anchors[1] is not None and _monotonic() < self._anchors[1].expires:
                 return None, 'split_proof_pending'
-            anchor = _Anchor(sample)
-            self._staged = anchor
+            anchor = _Anchor(sample, {'scan': scan_seed} if scan_seed is not None else None)
+            self._anchors = (self._anchors[0], anchor)
             self._wake_locked()
         while True:
             with self._cv:
                 revision = self.revision
-                parts, issue = self._parts_locked(anchor)
+                parts, issue = self._parts(anchor)
             proof = None
             if parts is not None:
                 proof, issue = self._combine_anchor(anchor, parts)
             with self._cv:
                 if self._closed or self._fault is not None:
                     return None, self._fault or 'split_worker_closed'
-                if self._staged is not anchor:
+                if self._anchors[1] is not anchor:
                     return None, 'split_proof_pending'
                 remaining = deadline - _monotonic()
                 if remaining <= 0:
-                    self._staged = None
+                    self._anchors = (self._anchors[0], None)
                     return None, 'split_proof_pending'
                 if proof is not None and (not isinstance(proof, dict) or proof['valid_until'] - _monotonic() > .035):
                     return proof, None
                 if proof is not None:
                     issue = 'prepared_pending'
                 if issue in ('new_scan', 'new_depth_unchecked'):
-                    self._staged = None
+                    self._anchors = (self._anchors[0], None)
                     return None, 'split_proof_pending'
                 if issue not in PENDING_PROOF:
-                    self._staged = None
+                    self._anchors = (self._anchors[0], None)
                     return None, issue
-                if revision == self.revision:
-                    self._cv.wait(min(.005, remaining) if issue == 'prepared_state_busy' else remaining)
+            self._wait_for_revision(self._stage_changed, revision,
+                                    min(.005, remaining) if issue == 'prepared_state_busy' else remaining)
 
-    def _parts_locked(self, anchor, record=False):
+    def _parts(self, anchor, record=False):
         if self._closed or self._fault is not None:
             return None, self._fault or 'split_worker_closed'
         if anchor is None or _monotonic() >= anchor.expires:
@@ -186,13 +237,15 @@ class SplitSensorValidation(object):
             return None, 'prepared_pending'
         if anchor.issue is not None:
             return None, anchor.issue
-        if any(anchor.parts.get(name) is None for name in self.STREAMS):
+        scan, depth = anchor.parts.get('scan'), anchor.parts.get('depth')
+        if scan is None or depth is None:
             if record:
-                for stream in self.STREAMS:
-                    if anchor.parts.get(stream) is None:
-                        self._reads['missing_' + stream] += 1
+                if scan is None:
+                    self._reads['missing_scan'] += 1
+                if depth is None:
+                    self._reads['missing_depth'] += 1
             return None, 'prepared_pending'
-        return (anchor.parts['scan'], anchor.parts['depth']), None
+        return (scan, depth), None
 
     def _combine_anchor(self, anchor, parts):
         scan, depth = parts
@@ -201,20 +254,17 @@ class SplitSensorValidation(object):
             return None, self._fault or 'split_worker_closed'
         if anchor.issue is not None:
             return None, anchor.issue
-        if (anchor not in (self._active, self._staged) or _monotonic() >= anchor.expires
+        if (anchor not in self._anchors or _monotonic() >= anchor.expires
                 or any(anchor.parts.get(name) is None for name in self.STREAMS)):
             return None, 'prepared_pending'
         return proof, issue
 
     def read(self, sample):
-        if not self._cv.acquire(False):
-            self._reads['coordinator_busy'] += 1
-            return None, 'prepared_pending'
-        try:
-            anchor = next((a for a in (self._active, self._staged) if a is not None and a.sample is sample), None)
-            parts, issue = self._parts_locked(anchor, record=True)
-        finally:
-            self._cv.release()
+        active, staged = self._anchors
+        if staged is not None and staged is self._pending_commit:
+            active, staged = staged, None
+        anchor = next((a for a in (active, staged) if a is not None and a.sample is sample), None)
+        parts, issue = self._parts(anchor, record=True)
         proof = None
         if parts is not None:
             proof, issue = self._combine_anchor(anchor, parts)
@@ -223,14 +273,23 @@ class SplitSensorValidation(object):
 
     def commit(self, sample):
         """Switch the active anchor only after a command using it is submitted."""
+        staged = self._anchors[1]
+        if staged is None or sample is not staged.sample:
+            return
+        self._pending_commit = staged
         if not self._cv.acquire(False):
             return
         try:
-            if self._staged is not None and sample is self._staged.sample:
-                self._active, self._staged = self._staged, None
-                self._wake_locked()
+            self._promote_locked()
         finally:
             self._cv.release()
+
+    def _promote_locked(self):
+        pending = self._pending_commit
+        if pending is not None and pending is self._anchors[1]:
+            self._anchors = (pending, None)
+            self._pending_commit = None
+            self._wake_locked()
 
     def counts(self):
         with self._cv:
@@ -242,17 +301,27 @@ class SplitSensorValidation(object):
 
     def wait_for_change(self, revision, timeout):
         """Wait for either stream to complete a check, without taking its lock."""
+        self._wait_for_revision(self._changed, revision, timeout)
+
+    def _wait_for_revision(self, event, revision, timeout):
         if revision == self.revision:
-            self._changed.clear()
+            event.clear()
             if revision == self.revision:
-                self._changed.wait(timeout)
+                event.wait(timeout)
 
     def notify_input(self, stream):
         # ROS callbacks may hold their own lock. Never acquire the
         # coordinator lock here; combining proofs acquires the ROS lock.
-        event = self._input_ready.get('depth' if stream == 'info' else stream)
+        event = self._input_ready.get('depth' if stream in ('info', 'odom') else stream)
         if event is not None:
             event.set()
+
+    def note_depth_obstacle(self):
+        with self._cv:
+            if self._anchors[0] is not None and self._fault is None and not self._closed:
+                self._fault = 'depth_obstacle'
+                self._counts['depth:producer_obstacle'] += 1
+                self._wake_locked()
 
     def close(self):
         with self._cv:
@@ -260,4 +329,8 @@ class SplitSensorValidation(object):
             self._wake_locked()
         for thread in self._threads:
             thread.join(.15)
-        return all(not thread.is_alive() for thread in self._threads)
+        closed = all(not thread.is_alive() for thread in self._threads)
+        if closed:
+            for event in list(self._input_ready.values()) + [self._changed, self._stage_changed]:
+                event.close()
+        return closed
