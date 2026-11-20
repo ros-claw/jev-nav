@@ -66,3 +66,23 @@ def test_forward_lidar_gaps_and_unobserved_rear_are_sent_to_the_model():
         return {"answers": [{"name": "next_action", "type": "choice", "choice": "forward"}]}
 
     assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["ok"]
+
+
+def test_forward_trial_only_offers_forward_or_stop_and_preserves_stop():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+        "forward_only": True,
+    }
+
+    def reply(choice):
+        def transport(payload, key, timeout):
+            assert [item["value"] for item in payload["questions"][0]["choices"]] == ["forward", "stop"]
+            return {"answers": [{"name": "next_action", "type": "choice", "choice": choice}]}
+        return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
+
+    assert reply("forward")["ok"]
+    assert reply("stop") == {"choice": "stop", "captured_at": 100.0, "ok": True}
+    assert not reply("left")["ok"]

@@ -142,6 +142,55 @@ def test_split_worker_checks_owned_frame_after_new_depth_arrives(monkeypatch):
     assert observer._combine_split_proof(sample, scan, depth) == (None, 'prepared_depth_advanced')
 
 
+def test_snapshot_uses_completed_depth_with_its_original_timestamp_and_calibration():
+    from explore import CompletedDepth
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    depth = {'stamp': now - .04}
+    calibration = {'message': Value()}
+    calibration['message'].K = (1.,) * 9
+    observer.depth_extrinsics = (.1, 0., .1, 0., 0., 0.)
+    observer.depth_projection_config = {'sample_stride': 4}
+    completed = CompletedDepth(2, depth, calibration, observer.depth_extrinsics,
+                               (('sample_stride', 4),), {'stamp': depth['stamp']})
+    observer._completed_depth = completed
+    current = {'depth': {'stamp': now}, 'info': calibration}
+    assert observer._fresh_completed_depth(current, 2, now) is completed
+    assert completed.projection['stamp'] == depth['stamp'] < current['depth']['stamp']
+    assert observer._fresh_completed_depth(current, 3, now) is None
+    assert observer._fresh_completed_depth(current, 2, now + .12) is None
+    assert observer._fresh_completed_depth(dict(current, info=None), 2, now) is None
+    observer.depth_projection_config['sample_stride'] = 8
+    assert observer._fresh_completed_depth(current, 2, now) is None
+
+
+def test_split_worker_uses_published_odometry_while_ros_lock_is_held(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._sensor_receipts = {}
+    observer._publish_split_inputs()
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+
+    def depth_check(probe, _sample, _frame, _odom, _at):
+        return probe.odom_history == tuple(observer.odom_history)
+
+    monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', depth_check)
+    result = []
+    def check():
+        _, captured = observer._capture_split_input('depth', sample)
+        result.append(observer._check_split_input('depth', sample, captured))
+
+    worker = threading.Thread(target=check)
+    with observer.lock:
+        worker.start()
+        worker.join(.25)
+        completed_under_lock = not worker.is_alive()
+    worker.join(1.)
+    assert completed_under_lock and result[0][1] is None
+
+
 def test_command_evidence_does_not_wait_for_a_busy_ros_lock():
     observer, sample = observer_and_sample()
     with observer.lock:

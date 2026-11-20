@@ -13,6 +13,7 @@ import argparse
 import base64
 import collections
 import copy
+import itertools
 import json
 import math
 import os
@@ -55,6 +56,7 @@ except NameError:
     INTEGER_TYPES = (int,)
 NUMBER_TYPES = INTEGER_TYPES + (float,)
 LATEST_INPUT_MAX_AGE_SEC = 0.15
+CompletedDepth = collections.namedtuple('CompletedDepth', 'epoch frame info extrinsics config projection')
 
 
 def _valid_epoch(value):
@@ -559,6 +561,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.depth_extrinsics = None
         self._depth_projector = depth_projector
         self._depth_projections = collections.deque(maxlen=4)
+        self._completed_depth = None
         self._depth_event = None
         self._depth_worker = None
         self._scan_veto_cache = []
@@ -584,9 +587,15 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             if "odom" not in names or not names.issubset(name for name, _, _ in topics):
                 raise ValueError("invalid observation sensor selection")
             topics = [spec for spec in topics if spec[0] in names]
-        self.subscriptions = [rospy.Subscriber(topic, typ, self._receive, callback_args=name,
-                                               queue_size=sensor_queue_size(name))
-                              for name, topic, typ in topics]
+        self.subscriptions = []
+        for name, topic, typ in topics:
+            options = {'queue_size': sensor_queue_size(name)}
+            if typ is Image:
+                # The measured color and depth messages both fit in 1 MiB.
+                # Keep the single-frame receive queue used by the image topics.
+                options['buff_size'] = 1024 * 1024
+            self.subscriptions.append(rospy.Subscriber(
+                topic, typ, self._receive, callback_args=name, **options))
 
     def _receive(self, message, name):
         try:
@@ -687,6 +696,12 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             epoch = self.epoch
             projection_only = getattr(self, "projection_only", False)
         now = _monotonic()
+        completed_depth = None
+        if projection_only and self._depth_projector is not None and self._depth_worker is not None:
+            completed_depth = self._fresh_completed_depth(current, epoch, now)
+            if completed_depth is None:
+                return reject("depth_projection_pending")
+            current["depth"] = completed_depth.frame
         for name in self.limits:
             if name not in current:
                 return reject("missing_" + name)
@@ -758,7 +773,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return reject("depth_transform_changed")
                 stamp = current["depth"]["stamp"]
                 prepared = None
-                if (self._depth_projector is not None and self._depth_worker is not None
+                if completed_depth is not None and depth_signature == completed_depth.extrinsics:
+                    prepared = copy.deepcopy(completed_depth.projection)
+                elif (self._depth_projector is not None and self._depth_worker is not None
                         and depth_signature == self.depth_extrinsics):
                     rotation = self.tf.transformations.quaternion_from_euler(*depth_signature[3:])
                     prepared = self._wait_for_depth_projection(
@@ -894,11 +911,26 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                                               extrinsics[:3], rotation)
                             self.depth_preprojection_counts['processed' if prepared is not None else 'unavailable'] += 1
                             if prepared is not None:
+                                self._completed_depth = CompletedDepth(epoch, depth, info, extrinsics, key[-1], prepared)
                                 self._depth_ready.set()
                             previous = key
             except Exception:  # no result for failed calibration, TF or conversion
                 pass
             self._depth_event.wait(.02)
+
+    def _fresh_completed_depth(self, current, epoch, now):
+        """Select a checked frame for snapshot assembly with its original age."""
+        latest = current.get('depth')
+        completed = self._completed_depth
+        if latest is None or completed is None:
+            return None
+        stamp = completed.frame['stamp']
+        if (completed.epoch != epoch or not 0 <= now - stamp < LATEST_INPUT_MAX_AGE_SEC
+                or stamp > latest['stamp'] or completed.extrinsics != self.depth_extrinsics
+                or completed.config != tuple(sorted(self.depth_projection_config.items()))
+                or not _same_depth_intrinsics(current.get('info'), completed.info)):
+            return None
+        return completed
 
     def _wait_for_depth_projection(self, image, info, stamp, epoch, trans, rotation):
         self._depth_ready.clear()
@@ -1117,42 +1149,57 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def _publish_split_inputs(self):
         """Publish a bounded input view after a callback has finished updating it."""
+        previous = getattr(self, '_split_inputs', None)
+        if (previous is None or previous[0] != self.epoch
+                or previous[1].get('odom') is not self.latest.get('odom')):
+            history = tuple(itertools.islice(reversed(self.odom_history), 150))[::-1]
+        else:
+            history = previous[3]
         self._split_inputs = (self.epoch, dict(self.latest),
-                              {key: tuple(value) for key, value in self._sensor_receipts.items()})
+                              {key: tuple(value) for key, value in self._sensor_receipts.items()}, history)
+
+    def _split_check_view(self):
+        view = getattr(self, '_split_inputs', None)
+        if view is not None:
+            return view
+        with self.lock:
+            return (self.epoch, dict(self.latest), {},
+                    tuple(itertools.islice(reversed(self.odom_history), 150))[::-1])
 
     def close_split_validation(self):
         return self._split_validation.close()
 
     def _capture_split_input(self, stream, _sample):
-        with self.lock:
-            entry = self.latest.get(stream)
-            info = self.latest.get('info') if stream == 'depth' else None
-            calibration = None
-            if info is not None:
-                msg = info['message']
-                calibration = (msg.header.frame_id, msg.width, msg.height, tuple(msg.K))
-            signature = self.extrinsics if stream == 'scan' else self.depth_extrinsics
-            stamp = entry.get('stamp') if entry else None
-            return (self.epoch, id(entry), stamp, calibration, signature), (self.epoch, entry, info)
+        epoch, latest, _, _ = self._split_check_view()
+        entry = latest.get(stream)
+        info = latest.get('info') if stream == 'depth' else None
+        calibration = None
+        if info is not None:
+            msg = info['message']
+            calibration = (msg.header.frame_id, msg.width, msg.height, tuple(msg.K))
+        signature = self.extrinsics if stream == 'scan' else self.depth_extrinsics
+        stamp = entry.get('stamp') if entry else None
+        return (epoch, id(entry), stamp, calibration, signature), (epoch, entry, info)
 
     def _check_split_input(self, stream, sample, inputs):
         epoch, entry, info = inputs
-        with self.lock:
-            if self.epoch != epoch or self.epoch != sample['epoch'] or self.clock_guard.faulted or self.odom_guard.faulted:
-                return None, 'epoch_or_guard'
-            if stream == 'depth' and not _same_depth_intrinsics(self.latest.get('info'), info):
-                return None, 'prepared_depth_advanced'
-            if not entry or 'odom' not in self.latest:
-                return None, 'prepared_pending'
-            probe = copy.copy(self)
-            probe.latest = dict(self.latest)
-            if stream == 'depth' and info is not None:
-                # Keep calibration from the same capture as the image. The
-                # command-side check still accounts for every newer receipt.
-                probe.latest['info'] = info
-            probe.odom_history = list(self.odom_history)[-150:]
-            probe.depth_projection_config = copy.copy(self.depth_projection_config)
-            odom = self.latest['odom']
+        current_epoch, latest, _, history = self._split_check_view()
+        if (self.epoch != epoch or current_epoch != epoch or self.epoch != sample['epoch']
+                or self.clock_guard.faulted or self.odom_guard.faulted):
+            return None, 'epoch_or_guard'
+        if stream == 'depth' and not _same_depth_intrinsics(latest.get('info'), info):
+            return None, 'prepared_depth_advanced'
+        odom = latest.get('odom')
+        if not entry or not odom:
+            return None, 'prepared_pending'
+        probe = copy.copy(self)
+        probe.latest = dict(latest)
+        if stream == 'depth' and info is not None:
+            # Keep calibration from the same capture as the image. The
+            # command-side check still accounts for every newer receipt.
+            probe.latest['info'] = info
+        probe.odom_history = history
+        probe.depth_projection_config = copy.copy(self.depth_projection_config)
         now = _monotonic()
         stamp = entry['stamp']
         max_age = .3 if stream == 'scan' else LATEST_INPUT_MAX_AGE_SEC
@@ -1267,7 +1314,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             now = _monotonic()
             if (sample['epoch'] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
                 return None, 'epoch_or_guard'
-            epoch, latest_inputs, receipts = view
+            epoch, latest_inputs, receipts = view[:3]
             if epoch != self.epoch:
                 return None, 'epoch_or_guard'
             if evidence is None:

@@ -13,6 +13,12 @@ import urllib.request
 MAX_IMAGE_BYTES = 2_000_000
 MAX_AGE_SEC = 8.0
 CHOICES = ("forward", "left", "right", "stop")
+DESCRIPTIONS = {
+    "forward": "Continue exploring ahead",
+    "left": "Explore to the left",
+    "right": "Explore to the right",
+    "stop": "Wait",
+}
 
 
 def _transport(payload, key, timeout):
@@ -31,6 +37,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
     try:
         stamp = observation["captured_at"]
         image = observation["image_b64"]
+        forward_only = observation.get("forward_only", False)
         if (
             isinstance(stamp, bool)
             or not isinstance(stamp, (int, float))
@@ -40,6 +47,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
             or not isinstance(observation["base"], dict)
             or not isinstance(key, str)
             or not key
+            or type(forward_only) is not bool
         ):
             return rejected
         binary = base64.b64decode(image, validate=True)
@@ -48,6 +56,11 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         started = clock()
         if not stamp <= started < stamp + MAX_AGE_SEC:
             return rejected
+        choices = ("forward", "stop") if forward_only else CHOICES
+        task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
+        if forward_only:
+            task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
+                    "choose forward if the visible segment supports progress. Otherwise choose stop.")
         payload = {
             "model": "gpt-6-luna",
             "input": [
@@ -56,7 +69,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                     "content": [
                         {
                             "type": "input_text",
-                            "text": "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data.",
+                            "text": task,
                         },
                         {"type": "input_image", "image_url": "data:image/jpeg;base64," + image},
                         {
@@ -82,12 +95,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         "is zero the rear is unknown. Missing returns and nulls are unknown. "
                         "The local controller checks obstacles independently."
                     ),
-                    "choices": [
-                        {"value": "forward", "description": "Continue exploring ahead"},
-                        {"value": "left", "description": "Explore to the left"},
-                        {"value": "right", "description": "Explore to the right"},
-                        {"value": "stop", "description": "Wait"},
-                    ],
+                    "choices": [{"value": value, "description": DESCRIPTIONS[value]} for value in choices],
                 }
             ],
         }
@@ -103,7 +111,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         ):
             return rejected
         choice = answers[0].get("choice")
-        if choice not in CHOICES:
+        if choice not in choices:
             return rejected
         return {"choice": choice, "captured_at": stamp, "ok": True}
     except Exception:  # noqa: BLE001 - model/network failures return an unavailable result

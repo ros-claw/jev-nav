@@ -806,6 +806,7 @@ def test_split_trial_seeds_background_workers_from_the_checked_first_command():
         return sample['_command_evidence']['valid_until'], None
 
     adapter.prepare_initial_command_evidence = initial_proof
+    adapter.read_initial_command_evidence = lambda _sample, evidence: (evidence['valid_until'], None)
     adapter.seed_split_validation = seed
     adapter.read_command_evidence = read
 
@@ -823,6 +824,7 @@ def test_split_trial_seeds_background_workers_from_the_checked_first_command():
     assert len(seeded) == 1 and renewed and len(submissions) > 2
     assert result['motion_timing']['nonadvancing_window_polls'] >= 2
     assert acknowledged == [submissions[0]['sequence']]
+    assert submissions[0]['reused_initial_proof'] is True
     assert submissions[0]['valid_until'] <= seeded[0][1]
     assert submissions[1]['valid_until'] > submissions[0]['valid_until']
     assert result['sampler_closed'] and json.loads(relay.transport.lines[-1])['linear'] == 0

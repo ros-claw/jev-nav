@@ -278,6 +278,12 @@ class ObservationAdapter(object):
     def prepare_initial_command_evidence(self, sample):
         return self.observation.prepare_initial_command_evidence(sample)
 
+    def read_initial_command_evidence(self, sample, evidence):
+        read = getattr(self.observation, 'read_command_evidence', None)
+        if not callable(read):
+            return None, 'prepared_pending'
+        return read(sample, evidence, nonblocking=True)
+
     def seed_split_validation(self, sample, proof):
         self.observation.seed_split_validation(sample, proof)
 
@@ -355,10 +361,11 @@ class DecisionsAdapter(object):
     """Bind a single helper call's matching response to its local evidence ID."""
     simulation_only = False
 
-    def __init__(self, invoke, timeout_sec=6.0):
+    def __init__(self, invoke, timeout_sec=6.0, forward_only=False):
         if not callable(invoke) or not checks._finite(timeout_sec) or not 0 < timeout_sec <= 6.0:
             raise ValueError("bounded Decisions invoker required")
         self.invoke, self.timeout_sec = invoke, timeout_sec
+        self.forward_only = forward_only
 
     def decide(self, evidence):
         rejected = {"ok": False, "choice": "stop"}
@@ -373,10 +380,13 @@ class DecisionsAdapter(object):
             payload = build_decision_evidence(sample, evidence["image_jpeg"])
             if payload is None:
                 return rejected
+            choices = ("forward", "stop") if self.forward_only else ("forward", "left", "right", "stop")
+            if self.forward_only:
+                payload["forward_only"] = True
             result = self.invoke(payload, self.timeout_sec)
             if (not isinstance(result, dict) or result.get("ok") is not True
                     or result.get("captured_at") != payload["captured_at"]
-                    or result.get("choice") not in ("forward", "left", "right", "stop")):
+                    or result.get("choice") not in choices):
                 return rejected
             return {"ok": True, "choice": result["choice"], "observation_id": evidence["observation_id"]}
         except Exception as exc:
@@ -1082,14 +1092,25 @@ class LiveTrial(object):
                 raise checks._StopError("sensor_unavailable")
             now = self._stationary_with_retry(before)
             fresh = _live_timestamps_fresh(sample, now)
-            current = (self.source.is_current_epoch(sample['epoch']) is True
-                       and self.source.is_current_sample(sample) is True)
+            current = self.source.is_current_epoch(sample['epoch']) is True
+            proof_issue = None
+            if fresh and current:
+                updates = getattr(self.source, 'updates_prepared_evidence', None)
+                if self.PREPARED_COMMANDS and callable(updates) and updates():
+                    evidence, proof_issue = self.source.prepare_initial_command_evidence(sample)
+                    current = evidence is not None
+                    if current:
+                        sample['_initial_command_evidence'] = evidence
+                else:
+                    current = self.source.is_current_sample(sample) is True
             if not fresh or not current:
                 self._last_diagnostic = {"step": "post_trace_recheck", "timestamps_fresh": fresh,
                                          "current_sample": current,
                                          "snapshot_age_sec": now - sample["snapshot_at"]}
                 issue = getattr(self.source, "current_issue", None)
-                if not current and callable(issue):
+                if proof_issue is not None:
+                    self._last_diagnostic["detail"] = proof_issue
+                elif not current and callable(issue):
                     self._last_diagnostic["detail"] = issue()
                 if now >= deadline:
                     raise checks._StopError("sensor_unavailable")
@@ -1529,9 +1550,18 @@ class LiveTrial(object):
                     check_started = self._now()
                     initial_split = refresh_prepared and first_sent_at is None
                     initial_evidence, prepared_issue = None, None
+                    reused_initial_proof = False
                     if initial_split:
-                        initial_evidence, prepared_issue = self.source.prepare_initial_command_evidence(current)
-                        final_sensor_until = initial_evidence['valid_until'] if initial_evidence is not None else None
+                        initial_evidence = current.get('_initial_command_evidence')
+                        final_sensor_until = None
+                        if initial_evidence is not None:
+                            final_sensor_until, prepared_issue = self.source.read_initial_command_evidence(
+                                current, initial_evidence)
+                            reused_initial_proof = final_sensor_until is not None
+                        if initial_evidence is None or (final_sensor_until is None and prepared_issue in PENDING_PROOF):
+                            initial_evidence, prepared_issue = self.source.prepare_initial_command_evidence(current)
+                            if initial_evidence is not None:
+                                final_sensor_until = initial_evidence['valid_until']
                         sensor_checked = self._now()
                     elif not self.PREPARED_COMMANDS:
                         final_sensor_until = current_limit(current) if callable(current_limit) else None
@@ -1562,6 +1592,8 @@ class LiveTrial(object):
                     if self.PREPARED_COMMANDS:
                         check["prepared_proof"] = current.get('_command_proof_info')
                         check["prepared_issue"] = prepared_issue
+                    if initial_split:
+                        check["reused_initial_proof"] = reused_initial_proof
                     renewal_checks.append(check)
                     if last_valid_until is not None and now >= last_valid_until:
                         raise checks._StopError("intent_expired")

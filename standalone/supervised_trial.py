@@ -282,7 +282,7 @@ def run(args, projector=None):
     serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                           args.driver_sha256, max_age=0.6, acquire_timeout=1.2,
                                           ros_monitor=ros_guard)
-    model = DecisionsAdapter(ExistingDecisionHelper(clock, cancelled=rospy.is_shutdown))
+    model = DecisionsAdapter(ExistingDecisionHelper(clock, cancelled=rospy.is_shutdown), forward_only=True)
     relay = make_relay(clock, motion_limit_sec=2.0 if args.longer_forward else 0.3)
     report = {'clear_room': True, 'operator_present': True, 'emergency_stop_available': True,
               'source': 'operator_report', 'independently_verified': False}
