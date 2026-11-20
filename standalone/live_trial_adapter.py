@@ -1202,6 +1202,7 @@ class LiveTrial(object):
             previous_odom = current["odom_at"]
             first_sent_at = last_sent_at = None
             last_valid_until = None
+            short_window_rechecked = False
             initial_sample_used = None
             path, sequence = 0.0, self.relay.sequence + 1
             result["stage"] = "motion_loop"
@@ -1428,6 +1429,8 @@ class LiveTrial(object):
                 try:
                     final_sensor_until = current_limit(current) if callable(current_limit) else None
                     now = self._now()
+                    if last_valid_until is not None and now >= last_valid_until:
+                        raise checks._StopError("intent_expired")
                     if not checks._finite(final_sensor_until):
                         issue = getattr(self.source, "current_issue", None)
                         detail = issue() if callable(issue) else None
@@ -1461,6 +1464,17 @@ class LiveTrial(object):
                                                  "remaining_sec": valid_until - now}
                         if detail is not None:
                             self._last_diagnostic['detail'] = detail
+                        # A still-valid but too-short proposal sends nothing.
+                        # Try one fresh observation while the last intent
+                        # can still run under its independent relay deadline.
+                        if (last_valid_until is not None and not short_window_rechecked
+                                and now < valid_until and now + .005 < last_valid_until
+                                and limiting in ("latest_sensors", "depth_gate", "snapshot",
+                                                 "scan", "depth", "color")):
+                            short_window_rechecked = True
+                            timing = result["motion_timing"]
+                            timing["short_window_rechecks"] = timing.get("short_window_rechecks", 0) + 1
+                            continue
                         if (first_sent_at is None and now < pre_motion_retry_until
                                 and limiting not in ("relay", "trial", "model_color", "model_scan")):
                             if sampler is not None and sampler_started:
@@ -1517,6 +1531,7 @@ class LiveTrial(object):
                 sequence += 1
                 last_sent_at = now
                 last_valid_until = valid_until
+                short_window_rechecked = False
                 now = self._now()
                 if now >= deadline:
                     raise checks._StopError("time_limit")

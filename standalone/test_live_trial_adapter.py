@@ -1717,6 +1717,39 @@ def test_motion_never_submits_an_intent_with_too_little_time_to_reach_the_relay(
     assert all(json.loads(line)['linear'] == 0.0 for line in relay.transport.lines)
 
 
+@pytest.mark.parametrize('recovery_delay,recovered', [(0.0, True), (0.125, False)])
+def test_short_valid_refresh_rechecks_once_without_extending_previous_intent(recovery_delay, recovered):
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    relay = mod.RelayAdapter(Transport(), clock)
+    checked = []
+
+    def validity(_sample):
+        if relay.had_motion:
+            checked.append(clock.now())
+            if len(checked) == 1:
+                return clock.now() + .016
+            if len(checked) == 2:
+                clock.sleep(recovery_delay)
+            else:
+                return None
+        return clock.now() + .10
+
+    adapter.current_valid_until = validity
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    frames = [json.loads(line) for line in relay.transport.lines]
+    moving = [frame for frame in frames if frame['linear'] > 0]
+    assert result['motion_timing']['short_window_rechecks'] == 1
+    assert len(moving) == (2 if recovered else 1)
+    assert frames[-1]['linear'] == 0.0
+    if recovered:
+        assert moving[1]['stamp'] < moving[0]['expires_at']
+
+
 def test_unavailable_latest_sensor_preserves_its_failure_reason():
     mod = module()
     clock = Clock()

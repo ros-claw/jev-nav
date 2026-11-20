@@ -159,7 +159,8 @@ def make_relay(clock, motion_limit_sec=0.3):
 def make_ros_monitor(clock, driver_pid, master_uri):
     from live_monitors import Ros1ReadOnlyBackend, RosCallerMonitor
     backend = Ros1ReadOnlyBackend(master_uri, clock, rpc_timeout=0.2)
-    return RosCallerMonitor(backend, clock, driver_pid, poll_interval=0.1, max_age=0.3,
+    # Read the most recent watchdog packet more frequently between graph RPCs.
+    return RosCallerMonitor(backend, clock, driver_pid, poll_interval=0.05, max_age=0.3,
                             acquire_timeout=1.0, bind_timeout=0.35)
 
 

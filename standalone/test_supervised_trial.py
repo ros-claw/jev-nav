@@ -42,6 +42,7 @@ def test_trial_uses_independent_heartbeat_without_starting_a_process_at_construc
 def test_trial_monitor_allows_ros_rpc_scheduling_delay_without_changing_watchdog_freshness():
     guard = make_ros_monitor(RealClock(), 11139, 'http://localhost:11311')
     assert guard.backend.rpc_timeout == 0.2
+    assert guard.poll_interval == 0.05
     assert guard.max_age == 0.3
     assert guard.bind_timeout == 0.35
 
