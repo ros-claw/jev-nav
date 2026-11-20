@@ -185,6 +185,22 @@ class Collector(harness.StatusCollector):
                 self.errors.append('ROS graph query failed')
 
 
+def check_expiry_during_pause(pause, expires, stop_at, commands, serial_last_nonzero):
+    """Require a stop before the paused producer can request one itself.
+
+    ROS and the fake serial driver publish on a 50 ms cycle; 80 ms is the
+    allowed observation/propagation tolerance, not an extension of intent.
+    """
+    tolerance = 0.08
+    if not (pause['start'] <= expires < pause['end'] and
+            pause['start'] <= stop_at < pause['end'] and stop_at <= expires + tolerance):
+        raise RuntimeError('intent expiry did not stop the relay during the pause')
+    if (serial_last_nonzero > expires + tolerance or
+            any(stamp > expires + tolerance and (linear != 0 or angular != 0)
+                for stamp, linear, angular, _caller in commands)):
+        raise RuntimeError('nonzero output continued beyond the expiry tolerance')
+
+
 def main(case):
     scenario = case
     if case in ('sync_long', 'sync_long_expired'):
@@ -277,6 +293,15 @@ def main(case):
                 or stop_line not in ('STOP requested_stop\n', 'FAULT intent_deadline\n')
                 or summary['trial_reason'] not in expected_reasons):
             raise RuntimeError('unrefreshed intent did not permanently stop the worker')
+        if (scenario == 'sync_long_expired' and fault != 'setpoint_expired'
+                and stop_line != 'FAULT intent_deadline\n'):
+            raise RuntimeError('synchronous pause did not trigger an intent deadline')
+        prior = [item['frame']['expires_at'] for item in writes
+                 if item['at'] <= pause['start'] and item['frame']['linear'] > 0]
+        if not prior:
+            raise RuntimeError('no wire intent deadline before pause')
+        check_expiry_during_pause(pause, prior[-1], stop_at, commands,
+                                  summary['last_nonzero_monotonic_s'])
         extra['worker_fault'] = fault
         extra['pause_started_after_first_nonzero'] = True
     elif summary['serial_nonzero_span_sec'] <= 1.0:
