@@ -98,6 +98,12 @@ and its transform before reusing a projection. The perception worker waits
 up to 20 ms for an exact cache result during the final depth check. A missing
 projection cannot authorize a command.
 
+Use `--split-sensor-checks` with prepared mode to run scan and depth checks
+on separate workers. Each part keeps its original acquisition deadline
+and pose. The combined result also checks current state and frame identity,
+and uses the earliest applicable expiry. Confirmed obstacles latch the
+split worker fault for the trial. This remains an opt-in experiment.
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

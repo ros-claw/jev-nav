@@ -254,7 +254,14 @@ class ObservationAdapter(object):
         return self.observation.prepare_command_evidence(sample)
 
     def read_command_evidence(self, sample):
+        split = getattr(self.observation, '_split_validation', None)
+        if split is not None:
+            proof, issue = split.read(sample)
+            return (proof['valid_until'], None) if proof is not None else (None, issue)
         return self.observation.read_command_evidence(sample, sample.get('_command_evidence'))
+
+    def updates_prepared_evidence(self):
+        return getattr(self.observation, '_split_validation', None) is not None
 
     def current_valid_until(self, sample):
         if not self._acquire_processing():
@@ -1214,6 +1221,7 @@ class LiveTrial(object):
             first_sent_at = last_sent_at = None
             last_valid_until = None
             short_window_rechecked = False
+            refresh_prepared = self.PREPARED_COMMANDS and self.source.updates_prepared_evidence()
             initial_sample_used = None
             path, sequence = 0.0, self.relay.sequence + 1
             result["stage"] = "motion_loop"
@@ -1250,7 +1258,7 @@ class LiveTrial(object):
                         if proof is None and issue not in (
                                 'scan_generation_changed', 'depth_generation_changed',
                                 'depth_replaced_during_retry', 'depth_preprojection_pending',
-                                'stale_snapshot', 'timestamps'):
+                                'stale_snapshot', 'timestamps', 'split_proof_pending'):
                             if self._motion_started or issue not in ('new_scan', 'new_depth_unchecked'):
                                 return issue or 'sensor_unavailable', None
                         candidate['_command_evidence'] = proof
@@ -1285,7 +1293,7 @@ class LiveTrial(object):
                             else:
                                 self.clock.sleep(.01)
                             continue
-                        if pending['sample'] is initial_sample_used:
+                        if pending['sample'] is initial_sample_used and not refresh_prepared:
                             result['initial_preparation']['same_sample'] += 1
                             if self.relay.send_zero_heartbeat() is not True:
                                 raise checks._StopError('relay_failure')
@@ -1477,14 +1485,15 @@ class LiveTrial(object):
                     limits["serial_monitor"] = serial_limit() if callable(serial_limit) else None
                     prepared_issue = None
                     if self.PREPARED_COMMANDS:
-                        if first_sent_at is None and current.get('_command_evidence') is not None:
+                        final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
+                        if first_sent_at is None and final_sensor_until is not None:
                             start = current.get('_stationary_checked_at')
                             end = self._now()
                             if (not checks._finite(start) or not checks._stationary_trace_valid(
                                     self.source.stationary_trace(start, end), start, end,
                                     sample['epoch'], sample['image_pose'], max_gap_sec=.15)):
                                 raise checks._StopError('stationary_trace_invalid')
-                        final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
+                            final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
                         sensor_checked = self._now()
                     now = self._now()
                     check = {"sample_at": current["snapshot_at"], "sensor_check_started_at": check_started,
@@ -1512,8 +1521,9 @@ class LiveTrial(object):
                             label = detail if isinstance(detail, str) and 0 < len(detail) <= 128 else 'unavailable'
                             reasons = result['initial_preparation']['sensor_rejections']
                             reasons[label] = reasons.get(label, 0) + 1
-                        if self.PREPARED_COMMANDS and detail in (
-                                'prepared_pending', 'prepared_scan_advanced', 'prepared_depth_advanced'):
+                        if self.PREPARED_COMMANDS and (detail in (
+                                'prepared_pending', 'prepared_scan_advanced', 'prepared_depth_advanced')
+                                or first_sent_at is None and detail in ('new_scan', 'new_depth_unchecked')):
                             # Withhold a new command while waiting for a
                             # complete proof. The previous deadline stands.
                             sampler.wait_next(current, .005)
@@ -1557,6 +1567,8 @@ class LiveTrial(object):
                         if (first_sent_at is None and now < pre_motion_retry_until
                                 and limiting not in ("relay", "trial", "model_color", "model_scan")):
                             if sampler is not None and sampler_started:
+                                if refresh_prepared:
+                                    sampler.wait_next(current, .005)
                                 continue
                             self.clock.sleep(0.01)
                             current, now = self._aligned_stationary_sample(sample)

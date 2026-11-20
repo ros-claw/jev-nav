@@ -65,6 +65,26 @@ def test_prepared_command_requires_unchanged_sensor_generation_and_current_state
     assert observer.read_command_evidence(sample, evidence) == (None, reason)
 
 
+def test_split_proof_combines_current_parts_with_original_deadlines(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    sample['scan_at'] = now
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', lambda *_: True)
+    _, scan_input = observer._capture_split_input('scan', sample)
+    scan, issue = observer._check_split_input('scan', sample, scan_input)
+    assert issue is None
+    _, depth_input = observer._capture_split_input('depth', sample)
+    depth, issue = observer._check_split_input('depth', sample, depth_input)
+    assert issue is None and depth['expires'] < scan['expires']
+    proof, issue = observer._combine_split_proof(sample, scan, depth)
+    assert issue is None and proof['valid_until'] == depth['expires']
+    observer.latest['depth'] = dict(observer.latest['depth'])
+    assert observer._combine_split_proof(sample, scan, depth) == (None, 'prepared_depth_advanced')
+
+
 @pytest.mark.parametrize('changed', ('odom', 'scan', 'depth', 'status', 'epoch', 'guard', 'transform', 'calibration'))
 def test_slow_scan_check_does_not_block_sensors_or_accept_unchecked_updates(changed, monkeypatch):
     observer, sample = observer_and_sample()

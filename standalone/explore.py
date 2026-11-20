@@ -643,6 +643,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 depth_event = getattr(self, '_depth_event', None)
                 if depth_event is not None and name in ('depth', 'info'):
                     depth_event.set()
+                split = getattr(self, '_split_validation', None)
+                if split is not None:
+                    split.notify_input(name)
                 if name == "odom":
                     entry["epoch"] = self.epoch
                     self.odom_history.append(entry)
@@ -906,6 +909,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         """
         try:
             self._depth_projection_pending = False
+            self._depth_obstacle_detected = False
             if self.depth_projection_config is None or not transform_matches(
                     self.depth_extrinsics, self.depth_extrinsics):
                 return False
@@ -946,7 +950,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 self._depth_projection_pending = True
                 return False
             candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': corridor}}
-            return ProjectedDepthGate().assess(candidate, now).get('candidate') is True
+            assessment = ProjectedDepthGate().assess(candidate, now)
+            self._depth_obstacle_detected = assessment.get('reason') == 'depth_obstacle'
+            return assessment.get('candidate') is True
         except Exception:  # noqa: BLE001 - an unprocessed depth frame must veto
             return False
 
@@ -1028,9 +1034,103 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def prepare_command_evidence(self, sample):
         """Build the same final proof on the perception worker."""
+        split = getattr(self, '_split_validation', None)
+        if split is not None:
+            return split.prepare(sample)
         failure, evidence = [None], {}
         deadline = self._current_valid_until_once(sample, failure, evidence)
         return (evidence, None) if deadline is not None else (None, failure[0])
+
+    def start_split_validation(self):
+        from split_sensor_validation import SplitSensorValidation
+        self._split_validation = SplitSensorValidation(self._capture_split_input, self._check_split_input,
+                                                        self._combine_split_proof)
+
+    def close_split_validation(self):
+        return self._split_validation.close()
+
+    def _capture_split_input(self, stream, _sample):
+        with self.lock:
+            entry = self.latest.get(stream)
+            info = self.latest.get('info') if stream == 'depth' else None
+            calibration = None
+            if info is not None:
+                msg = info['message']
+                calibration = (msg.header.frame_id, msg.width, msg.height, tuple(msg.K))
+            signature = self.extrinsics if stream == 'scan' else self.depth_extrinsics
+            stamp = entry.get('stamp') if entry else None
+            return (self.epoch, id(entry), stamp, calibration, signature), (self.epoch, entry, info)
+
+    def _check_split_input(self, stream, sample, inputs):
+        epoch, entry, info = inputs
+        with self.lock:
+            if self.epoch != epoch or self.epoch != sample['epoch'] or self.clock_guard.faulted or self.odom_guard.faulted:
+                return None, 'epoch_or_guard'
+            if self.latest.get(stream) is not entry:
+                return None, 'prepared_' + stream + '_advanced'
+            if stream == 'depth' and not _same_depth_intrinsics(self.latest.get('info'), info):
+                return None, 'prepared_depth_advanced'
+            if not entry or 'odom' not in self.latest:
+                return None, 'prepared_pending'
+            probe = copy.copy(self)
+            probe.latest = dict(self.latest)
+            probe.odom_history = list(self.odom_history)[-150:]
+            probe.depth_projection_config = copy.copy(self.depth_projection_config)
+            odom = self.latest['odom']
+        now = _monotonic()
+        stamp = entry['stamp']
+        max_age = .3 if stream == 'scan' else LATEST_INPUT_MAX_AGE_SEC
+        if (not 0 <= now - stamp < max_age or not 0 <= now - odom['stamp'] < LATEST_INPUT_MAX_AGE_SEC
+                or stamp < sample[stream + '_at'] or now >= sample['snapshot_at'] + .25):
+            return None, 'prepared_pending'
+        expires = stamp + max_age
+        if stream == 'scan' and stamp != sample['scan_at']:
+            aligned = nearest_odometry(probe.odom_history, stamp)
+            if aligned is None or aligned.get('epoch') != epoch:
+                return None, 'scan_alignment_pending'
+            if not probe._cached_newest_scan_safe_locked(sample, entry, aligned, odom, now):
+                from forward_trial import _raw_scan
+                raw = {key: getattr(entry['message'], key) for key in
+                       ('ranges', 'angle_min', 'angle_increment', 'range_min', 'range_max', 'time_increment')}
+                raw.update({'stamp': stamp, 'frame_id': entry['message'].header.frame_id})
+                reason, _ = _raw_scan({'raw_scan': raw, 'scan_at': stamp, 'pose': odom['pose'],
+                                       'laser_extrinsics': probe.extrinsics[:2] + (probe.extrinsics[5],),
+                                       'scene': {'coverage': {'scan_pose': aligned['pose']}}},
+                                      need_canonical=False, return_counts=True)
+                if reason == 'front_blocked':
+                    return None, reason
+                return None, 'new_scan'
+            expires = min(expires, probe._scan_veto_valid_until)
+        if stream == 'depth':
+            probe._prepared_depth_only = getattr(self, '_depth_worker', None) is not None
+            if not probe._newest_depth_safe_locked(sample, entry, odom, now):
+                if probe._depth_projection_pending:
+                    return None, 'depth_preprojection_pending'
+                return None, 'depth_obstacle' if probe._depth_obstacle_detected else 'new_depth_unchecked'
+        return {'entry': entry, 'info': info, 'pose': odom['pose'], 'odom_at': odom['stamp'],
+                'expires': expires, 'at': now, 'epoch': epoch, 'extrinsics': probe.extrinsics,
+                'depth_extrinsics': probe.depth_extrinsics, 'config': probe.depth_projection_config}, None
+
+    def _combine_split_proof(self, sample, scan, depth):
+        with self.lock:
+            odom, status = self.latest.get('odom'), self.latest.get('status')
+            if not odom or not status:
+                return None, 'prepared_pending'
+            deadline = min(scan['expires'], depth['expires'], sample['snapshot_at'] + .25,
+                           sample['scan_at'] + .5, sample['depth_at'] + .5, sample['color_at'] + .5,
+                           sample['status_at'] + 1., status['stamp'] + 1.,
+                           odom['stamp'] + LATEST_INPUT_MAX_AGE_SEC)
+        if (scan['epoch'] != depth['epoch'] or scan['extrinsics'] != depth['extrinsics']
+                or scan['depth_extrinsics'] != depth['depth_extrinsics'] or scan['config'] != depth['config']):
+            return None, 'transform_changed'
+        evidence = {'epoch': scan['epoch'], 'scan': scan['entry'], 'depth': depth['entry'],
+                    'info': depth['info'], 'poses': (sample['pose'], scan['pose'], depth['pose']),
+                    'odom_at': max(scan['odom_at'], depth['odom_at']), 'status_at': status['stamp'],
+                    'checked_at': max(scan['at'], depth['at']), 'valid_until': deadline,
+                    'extrinsics': scan['extrinsics'], 'depth_extrinsics': depth['depth_extrinsics'],
+                    'config': depth['config']}
+        checked, issue = self.read_command_evidence(sample, evidence)
+        return (evidence, None) if checked is not None else (None, issue)
 
     def read_command_evidence(self, sample, evidence):
         """Recheck freshness and continuity without projecting a sensor frame."""
