@@ -99,7 +99,8 @@ def main(argv=None):
                 age = (message.header.stamp - message.scan_stamp).to_sec() if message.scan_fresh else None
                 with lock:
                     snapshots.append((phase[0], _monotonic() - phase[1], message.scan_fresh, age,
-                                      grid.data[y * grid.info.width + x]))
+                                      grid.data[y * grid.info.width + x], message.scan_stamp.to_sec(),
+                                      message.header.stamp.to_sec()))
 
         snapshot_sub = rospy.Subscriber('/' + namespace + '/rolling_costmap/costmap/snapshot/fresh_grid',
                                         FreshGrid, snapshot_callback, queue_size=10)
@@ -154,15 +155,31 @@ def main(argv=None):
             raise RuntimeError('layer_connections_timeout')
 
         dynamic = Client('/' + namespace + '/rolling_costmap/costmap/fresh_laser', timeout=3)
-        phases = (('fresh', 3.0, 'valid'), ('dropout', 1.4, None), ('old', 1.2, 'old'),
+        phases = (('fresh', 3.0, 'valid'), ('regressed', 1.2, 'regressed'),
+                  ('recovered_regression', 1.2, 'valid'), ('dropout', 1.4, None), ('old', 1.2, 'old'),
                   ('recovered', 1.6, 'valid'), ('unknown', 1.2, 'unknown'),
                   ('disabled', 1.2, 'valid'), ('reenabled', 1.2, 'valid'),
                   ('depth', 1.5, 'valid'), ('retained_depth', 1.2, 'valid'))
+        regressed_stamp = None
         for label, duration, scan_type in phases:
             if label == 'disabled':
                 dynamic.update_configuration({'enabled': False})
             elif label == 'reenabled':
                 dynamic.update_configuration({'enabled': True})
+            if label == 'regressed':
+                handshake_deadline = _monotonic() + 5.0
+                while _monotonic() < handshake_deadline:
+                    stamp = rospy.Time.now()
+                    publish_tf(stamp)
+                    publish_scan(stamp, 'valid')
+                    with lock:
+                        recent_stamps = [item[5] for item in snapshots if item[0] == 'fresh' and item[2]]
+                    if recent_stamps and 0 <= stamp.to_sec() - max(recent_stamps) < .14:
+                        regressed_stamp = rospy.Time.from_sec(max(recent_stamps)) - rospy.Duration(.01)
+                        break
+                    time.sleep(.03)
+                if regressed_stamp is None:
+                    raise RuntimeError('regression_test_missing_recent_scan')
             with lock:
                 phase[:] = [label, _monotonic()]
             until = _monotonic() + duration
@@ -172,7 +189,8 @@ def main(argv=None):
                 stamp = rospy.Time.now()
                 publish_tf(stamp)
                 if scan_type is not None:
-                    scan_stamp = stamp - rospy.Duration(2.0) if scan_type == 'old' else stamp
+                    scan_stamp = (stamp - rospy.Duration(2.0) if scan_type == 'old' else
+                                  regressed_stamp if scan_type == 'regressed' else stamp)
                     publish_scan(scan_stamp, scan_type)
                 if label == 'depth':
                     header = Header(stamp=stamp, frame_id='base_link')
@@ -189,8 +207,9 @@ def main(argv=None):
                 for name, _, _ in phases}
         normal_result = (not all(late.values()) or not any(value == 0 for value in late['fresh'])
                          or not any(value == 0 for value in late['recovered'])
+                         or not any(value == 0 for value in late['recovered_regression'])
                          or not any(value == 0 for value in late['reenabled'])
-                         or any(value != -1 for name in ('dropout', 'old', 'unknown', 'disabled')
+                         or any(value != -1 for name in ('regressed', 'dropout', 'old', 'unknown', 'disabled')
                                 for value in late[name])
                          or any(value != 100 for name in ('depth', 'retained_depth') for value in late[name]))
         if normal_result:
@@ -204,7 +223,7 @@ def main(argv=None):
                 or any(source != 'unavailable' or age is not None
                        for name in ('dropout', 'old', 'disabled') for source, age in checked_late[name])):
             raise RuntimeError('scan_evidence_expectations_failed:' + json.dumps(checked_late, sort_keys=True))
-        snapshots_late = {name: [(fresh, age, value) for label, elapsed, fresh, age, value in captured
+        snapshots_late = {name: [(fresh, age, value) for label, elapsed, fresh, age, value, _, _ in captured
                                  if label == name and elapsed >= .7] for name, _, _ in phases}
         if (not all(snapshots_late.values())
                 or not any(fresh and age is not None and 0 <= age <= .3 and value == 0
@@ -214,6 +233,11 @@ def main(argv=None):
                 or any(value != 100 for name in ('depth', 'retained_depth')
                        for _, _, value in snapshots_late[name])):
             raise RuntimeError('bound_grid_expectations_failed:' + json.dumps(snapshots_late, sort_keys=True))
+        early_regression = [(fresh, value, stamp) for label, elapsed, fresh, _, value, _, stamp in captured
+                            if label == 'regressed' and elapsed >= .03
+                            and 0 <= stamp - regressed_stamp.to_sec() <= .3]
+        if not any(not fresh and value == -1 for fresh, value, _ in early_regression):
+            raise RuntimeError('fresh_regressed_scan_not_rejected:' + json.dumps(early_regression))
         print(json.dumps({'mode': 'synthetic_fresh_laser_probe', 'motion_requested': False,
                           'global_tf_published': False, 'phase_cells': late,
                           'scan_evidence_phase_counts': {name: len(items) for name, items in checked_late.items()},

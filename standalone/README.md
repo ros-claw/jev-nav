@@ -63,9 +63,10 @@ base configuration does not publish that transform. The standard obstacle
 layer can retain old free cells. The optional experimental native layer resets
 laser free space on each update and exposes the final grid and the scan's
 acquisition timestamp in a single `FreshGrid` message. It requires a recent
-scan and rejects unsafe laser and unknown-space configurations. A delayed,
-older scan can still replace a newer scan while both are within the age
-limit; monotonic scan ordering has not been enforced. The separate
+scan and rejects unsafe laser and unknown-space configurations. A delayed scan
+older than the last accepted scan is rejected, including while it is within
+the age limit. After a clock or sensor timestamp reset, scans remain unavailable
+until their timestamps catch up or the layer is restarted. The separate
 depth layer retains marked obstacles, but its frame freshness and validity are
 not bound to the grid. The depth height thresholds and camera rectification
 remain unverified; unobserved space remains unknown. None of these grids is a

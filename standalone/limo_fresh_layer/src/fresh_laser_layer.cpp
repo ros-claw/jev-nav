@@ -78,7 +78,9 @@ class FreshLaserLayer : public costmap_2d::ObstacleLayer {
       if (fresh) {
         const ros::Time stamp = observations[0].cloud_->header.stamp;
         const double age = (ros::Time::now() - stamp).toSec();
-        fresh = !stamp.isZero() && std::isfinite(age) && age >= 0 && age <= max_scan_age_;
+        // A delayed scan must not replace a newer accepted observation.
+        fresh = !stamp.isZero() && stamp >= accepted_scan_stamp_
+                && std::isfinite(age) && age >= 0 && age <= max_scan_age_;
       }
       resetMaps();
       if (fresh) {
