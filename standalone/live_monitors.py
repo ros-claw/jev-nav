@@ -616,13 +616,17 @@ class SerialOwnershipMonitor(_AsyncMonitor):
         return [sample['fuser_at'] + 1.2]
 
     def valid_until(self):
-        own = _AsyncMonitor.valid_until(self)
+        own = self.local_command_deadline()
         if own is None:
             return None
         if self.ros_monitor is None:
             return own
         linked = self.ros_monitor.valid_until()
         return min(own, linked) if _number(linked) else None
+
+    def local_command_deadline(self):
+        """Check serial evidence when the caller separately checks the ROS guard."""
+        return _AsyncMonitor.valid_until(self)
 
     def acquire(self):
         if not _AsyncMonitor.acquire(self):

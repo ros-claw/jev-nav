@@ -99,10 +99,14 @@ up to 20 ms for an exact cache result during the final depth check. A missing
 projection cannot authorize a command.
 
 Use `--split-sensor-checks` with prepared mode to run scan and depth checks
-on separate workers. Each part keeps its original acquisition deadline
-and pose. The combined result also checks current state and frame identity,
-and uses the earliest applicable expiry. Confirmed obstacles latch the
-split worker fault for the trial. This remains an opt-in experiment.
+on separate workers. The first command uses the synchronous check and
+seeds the workers with its existing deadline. Each subsequent command
+checks current state and uses the earliest applicable expiry. At most
+two pending arrivals per sensor can be tolerated within the previous
+proof, with its deadline capped by the oldest pending receipt and
+the 70 ms renewal budget. A pending frame contributes no clearance.
+Confirmed obstacles latch the split worker fault. This remains an opt-in
+experiment and has yet to sustain motion on the robot.
 
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also

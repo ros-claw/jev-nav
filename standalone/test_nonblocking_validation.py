@@ -71,6 +71,7 @@ def test_split_proof_combines_current_parts_with_original_deadlines(monkeypatch)
     now = sample['snapshot_at']
     observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
     sample['scan_at'] = now
+    sample['_front_coverage_valid_until'] = now + .22
     monkeypatch.setattr(explore, '_monotonic', lambda: now)
     monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', lambda *_: True)
     _, scan_input = observer._capture_split_input('scan', sample)
@@ -80,9 +81,40 @@ def test_split_proof_combines_current_parts_with_original_deadlines(monkeypatch)
     depth, issue = observer._check_split_input('depth', sample, depth_input)
     assert issue is None and depth['expires'] < scan['expires']
     proof, issue = observer._combine_split_proof(sample, scan, depth)
-    assert issue is None and proof['valid_until'] == depth['expires']
+    assert issue is None and proof['valid_until'] == min(depth['expires'], now + .070)
     observer.latest['depth'] = dict(observer.latest['depth'])
     assert observer._combine_split_proof(sample, scan, depth) == (None, 'prepared_depth_advanced')
+
+
+def test_split_pending_frame_does_not_extend_prior_proof(monkeypatch):
+    import explore
+    from relay import RelayGate
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    sample['scan_at'] = now
+    observer.latest['depth']['generation'] = 4
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    evidence, issue = observer.prepare_command_evidence(sample)
+    assert issue is None
+    evidence['valid_until'] = now + .04
+    observer.latest['depth'] = {'generation': 5, 'stamp': now + .01, 'received_at': now + .02}
+    monkeypatch.setattr(explore, '_monotonic', lambda: now + .03)
+    deadline, issue = observer.read_command_evidence(sample, evidence, True)
+    assert deadline == now + .04 and issue is None
+    relay = RelayGate(now, max_motion_sec=2., require_intent_deadline=True)
+    assert relay.accept({'sequence': 0, 'stamp': now + .03, 'linear': .02, 'angular': 0.,
+                         'expires_at': deadline}, now + .03)
+    assert observer.read_command_evidence(sample, evidence) == (None, 'prepared_depth_advanced')
+    observer.latest['depth']['generation'] = 6
+    assert observer.read_command_evidence(sample, evidence, True) == (None, 'prepared_depth_advanced')
+    assert relay.command(deadline) == (0., 0.) and relay.reason == 'intent_deadline'
+
+
+def test_command_evidence_does_not_wait_for_a_busy_ros_lock():
+    observer, sample = observer_and_sample()
+    with observer.lock:
+        assert observer.read_command_evidence(sample, None, nonblocking=True) == (None, 'prepared_pending')
 
 
 @pytest.mark.parametrize('changed', ('odom', 'scan', 'depth', 'status', 'epoch', 'guard', 'transform', 'calibration'))

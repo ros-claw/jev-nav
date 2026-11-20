@@ -6,6 +6,33 @@ import collections
 import threading
 
 from relay import _monotonic
+from processed_evidence import _number
+
+
+def pending_sensor_deadline(latest, checked, now, max_age, history=()):
+    """Shorten a live proof to the oldest of at most two pending arrivals."""
+    if not latest or not checked:
+        return None
+    generation, previous = latest.get('generation'), checked.get('generation')
+    if (generation is None or previous is None or not 1 <= generation - previous <= 2
+            or not _number(checked.get('stamp'))):
+        return None
+    pending = [(latest.get('stamp'), latest.get('received_at'))]
+    if generation == previous + 2:
+        intermediate = next(((stamp, receipt) for index, stamp, receipt in history
+                             if index == previous + 1), None)
+        if intermediate is None:
+            return None
+        pending.insert(0, intermediate)
+    deadline, stamp_before, receipt_before = None, checked['stamp'], 0.
+    for stamp, received in pending:
+        if (not _number(stamp) or not _number(received) or not stamp_before < stamp <= received <= now
+                or received < receipt_before):
+            return None
+        candidate = min(received + .070, stamp + max_age)
+        deadline = candidate if deadline is None else min(deadline, candidate)
+        stamp_before, receipt_before = stamp, received
+    return deadline if now < deadline else None
 
 
 class SplitSensorValidation(object):
@@ -62,7 +89,10 @@ class SplitSensorValidation(object):
                         self._fault = issue
                         self._cv.notifyAll()
                     if job is self._job:
-                        self._parts[stream] = (part, issue)
+                        waiting = retry or issue in ('prepared_scan_advanced', 'prepared_depth_advanced',
+                                                     'scan_coverage_pending')
+                        if not waiting or stream not in self._parts:
+                            self._parts[stream] = (part, issue)
                         if issue in self.STOPS and self._job_fault is None:
                             self._job_fault = issue
                         self._cv.notifyAll()
@@ -73,13 +103,21 @@ class SplitSensorValidation(object):
                 self._fault = 'split_worker_failed'
                 self._cv.notifyAll()
 
+    def _replace_locked(self, sample, parts):
+        self._job, self._parts, self._job_fault = sample, parts, None
+        for event in self._input_ready.values():
+            event.set()
+        self._cv.notifyAll()
+
+    def seed(self, sample, scan, depth):
+        """Publish the already checked initial proof without changing expiry."""
+        with self._cv:
+            self._replace_locked(sample, {'scan': (scan, None), 'depth': (depth, None)})
+
     def prepare(self, sample, budget=.075):
         deadline = min(_monotonic() + budget, sample['snapshot_at'] + .25)
         with self._cv:
-            self._job, self._parts, self._job_fault = sample, {}, None
-            for event in self._input_ready.values():
-                event.set()
-            self._cv.notifyAll()
+            self._replace_locked(sample, {})
             while True:
                 proof, issue = self._read_locked(sample)
                 if proof is not None or issue not in (
@@ -92,7 +130,7 @@ class SplitSensorValidation(object):
                     return None, 'split_proof_pending'
                 self._cv.wait(remaining)
 
-    def _read_locked(self, sample):
+    def _read_locked(self, sample, nonblocking=False):
         if self._closed or self._fault is not None:
             return None, self._fault or 'split_worker_closed'
         if sample is not self._job:
@@ -101,11 +139,17 @@ class SplitSensorValidation(object):
             return None, self._job_fault
         if any(self._parts.get(name, (None,))[0] is None for name in self.STREAMS):
             return None, 'prepared_pending'
+        if nonblocking:
+            return self.combine(sample, self._parts['scan'][0], self._parts['depth'][0], nonblocking=True)
         return self.combine(sample, self._parts['scan'][0], self._parts['depth'][0])
 
     def read(self, sample):
-        with self._cv:
-            return self._read_locked(sample)
+        if not self._cv.acquire(False):
+            return None, 'prepared_pending'
+        try:
+            return self._read_locked(sample, nonblocking=True)
+        finally:
+            self._cv.release()
 
     def counts(self):
         with self._cv:

@@ -592,6 +592,25 @@ def test_new_scan_cache_reuses_only_same_scene_pose_and_unexpired_rays(monkeypat
     assert len(calls) == 5
 
 
+def test_new_scan_veto_distinguishes_sparse_coverage_from_measured_blockage():
+    from explore import newest_scan_veto
+
+    class Scan(object):
+        header = type('Header', (object,), {'frame_id': 'laser_link'})()
+        angle_min, angle_increment = -.3, .02
+        range_min, range_max, time_increment = .1, 8., 0.
+        ranges = [0.] * 33
+
+    scan, diagnostic = Scan(), {}
+    extrinsics = (.1, 0., .08, 0., 0., 0.)
+    scan.ranges[15] = 2.
+    assert not newest_scan_veto(scan, extrinsics, diagnostic=diagnostic)
+    assert diagnostic['reason'] == 'scan_coverage_pending'
+    scan.ranges[15] = .2
+    assert not newest_scan_veto(scan, extrinsics, diagnostic=diagnostic)
+    assert diagnostic['reason'] == 'front_blocked'
+
+
 def test_depth_grid_reports_spatial_gaps_not_just_global_fraction():
     array = np.full((9, 9), 2000, dtype=np.uint16)
     array[0:3, 3:6] = 0

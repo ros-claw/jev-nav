@@ -43,6 +43,7 @@ from observation_guards import ClockGuard, OdomGuard, sensors_aligned
 from policy import ForwardPolicy, assess_front
 from projected_depth_gate import ProjectedDepthGate, project_depth_frame
 from relay import _monotonic
+from split_sensor_validation import pending_sensor_deadline
 
 # The worker may have been imported before the optional local accelerator was
 # discoverable. Reuse the loader's verified binary regardless of import order.
@@ -312,7 +313,7 @@ def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, curren
 
 
 def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
-                     scene_pose=None, scan_pose=None, current_pose=None):
+                     scene_pose=None, scan_pose=None, current_pose=None, diagnostic=None):
     """Reject newly measured front hits; non-returns remain unknown.
 
     The latest scan must have bounded gaps and no measured hit in the padded
@@ -395,6 +396,8 @@ def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
         if accelerated is not None:
             blocked, crossings = accelerated
             if blocked:
+                if diagnostic is not None:
+                    diagnostic['reason'] = 'front_blocked'
                 return False
         else:
             start = from_scan((extrinsics[0], extrinsics[1]))
@@ -414,11 +417,15 @@ def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
                 y = extrinsics[1] + value * math.sin(angle)
                 x, y = from_scan((x, y))
                 if -0.20 <= x <= 0.65 and abs(y) <= 0.17:
+                    if diagnostic is not None:
+                        diagnostic['reason'] = 'front_blocked'
                     return False
                 value = crossing(start, (x, y))
                 if value is not None:
                     crossings.append(value)
         if not crossings or gap(crossings) > 0.07:
+            if diagnostic is not None:
+                diagnostic['reason'] = 'scan_coverage_pending'
             return False
         if not have_history:
             return gap(crossings) <= 0.035
@@ -541,6 +548,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.listener = tf.TransformListener()
         self.lock = threading.Lock()
         self.latest = {}
+        self._sensor_generations = {'scan': 0, 'depth': 0}
+        self._sensor_receipts = {name: collections.deque(maxlen=4) for name in self._sensor_generations}
         self.odom_history = collections.deque(maxlen=600)
         self.fusion = None
         self.extrinsics = None
@@ -639,6 +648,11 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self.epoch += 1
                     self.epoch_issue = {'reason': 'sensor_time_regression', 'sensor': name}
                     return
+                generations = getattr(self, '_sensor_generations', None)
+                if generations is not None and name in generations:
+                    generations[name] += 1
+                    entry['generation'] = generations[name]
+                    self._sensor_receipts[name].append((entry['generation'], stamp, received))
                 self.latest[name] = entry
                 depth_event = getattr(self, '_depth_event', None)
                 if depth_event is not None and name in ('depth', 'info'):
@@ -959,6 +973,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     def _cached_newest_scan_safe_locked(self, sample, scan, aligned, odom, now):
         """Reuse a scan assessment only for the same owned scene and poses."""
         try:
+            self._scan_veto_issue = None
             scene = sample['scene']
             message = scan['message']
             rays, hits = scene['rays'], scene['occupied_hits']
@@ -973,12 +988,19 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                    message.range_min, message.range_max, message.time_increment, tuple(message.ranges),
                    scene.get('status'), scene.get('coverage', {}).get('sensor_fresh'), scene_signature)
             entries = getattr(self, '_scan_veto_cache', [])
-            for cached_scene, cached_key, expires, accepted in entries:
+            for cached_scene, cached_key, expires, accepted, issue in entries:
                 if cached_scene is scene and cached_key == key and now < expires:
                     self._scan_veto_valid_until = expires if accepted else None
+                    self._scan_veto_issue = issue
                     return accepted
-            accepted = newest_scan_veto(message, self.extrinsics, scene, now, scan['stamp'],
-                                        sample['pose'], aligned['pose'], odom['pose'])
+            diagnostic = {}
+            args = (message, self.extrinsics, scene, now, scan['stamp'],
+                    sample['pose'], aligned['pose'], odom['pose'])
+            if getattr(self, '_split_validation', None) is not None:
+                accepted = newest_scan_veto(*args, **{'diagnostic': diagnostic})
+            else:
+                accepted = newest_scan_veto(*args)
+            self._scan_veto_issue = diagnostic.get('reason')
             expiry = min(now + 0.1, scan['stamp'] + 0.3)
             if accepted:
                 stamps = [ray['stamp'] for ray in scene['rays'] if _finite(ray.get('stamp'))
@@ -995,7 +1017,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         expiry = future
                     else:
                         expiry = conservative_expiry
-            self._scan_veto_cache = (entries + [(scene, key, expiry, accepted)])[-4:]
+            self._scan_veto_cache = (entries + [(scene, key, expiry, accepted, self._scan_veto_issue)])[-4:]
             self._scan_veto_valid_until = expiry if accepted else None
             return accepted
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
@@ -1037,9 +1059,22 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         split = getattr(self, '_split_validation', None)
         if split is not None:
             return split.prepare(sample)
+        return self.prepare_initial_command_evidence(sample)
+
+    def prepare_initial_command_evidence(self, sample):
         failure, evidence = [None], {}
         deadline = self._current_valid_until_once(sample, failure, evidence)
         return (evidence, None) if deadline is not None else (None, failure[0])
+
+    def seed_split_validation(self, sample, evidence):
+        def part(stream):
+            return {'entry': evidence[stream], 'info': evidence['info'],
+                    'pose': sample['pose'], 'poses': evidence['poses'],
+                    'odom_at': evidence['odom_at'], 'expires': evidence['valid_until'],
+                    'at': evidence['checked_at'], 'epoch': evidence['epoch'],
+                    'extrinsics': evidence['extrinsics'], 'depth_extrinsics': evidence['depth_extrinsics'],
+                    'config': evidence['config']}
+        self._split_validation.seed(sample, part('scan'), part('depth'))
 
     def start_split_validation(self):
         from split_sensor_validation import SplitSensorValidation
@@ -1084,11 +1119,18 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 or stamp < sample[stream + '_at'] or now >= sample['snapshot_at'] + .25):
             return None, 'prepared_pending'
         expires = stamp + max_age
-        if stream == 'scan' and stamp != sample['scan_at']:
+        if stream == 'scan' and stamp == sample['scan_at']:
+            original = sample.get('_front_coverage_valid_until')
+            if not _finite(original) or now >= original:
+                return None, 'prepared_pending'
+            expires = min(expires, original)
+        elif stream == 'scan':
             aligned = nearest_odometry(probe.odom_history, stamp)
             if aligned is None or aligned.get('epoch') != epoch:
                 return None, 'scan_alignment_pending'
             if not probe._cached_newest_scan_safe_locked(sample, entry, aligned, odom, now):
+                if probe._scan_veto_issue in ('front_blocked', 'scan_coverage_pending'):
+                    return None, probe._scan_veto_issue
                 from forward_trial import _raw_scan
                 raw = {key: getattr(entry['message'], key) for key in
                        ('ranges', 'angle_min', 'angle_increment', 'range_min', 'range_max', 'time_increment')}
@@ -1111,8 +1153,10 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 'expires': expires, 'at': now, 'epoch': epoch, 'extrinsics': probe.extrinsics,
                 'depth_extrinsics': probe.depth_extrinsics, 'config': probe.depth_projection_config}, None
 
-    def _combine_split_proof(self, sample, scan, depth):
-        with self.lock:
+    def _combine_split_proof(self, sample, scan, depth, nonblocking=False):
+        if not self.lock.acquire(not nonblocking):
+            return None, 'prepared_pending'
+        try:
             odom, status = self.latest.get('odom'), self.latest.get('status')
             if not odom or not status:
                 return None, 'prepared_pending'
@@ -1120,58 +1164,76 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                            sample['scan_at'] + .5, sample['depth_at'] + .5, sample['color_at'] + .5,
                            sample['status_at'] + 1., status['stamp'] + 1.,
                            odom['stamp'] + LATEST_INPUT_MAX_AGE_SEC)
+        finally:
+            self.lock.release()
         if (scan['epoch'] != depth['epoch'] or scan['extrinsics'] != depth['extrinsics']
                 or scan['depth_extrinsics'] != depth['depth_extrinsics'] or scan['config'] != depth['config']):
             return None, 'transform_changed'
+        poses = (sample['pose'],) + scan.get('poses', (scan['pose'],)) + depth.get('poses', (depth['pose'],))
         evidence = {'epoch': scan['epoch'], 'scan': scan['entry'], 'depth': depth['entry'],
-                    'info': depth['info'], 'poses': (sample['pose'], scan['pose'], depth['pose']),
+                    'info': depth['info'], 'poses': poses,
                     'odom_at': max(scan['odom_at'], depth['odom_at']), 'status_at': status['stamp'],
                     'checked_at': max(scan['at'], depth['at']), 'valid_until': deadline,
                     'extrinsics': scan['extrinsics'], 'depth_extrinsics': depth['depth_extrinsics'],
                     'config': depth['config']}
-        checked, issue = self.read_command_evidence(sample, evidence)
-        return (evidence, None) if checked is not None else (None, issue)
+        checked, issue = self.read_command_evidence(
+            sample, evidence, allow_pending=True, nonblocking=nonblocking)
+        if checked is None:
+            return None, issue
+        evidence['valid_until'] = checked
+        return evidence, None
 
-    def read_command_evidence(self, sample, evidence):
+    def read_command_evidence(self, sample, evidence, allow_pending=False, nonblocking=False):
         """Recheck freshness and continuity without projecting a sensor frame."""
+        if not self.lock.acquire(not nonblocking):
+            return None, 'prepared_pending'
         try:
-            with self.lock:
-                now = _monotonic()
-                if (sample['epoch'] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
-                    return None, 'epoch_or_guard'
-                if evidence is None:
-                    return None, 'prepared_pending'
-                if self.epoch != evidence['epoch']:
-                    return None, 'epoch_or_guard'
-                if self.latest.get('scan') is not evidence['scan']:
-                    return None, 'prepared_scan_advanced'
-                if self.latest.get('depth') is not evidence['depth']:
-                    return None, 'prepared_depth_advanced'
-                if not _same_depth_intrinsics(self.latest.get('info'), evidence['info']):
-                    return None, 'camera_info_changed'
-                if (self.extrinsics != evidence['extrinsics'] or self.depth_extrinsics != evidence['depth_extrinsics']
-                        or self.depth_projection_config != evidence['config']):
-                    return None, 'transform_changed'
-                if not 0 <= now - evidence['checked_at'] or now >= evidence['valid_until']:
-                    return None, 'prepared_pending'
-                odom, status = self.latest['odom'], self.latest['status']
-                if (odom['stamp'] < evidence['odom_at'] or status['stamp'] < evidence['status_at']
-                        or not 0 <= now - odom['stamp'] <= LATEST_INPUT_MAX_AGE_SEC
-                        or not 0 <= now - status['stamp'] <= 1.0):
-                    return None, 'stale_latest_state'
-                for pose in evidence['poses']:
-                    distance, turn = _pose_delta(pose, odom['pose'])
-                    if not _finite(distance) or not _finite(turn) or distance > .005 or turn > .01:
-                        return None, 'pose_changed'
-                state = base_state(odom['message'], status['message'], now)
-                if (state is None or state['motion_mode'] != 0 or state['error_code'] != 0
-                        or state['vehicle_state'] != 0 or state['control_mode'] != 1
-                        or state['battery_voltage'] < 10 or not 0 <= state['linear_x_mps'] <= .02
-                        or abs(state['linear_y_mps']) > .005 or abs(state['angular_z_radps']) > .02):
-                    return None, 'base_state'
-                return evidence['valid_until'], None
+            now = _monotonic()
+            if (sample['epoch'] != self.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
+                return None, 'epoch_or_guard'
+            if evidence is None:
+                return None, 'prepared_pending'
+            if self.epoch != evidence['epoch']:
+                return None, 'epoch_or_guard'
+            deadline = evidence['valid_until']
+            if allow_pending:
+                deadline = min(deadline, now + .070)
+            for stream, max_age in (('scan', .3), ('depth', LATEST_INPUT_MAX_AGE_SEC)):
+                latest, checked = self.latest.get(stream), evidence[stream]
+                if latest is checked:
+                    continue
+                history = getattr(self, '_sensor_receipts', {}).get(stream, ())
+                pending = pending_sensor_deadline(latest, checked, now, max_age, history) if allow_pending else None
+                if pending is None:
+                    return None, 'prepared_' + stream + '_advanced'
+                deadline = min(deadline, pending)
+            if not _same_depth_intrinsics(self.latest.get('info'), evidence['info']):
+                return None, 'camera_info_changed'
+            if (self.extrinsics != evidence['extrinsics'] or self.depth_extrinsics != evidence['depth_extrinsics']
+                    or self.depth_projection_config != evidence['config']):
+                return None, 'transform_changed'
+            if not 0 <= now - evidence['checked_at'] or now >= deadline:
+                return None, 'prepared_pending'
+            odom, status = self.latest['odom'], self.latest['status']
+            if (odom['stamp'] < evidence['odom_at'] or status['stamp'] < evidence['status_at']
+                    or not 0 <= now - odom['stamp'] <= LATEST_INPUT_MAX_AGE_SEC
+                    or not 0 <= now - status['stamp'] <= 1.0):
+                return None, 'stale_latest_state'
+            for pose in evidence['poses']:
+                distance, turn = _pose_delta(pose, odom['pose'])
+                if not _finite(distance) or not _finite(turn) or distance > .005 or turn > .01:
+                    return None, 'pose_changed'
+            state = base_state(odom['message'], status['message'], now)
+            if (state is None or state['motion_mode'] != 0 or state['error_code'] != 0
+                    or state['vehicle_state'] != 0 or state['control_mode'] != 1
+                    or state['battery_voltage'] < 10 or not 0 <= state['linear_x_mps'] <= .02
+                    or abs(state['linear_y_mps']) > .005 or abs(state['angular_z_radps']) > .02):
+                return None, 'base_state'
+            return deadline, None
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None, 'malformed'
+        finally:
+            self.lock.release()
 
     def _current_valid_until_once(self, sample, failure, evidence=None):
         """Validate a captured generation without blocking sensor callbacks.
@@ -1449,12 +1511,15 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             with self.lock:
                 if self.clock_guard.faulted or self.odom_guard.faulted:
                     return []
-                history = list(self.odom_history)
-            earlier = [entry for entry in history if entry["stamp"] <= start]
-            if not earlier:
-                return []
-            first = earlier[-1]
-            selected = [first] + [entry for entry in history if start < entry["stamp"] <= end]
+                selected = []
+                for entry in reversed(self.odom_history):
+                    if entry['stamp'] <= end:
+                        selected.append(entry)
+                    if entry['stamp'] <= start:
+                        break
+                else:
+                    return []
+            selected.reverse()
             result = []
             for entry in selected:
                 message = entry["message"]

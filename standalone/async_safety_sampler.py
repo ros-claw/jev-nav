@@ -61,16 +61,24 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
         self._closed = False
         self._changed = threading.Event()
 
-    def start(self):
+    def start(self, sample=None, assessment=None, initial_delay=0.):
         with self._lock:
             if self._thread is not None or self._closed:
                 raise ValueError('sampler is single-use')
-            self._thread = threading.Thread(target=self._run, name='limo-safety-sampler')
+            if not 0. <= initial_delay <= .1:
+                raise ValueError('invalid sampler startup delay')
+            if sample is not None or assessment is not None:
+                if not isinstance(sample, dict) or not isinstance(assessment, dict):
+                    raise ValueError('seed requires an already checked sample and assessment')
+                self._latest, self._assessment = sample, assessment
+            self._thread = threading.Thread(target=self._run, args=(initial_delay,), name='limo-safety-sampler')
             self._thread.daemon = True
             self._thread.start()
 
-    def _run(self):
+    def _run(self, initial_delay=0.):
         try:
+            if initial_delay and self._stop.wait(initial_delay):
+                return
             while not self._stop.is_set():
                 validated = (getattr(self.source, 'serialize_processing', False) is True
                              and callable(getattr(self.source, 'validated_snapshot', None)))

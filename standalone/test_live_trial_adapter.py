@@ -758,6 +758,57 @@ def test_prepared_forward_threads_separate_proof_from_renewal_and_stop_on_obstac
     assert json.loads(relay.transport.lines[-1])['linear'] == 0.
 
 
+def test_split_trial_seeds_background_workers_from_the_checked_first_command():
+    import time
+    from relay import _monotonic
+    mod = module()
+
+    class RealClock(object):
+        now = staticmethod(_monotonic)
+        sleep = staticmethod(time.sleep)
+
+    clock = RealClock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'),
+                             clock, motion_limit_sec=2.)
+    initial, seeded, renewed = [], [], []
+    adapter.updates_prepared_evidence = lambda: True
+
+    def initial_proof(sample):
+        assert not relay.had_motion
+        initial.append(sample)
+        return {'valid_until': clock.now() + .14}, None
+
+    def seed(sample, evidence):
+        assert relay.had_motion and sample is initial[-1]
+        seeded.append((sample, evidence['valid_until']))
+
+    def read(sample):
+        if sample is seeded[0][0]:
+            renewed.append(sample)
+            if len(renewed) <= 2:
+                return clock.now() + .015, None
+            return seeded[0][1], None
+        return sample['_command_evidence']['valid_until'], None
+
+    adapter.prepare_initial_command_evidence = initial_proof
+    adapter.seed_split_validation = seed
+    adapter.read_command_evidence = read
+    adapter.prepare_command_evidence = lambda _: ({'valid_until': clock.now() + .14}, None)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.PreparedLongerForwardTrial(
+        adapter, model, relay, FakeArbiter(), clock, enable_motion=True,
+        duration_sec=.6, period_sec=.02, serial_guard=FakeSerialGuard()).run()
+    submissions = [item for item in result['renewal_checks'] if item['submitted']]
+    assert len(seeded) == 1 and renewed and len(submissions) > 2
+    assert result['motion_timing']['pending_window_polls'] >= 2
+    assert submissions[0]['valid_until'] <= seeded[0][1]
+    assert submissions[1]['valid_until'] <= seeded[0][1]
+    assert result['sampler_closed'] and json.loads(relay.transport.lines[-1])['linear'] == 0
+
+
 def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
     import time
 

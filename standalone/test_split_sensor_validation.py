@@ -2,7 +2,22 @@ import threading
 import time
 
 from relay import _monotonic
-from split_sensor_validation import SplitSensorValidation
+from split_sensor_validation import SplitSensorValidation, pending_sensor_deadline
+
+
+def test_pending_successors_use_the_oldest_recorded_receipt():
+    checked = {'generation': 8, 'stamp': 10.}
+    latest = {'generation': 9, 'stamp': 10.04, 'received_at': 10.06}
+    assert pending_sensor_deadline(latest, checked, 10.07, .3) == 10.13
+    assert pending_sensor_deadline(latest, checked, 10.07, .05) == 10.09
+    assert pending_sensor_deadline(latest, checked, 10.14, .3) is None
+    assert pending_sensor_deadline(dict(latest, generation=10), checked, 10.07, .3) is None
+    assert pending_sensor_deadline(dict(latest, received_at=10.1), checked, 10.07, .3) is None
+    second = {'generation': 10, 'stamp': 10.07, 'received_at': 10.08}
+    receipts = [(9, 10.04, 10.06), (10, 10.07, 10.08)]
+    assert pending_sensor_deadline(second, checked, 10.09, .3, receipts) == 10.13
+    assert pending_sensor_deadline(second, checked, 10.14, .3, receipts) is None
+    assert pending_sensor_deadline(dict(second, generation=11), checked, 10.09, .3, receipts) is None
 
 
 def test_depth_advance_rechecks_depth_without_recomputing_scan():
@@ -21,7 +36,7 @@ def test_depth_advance_rechecks_depth_without_recomputing_scan():
             advance.set()
         return value, None
 
-    def combine(_sample, scan, depth):
+    def combine(_sample, scan, depth, nonblocking=False):
         if depth != generation['depth']:
             return None, 'prepared_depth_advanced'
         return (scan, depth), None
