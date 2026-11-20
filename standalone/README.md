@@ -108,6 +108,15 @@ the 70 ms renewal budget. A pending frame contributes no clearance.
 Confirmed obstacles latch the split worker fault. This remains an opt-in
 experiment and has yet to sustain motion on the robot.
 
+Add `--depth-projection-process` to the split checks with preprojection
+enabled to isolate projection from the Python process that receives ROS
+messages and renews commands. The child receives the exact depth buffer via
+a private socket and uses the existing projection. It does not subscribe to
+ROS or publish velocity. The single depth producer fills the same cache.
+An out-of-budget projection supplies no evidence. A stalled transport closes
+without refreshing any acquisition timestamp, and the local relay still
+enforces the original expiry.
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

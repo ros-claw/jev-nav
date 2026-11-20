@@ -677,7 +677,7 @@ def _transient_snapshot_gap(source):
     issue = issue_method() if callable(issue_method) else getattr(source, 'last_issue', None)
     return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
                      'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException',
-                     'source_processing_busy', 'source_initial_coverage_pending')
+                     'source_processing_busy', 'source_initial_coverage_pending', 'source_depth_projection_pending')
 
 
 class StrictDepthGate(object):

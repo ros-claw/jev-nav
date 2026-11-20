@@ -50,6 +50,16 @@ def test_prepared_mode_requires_explicit_longer_trial():
     assert parse_args(['--longer-forward', '--prepared-forward', '--preproject-depth']).preproject_depth
 
 
+def test_depth_projection_process_requires_the_split_preprojection_path():
+    mode = ['--longer-forward', '--prepared-forward', '--split-sensor-checks', '--depth-projection-process']
+    with pytest.raises(SystemExit):
+        parse_args(mode + ['--assume-rectified', '--ground-z=-.1'])
+    with pytest.raises(SystemExit):
+        parse_args(mode + ['--preproject-depth'])
+    args = parse_args(mode + ['--preproject-depth', '--assume-rectified', '--ground-z=-.1'])
+    assert args.depth_projection_process and not args.execute
+
+
 def test_trial_monitor_allows_ros_rpc_scheduling_delay_without_changing_watchdog_freshness():
     guard = make_ros_monitor(RealClock(), 11139, 'http://localhost:11311')
     assert guard.backend.rpc_timeout == 0.2

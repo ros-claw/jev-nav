@@ -536,7 +536,7 @@ class DecisionGate(object):  # noqa: UP004 - ROS Melodic Python 2
 class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     """Read ROS sensors directly; this object never creates a velocity publisher."""
 
-    def __init__(self, depth_projection_config=None, sensor_names=None):
+    def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -557,6 +557,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.depth_projection_config = (dict(depth_projection_config)
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
+        self._depth_projector = depth_projector
         self._depth_projections = collections.deque(maxlen=4)
         self._depth_event = None
         self._depth_worker = None
@@ -757,7 +758,14 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return reject("depth_transform_changed")
                 stamp = current["depth"]["stamp"]
                 prepared = None
-                if (projection_only and self._depth_worker is not None
+                if (self._depth_projector is not None and self._depth_worker is not None
+                        and depth_signature == self.depth_extrinsics):
+                    rotation = self.tf.transformations.quaternion_from_euler(*depth_signature[3:])
+                    prepared = self._wait_for_depth_projection(
+                        depth, info, stamp, epoch, depth_signature[:3], rotation)
+                    if prepared is None:
+                        return reject("depth_projection_pending")
+                elif (projection_only and self._depth_worker is not None
                         and depth_signature == self.depth_extrinsics):
                     # The worker uses the rigid transform's canonical
                     # quaternion, so equivalent ROS quaternion signs must
@@ -767,6 +775,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         depth, info, stamp, epoch, depth_signature[:3], rotation, cache_only=True)
                 if prepared is None:
                     prepared = self._depth_projection(depth, info, stamp, epoch, depth_trans, depth_rot, depth_array)
+                if prepared is None:
+                    return reject("depth_projection_pending")
                 depth_summary["corridor"] = prepared
             image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
             depth_pose = nearest_odometry(odom_history, current["depth"]["stamp"])
@@ -880,13 +890,23 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         signature = tuple(trans) + tuple(self.tf.transformations.euler_from_quaternion(rot))
                         if transform_matches(extrinsics, signature):
                             rotation = self.tf.transformations.quaternion_from_euler(*extrinsics[3:])
-                            self._depth_projection(image, calibration, stamp, epoch, extrinsics[:3], rotation)
-                            self.depth_preprojection_counts['processed'] += 1
-                            self._depth_ready.set()
+                            prepared = self._depth_projection(image, calibration, stamp, epoch,
+                                                              extrinsics[:3], rotation)
+                            self.depth_preprojection_counts['processed' if prepared is not None else 'unavailable'] += 1
+                            if prepared is not None:
+                                self._depth_ready.set()
                             previous = key
             except Exception:  # no result for failed calibration, TF or conversion
                 pass
             self._depth_event.wait(.02)
+
+    def _wait_for_depth_projection(self, image, info, stamp, epoch, trans, rotation):
+        self._depth_ready.clear()
+        projection = self._depth_projection(image, info, stamp, epoch, trans, rotation, cache_only=True)
+        if projection is None:
+            self._depth_ready.wait(.020)
+            projection = self._depth_projection(image, info, stamp, epoch, trans, rotation, cache_only=True)
+        return projection
 
     def _depth_projection(self, image, info, stamp, epoch, trans, rotation, array=None, cache_only=False):
         """Reuse geometry only; callers still check age, TF and aligned pose."""
@@ -908,11 +928,18 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         matrix[:3, 3] = trans
         intrinsics = {'width': image.width, 'height': image.height, 'fx': k[0], 'fy': k[4],
                       'cx': k[2], 'cy': k[5], 'rectified': True}
-        if array is None:
-            array = self.bridge.imgmsg_to_cv2(image, desired_encoding='passthrough')
-        projection = project_depth_frame(array, image.encoding, intrinsics, matrix, stamp,
-                                         self.depth_projection_config)
-        if cache is not None:
+        projector = getattr(self, '_depth_projector', None)
+        if projector is None:
+            if array is None:
+                array = self.bridge.imgmsg_to_cv2(image, desired_encoding='passthrough')
+            projection = project_depth_frame(array, image.encoding, intrinsics, matrix, stamp,
+                                             self.depth_projection_config)
+        else:
+            params = {'encoding': image.encoding, 'width': image.width, 'height': image.height,
+                      'step': image.step, 'is_bigendian': image.is_bigendian, 'intrinsics': intrinsics,
+                      'matrix': matrix.tolist(), 'stamp': stamp, 'config': self.depth_projection_config}
+            projection = projector.project(params, data)
+        if cache is not None and projection is not None:
             cache.appendleft((image, data, key, copy.deepcopy(projection)))
         return projection
 
@@ -959,11 +986,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 # the depth producer finish this exact frame without throwing
                 # away the valid scan work. The final generation and deadline
                 # checks are unchanged.
-                self._depth_ready.clear()
-                corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation, cache_only=True)
-                if corridor is None:
-                    self._depth_ready.wait(.020)
-                    corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation, cache_only=True)
+                corridor = self._wait_for_depth_projection(image, info, stamp, self.epoch, trans, rotation)
             if cached_only:
                 self.depth_preprojection_counts['cache_miss' if corridor is None else 'cache_hit'] += 1
             if corridor is None and cached_only:

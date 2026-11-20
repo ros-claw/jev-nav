@@ -764,7 +764,11 @@ def test_depth_worker_processes_same_calibrated_frame_once_and_closes(monkeypatc
     monkeypatch.setattr(explore, '_monotonic', lambda: 10.01)
     monkeypatch.setattr(explore, 'lookup_rigid_transform', lambda *_: ((0., 0., 0.), (0., 0., 0., 1.)))
     calls = []
-    observer._depth_projection = lambda *args: calls.append(args)
+    def project(*args):
+        calls.append(args)
+        return {'stamp': 10.}
+
+    observer._depth_projection = project
     observer.start_depth_preprojection()
     try:
         assert observer._depth_ready.wait(.3)

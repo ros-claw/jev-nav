@@ -33,6 +33,8 @@ def parse_args(argv=None):
                         help='run final sensor processing in the longer trial worker')
     parser.add_argument('--preproject-depth', action='store_true',
                         help='use an independent depth projection worker in prepared mode')
+    parser.add_argument('--depth-projection-process', action='store_true',
+                        help='project depth in a child process with a private bounded socket')
     parser.add_argument('--split-sensor-checks', action='store_true',
                         help='prepare scan and depth proofs in separate workers')
     parser.add_argument('--driver-pid', type=int)
@@ -48,6 +50,9 @@ def parse_args(argv=None):
         parser.error('--prepared-forward requires --longer-forward without --single-threaded')
     if args.preproject_depth and not args.prepared_forward:
         parser.error('--preproject-depth requires --prepared-forward')
+    if args.depth_projection_process and (not args.preproject_depth or not args.split_sensor_checks
+                                          or not args.assume_rectified or args.ground_z is None):
+        parser.error('--depth-projection-process requires split checks, preprojection and explicit depth assumptions')
     if args.split_sensor_checks and not args.prepared_forward:
         parser.error('--split-sensor-checks requires --prepared-forward')
     if args.execute:
@@ -218,6 +223,14 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.depth_projection_process:
+        from depth_projection_process import DepthProjectionProcess
+        with DepthProjectionProcess() as projector:
+            return run(args, projector)
+    return run(args)
+
+
+def run(args, projector=None):
     import rospy
     from explore import RosObservation
     from live_monitors import (
@@ -247,7 +260,7 @@ def main(argv=None):
                       'ground_z_m': args.ground_z, 'ground_tolerance_m': 0.025,
                       'obstacle_min_height_m': 0.03, 'obstacle_max_height_m': 0.4,
                       'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': 4}
-    observation = RosObservation(depth_projection_config=projection)
+    observation = RosObservation(depth_projection_config=projection, depth_projector=projector)
     recorder = ObservationRecorder(clock)
     source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
                                 projection_only_after_model=True, recheck_snapshot=False,
@@ -259,7 +272,9 @@ def main(argv=None):
         time.sleep(0.05)
     if not args.execute:
         print(json.dumps({'mode': 'observation_only', 'observation': observation.diagnostic_status(),
-                          'recorder': recorder.summary()}, allow_nan=False))
+                          'recorder': recorder.summary(),
+                          'projection_process': projector.summary() if projector is not None else None},
+                         allow_nan=False))
         return 0
     ros_guard = make_ros_monitor(clock, args.driver_pid,
                                 os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'))
@@ -296,6 +311,8 @@ def main(argv=None):
     if args.preproject_depth:
         result['depth_worker_closed'] = depth_worker_closed
         result['depth_preprojection_counts'] = dict(observation.depth_preprojection_counts)
+    if projector is not None:
+        result['depth_projection_process'] = projector.summary()
     trial_ended = clock.now()
     # Continue read-only observation briefly after the relay has been closed.
     time.sleep(0.7)
