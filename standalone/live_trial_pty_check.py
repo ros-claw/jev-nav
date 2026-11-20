@@ -5,13 +5,15 @@ Only run inside the private PID, device and network bubblewrap namespace. The
 source, model, ROS arbitration and serial guards are test fixtures. Results
 prove only simulated serial output and never physical stopping or clearance.
 
+From the jev-nav repository root:
+
     env -i PATH=/usr/bin:/bin:/sbin bwrap --unshare-all \
       --hostname limo-pty-isolated --die-with-parent \
       --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /sbin /sbin \
       --ro-bind /opt/ros/melodic /opt/ros/melodic --proc /proc --dev /dev --tmpfs /tmp \
       --ro-bind /tmp/rosclaw-limo-exclusive-candidate /tmp/rosclaw-limo-exclusive-candidate \
-      --ro-bind /home/agilex/rosclaw/jev/standalone /sandbox \
-      --ro-bind /home/agilex/rosclaw/jev/worktrees/limo-mcp/worker /worker \
+      --ro-bind "$PWD/standalone" /sandbox \
+      --ro-bind "$PWD/worker" /worker \
       --dir /etc --ro-bind /etc/hosts /etc/hosts \
       --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf --ro-bind /etc/passwd /etc/passwd \
       --ro-bind /etc/group /etc/group --ro-bind /etc/alternatives /etc/alternatives \

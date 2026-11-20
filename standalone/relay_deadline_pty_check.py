@@ -13,7 +13,7 @@ From the repository root, with the existing candidate build present:
       --ro-bind /sbin /sbin --ro-bind /opt/ros/melodic /opt/ros/melodic \
       --proc /proc --dev /dev --tmpfs /tmp \
       --ro-bind /tmp/rosclaw-limo-base-check /tmp/rosclaw-limo-base-check \
-      --ro-bind /home/agilex/rosclaw/jev/standalone /sandbox \
+      --ro-bind "$PWD/standalone" /sandbox \
       --dir /etc --ro-bind /etc/hosts /etc/hosts \
       --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
       --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \
