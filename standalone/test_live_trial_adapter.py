@@ -1572,6 +1572,49 @@ def test_motion_loop_prepares_next_sample_during_the_frame_interval():
     assert result['motion_timing']['max_sample_sec'] >= 0.039
 
 
+def test_single_threaded_long_trial_samples_immediately_and_stops_on_obstacle():
+    mod = module()
+    clock = Clock()
+    adapter, obs = source(clock)
+    def mutate(sample, count):
+        if count >= 12:
+            sample['raw_scan']['ranges'][16] = 0.195
+        return sample
+    obs.source.mutate = mutate
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'),
+                             clock, motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    delays = []
+    class TimedTrial(mod.SynchronousLongerForwardTrial):
+        def _sample(self, defer_current_check=False):
+            if relay.had_motion:
+                frames = [json.loads(line) for line in relay.transport.lines]
+                delays.append(clock.now() - frames[-1]['stamp'])
+            return mod.SynchronousLongerForwardTrial._sample(self, defer_current_check)
+    trial = TimedTrial(adapter, model, relay, FakeArbiter(), clock,
+                       duration_sec=2.0, enable_motion=True, serial_guard=FakeSerialGuard())
+    result = trial.run()
+    frames = [json.loads(line) for line in relay.transport.lines]
+    assert result['reason'] == 'front_blocked'
+    assert len(delays) > 3 and max(delays) < 0.002
+    assert frames[-1]['linear'] == 0.0
+    assert trial.ASYNC_SAMPLING is False
+
+
+def test_shorter_refresh_period_does_not_reduce_distance_reserve():
+    mod = module()
+    clock = Clock()
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'),
+                             clock, motion_limit_sec=2.0)
+    trial = mod.SynchronousLongerForwardTrial(source(clock)[0], None, relay, FakeArbiter(), clock,
+                                             duration_sec=2.0, period_sec=0.025,
+                                             serial_guard=FakeSerialGuard())
+    assert trial._distance_limit_reached(0.0392, 0.0392)
+    assert trial._distance_limit_reached(0.037, 0.037)
+    assert not trial._distance_limit_reached(0.036, 0.036)
+
+
 def test_motion_intent_is_bounded_by_monitor_expiry():
     mod = module()
     clock = Clock()

@@ -823,6 +823,8 @@ class LiveTrial(object):
     MAX_DISTANCE_M = 0.02
     ASYNC_SAMPLING = False
     ARM_BEFORE_MODEL = False
+    IMMEDIATE_SYNC_SAMPLING = False
+    DISTANCE_RESERVE_SEC = 0.0
 
     def __init__(self, source, model, relay, arbiter, clock, enable_motion=False,
                  duration_sec=0.6, speed_mps=0.02, period_sec=0.05, serial_guard=None, depth_gate=None,
@@ -847,6 +849,10 @@ class LiveTrial(object):
         self._lock = threading.Lock()
         self._last_time = None
         self._motion_started = False
+
+    def _distance_limit_reached(self, displacement, path):
+        reserve = self.speed_mps * max(self.period_sec, self.DISTANCE_RESERVE_SEC)
+        return max(displacement, path) + reserve >= self.MAX_DISTANCE_M
 
     def _now(self):
         now = self.clock.now()
@@ -1275,7 +1281,8 @@ class LiveTrial(object):
                     now = self._now()
                     next_slot = max(last_sent_at + 0.005,
                                     min(last_sent_at + self.period_sec, last_valid_until - 0.015))
-                    early_wait = min(0.015, max(0.0, next_slot - now))
+                    early_wait = (0.0 if self.IMMEDIATE_SYNC_SAMPLING else
+                                  min(0.015, max(0.0, next_slot - now)))
                     if early_wait:
                         self.clock.sleep(early_wait)
                     sample_started = self._now()
@@ -1300,7 +1307,7 @@ class LiveTrial(object):
                 path += step
                 previous, previous_odom = current["pose"], current["odom_at"]
                 result["odom_displacement_m"], result["odom_path_m"] = displacement, path
-                if max(displacement, path) + self.speed_mps * self.period_sec >= self.MAX_DISTANCE_M:
+                if self._distance_limit_reached(displacement, path):
                     raise checks._StopError("distance_limit")
                 # Prepare the next checked observation while the previous
                 # command is active, then wait only for the remaining frame
@@ -1557,6 +1564,15 @@ class LongerForwardTrial(LiveTrial):
     MAX_DISTANCE_M = 0.04
     ASYNC_SAMPLING = True
     ARM_BEFORE_MODEL = True
+
+
+class SynchronousLongerForwardTrial(LongerForwardTrial):
+    """Experimental single-threaded sensing with the same motion bounds."""
+    ASYNC_SAMPLING = False
+    IMMEDIATE_SYNC_SAMPLING = True
+    # Commanded-speed distance over one TTL; excludes odometry lag, stopping
+    # latency, speed error and braking, and is not a physical travel bound.
+    DISTANCE_RESERVE_SEC = 0.16
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ def parse_args(argv=None):
     parser.add_argument('--execute', action='store_true', help='enable a single bounded motion trial')
     parser.add_argument('--longer-forward', action='store_true',
                         help='allow up to two seconds of forward motion in this trial')
+    parser.add_argument('--single-threaded', action='store_true',
+                        help='experiment with synchronous sensing in the longer trial')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -29,6 +31,8 @@ def parse_args(argv=None):
     parser.add_argument('--ground-z', type=float)
     parser.add_argument('--assume-rectified', action='store_true')
     args = parser.parse_args(argv)
+    if args.single_threaded and not args.longer_forward:
+        parser.error('--single-threaded requires --longer-forward')
     if args.execute:
         digest = args.driver_sha256
         if (args.driver_pid is None or args.driver_pid <= 1
@@ -40,6 +44,11 @@ def parse_args(argv=None):
                 or not -0.5 <= args.ground_z <= 0.0):
             parser.error('execute requires driver identity, site report and explicit depth assumptions')
     return args
+
+
+def trial_period(args):
+    # Refresh sooner in the synchronous experiment, without extending any TTL.
+    return 0.025 if args.single_threaded else 0.05
 
 
 def summarize_observations(odometry, commands):
@@ -135,6 +144,7 @@ def main(argv=None):
         ExistingDecisionHelper,
         LiveTrial,
         LongerForwardTrial,
+        SynchronousLongerForwardTrial,
         ObservationAdapter,
     )
     from projected_depth_gate import ProjectedDepthGate
@@ -174,9 +184,11 @@ def main(argv=None):
     relay = make_relay(clock, motion_limit_sec=2.0 if args.longer_forward else 0.3)
     report = {'clear_room': True, 'operator_present': True, 'emergency_stop_available': True,
               'source': 'operator_report', 'independently_verified': False}
-    trial_class = LongerForwardTrial if args.longer_forward else LiveTrial
+    trial_class = (SynchronousLongerForwardTrial if args.single_threaded else
+                   LongerForwardTrial if args.longer_forward else LiveTrial)
     trial = trial_class(source, model, relay, ros_guard, clock, enable_motion=True,
                         duration_sec=2.0 if args.longer_forward else 0.6,
+                        period_sec=trial_period(args),
                         serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
                         operator_site_report=report)
     result = trial.run()

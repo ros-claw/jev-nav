@@ -5,6 +5,7 @@ from supervised_trial import (
     make_ros_monitor,
     parse_args,
     summarize_observations,
+    trial_period,
 )
 
 
@@ -18,6 +19,15 @@ def test_longer_forward_trial_is_explicitly_selected():
     assert args.longer_forward is True and args.execute is False
     relay = make_relay(RealClock(), motion_limit_sec=2.0)
     assert relay.motion_limit_sec == 2.0 and relay.transport.process is None
+
+
+def test_single_threaded_mode_requires_explicit_longer_trial():
+    with pytest.raises(SystemExit):
+        parse_args(['--single-threaded'])
+    args = parse_args(['--longer-forward', '--single-threaded'])
+    assert args.single_threaded and not args.execute
+    assert trial_period(args) == 0.025
+    assert trial_period(parse_args(['--longer-forward'])) == 0.05
 
 
 def test_trial_uses_independent_heartbeat_without_starting_a_process_at_construction():

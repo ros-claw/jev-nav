@@ -3,7 +3,8 @@
 
 Use the bubblewrap command documented in live_trial_pty_check.py, replacing its
 last line with ``/usr/bin/python3 /sandbox/threaded_relay_pty_check.py live``
-or ``... expired``, ``... long``, ``... long_expired`` or ``... long_model_pause``.
+or ``... expired``, ``... long``, ``... long_expired``, ``... long_model_pause``,
+``... sync_long`` or ``... sync_long_expired``.
 These scenarios use the real trial, RelayProcessTransport,
 relay and candidate driver; source, model and ROS/serial guards are fixtures.
 No firmware, actual exclusive ownership, path clearance or stopping is proved.
@@ -55,12 +56,15 @@ while not rospy.is_shutdown():
 CHILD_TEMPLATE = r'''
 from __future__ import print_function
 import json, threading, time
-from live_trial_adapter import DecisionsAdapter, LiveTrial, LongerForwardTrial, ObservationAdapter, RelayProcessTransport
+from live_trial_adapter import DecisionsAdapter, LiveTrial, LongerForwardTrial, SynchronousLongerForwardTrial, ObservationAdapter, RelayProcessTransport
 from relay import _monotonic
 from test_live_trial_adapter import FakeArbiter, FakeSerialGuard, source
 from threaded_relay_adapter import ThreadedRelayAdapter
 
 case = CASE_NAME
+sync = case.startswith('sync_')
+if sync:
+    case = case[5:]
 class Clock(object):
     def now(self):
         return _monotonic()
@@ -123,10 +127,11 @@ def fake_model(payload, timeout):
         pause['end'] = clock.now()
     return {'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']}
 arbiter, serial = FakeArbiter(), FakeSerialGuard()
-trial_class = LongerForwardTrial if case in ('long', 'long_expired', 'long_model_pause') else LiveTrial
+trial_class = (SynchronousLongerForwardTrial if sync else
+               LongerForwardTrial if case in ('long', 'long_expired', 'long_model_pause') else LiveTrial)
 trial = trial_class(PausedSource(), DecisionsAdapter(fake_model), relay, arbiter, clock,
                     enable_motion=True, duration_sec=2.0 if case in ('long', 'long_expired', 'long_model_pause') else 0.6,
-                    speed_mps=0.02, period_sec=0.05, serial_guard=serial)
+                    speed_mps=0.02, period_sec=0.025 if sync else 0.05, serial_guard=serial)
 started = clock.now()
 result = trial.run()
 returned = clock.now()
@@ -181,10 +186,13 @@ class Collector(harness.StatusCollector):
 
 
 def main(case):
+    scenario = case
+    if case in ('sync_long', 'sync_long_expired'):
+        case = case[5:]
     if case not in ('live', 'expired', 'long', 'long_expired', 'long_model_pause'):
         raise ValueError('unknown scenario')
     # The reused harness refuses to allocate a PTY unless namespace checks pass.
-    harness.CHILD = CHILD_TEMPLATE.replace('CASE_NAME', repr(case))
+    harness.CHILD = CHILD_TEMPLATE.replace('CASE_NAME', repr(scenario))
     harness.STATUS_MONITOR = MONITOR
     harness.StatusCollector = Collector
     # The thread may reuse a just-written zero; relay READY separately proves
@@ -240,7 +248,7 @@ def main(case):
     if (not active or not after or any(any(name.startswith('/standalone_limo_relay_')
                                            for name in state['cmd_vel']) for state in after)):
         raise RuntimeError('relay cmd_vel registration was not removed after process exit')
-    extra = {'scenario': case, 'controlled_pause_sec': round(pause['end'] - pause['start'], 6) if pause else None,
+    extra = {'scenario': scenario, 'controlled_pause_sec': round(pause['end'] - pause['start'], 6) if pause else None,
              'unique_pipe_writer_threads': len(writer_ids), 'control_thread_writes_pipe': False,
              'setpoints_submitted': len(submissions), 'all_nonzero_pipe_frames_within_intent_ttl': True,
              'cmd_vel_nonzero_observations': len(moving),

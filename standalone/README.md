@@ -9,6 +9,8 @@ turning, reverse motion, a persistent exploration loop, or autonomous mapping.
 
 The ordinary trial has a 0.3-second relay motion deadline. The explicit
 `--longer-forward` option selects a separate, bounded two-second forward trial.
+Adding `--single-threaded` to that option selects an experimental synchronous
+sampling loop with the same motion bounds and per-command freshness checks.
 Both require fresh camera, depth, lidar, odometry and base status, current ROS
 and serial-ownership observations, an operator site report, and an explicit
 floor-height and camera-rectification assumption. A dedicated relay publishes
