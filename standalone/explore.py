@@ -529,7 +529,7 @@ class DecisionGate(object):  # noqa: UP004 - ROS Melodic Python 2
 class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     """Read ROS sensors directly; this object never creates a velocity publisher."""
 
-    def __init__(self, depth_projection_config=None):
+    def __init__(self, depth_projection_config=None, sensor_names=None):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -567,6 +567,11 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                   ("depth", "/camera/depth/image_raw", Image),
                   ("color", "/camera/color/image_raw", Image),
                   ("info", "/camera/depth/camera_info", CameraInfo)]
+        if sensor_names is not None:
+            names = set(sensor_names)
+            if "odom" not in names or not names.issubset(name for name, _, _ in topics):
+                raise ValueError("invalid observation sensor selection")
+            topics = [spec for spec in topics if spec[0] in names]
         self.subscriptions = [rospy.Subscriber(topic, typ, self._receive, callback_args=name,
                                                queue_size=sensor_queue_size(name))
                               for name, topic, typ in topics]

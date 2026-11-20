@@ -476,6 +476,46 @@ def test_native_fusion_transform_matches_scalar_and_keeps_shared_hit_identity(mo
     assert sum(calls) > 90
 
 
+def test_native_fusion_batches_preserve_old_hits_and_scalar_fallback(monkeypatch):
+    import limo_scan_fusion as fusion
+    native = fusion._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    obj = fusion.RollingScanFusion((.105, 0., 0.))
+    pose = (0., 0., 0.)
+    for frame in range(5):
+        stamp = 10. + .1 * frame
+        values = [2.] * 401
+        if frame == 0:
+            values[200] = .25
+        packet = {'stamp': stamp, 'ranges': values, 'angle_min': -1.4,
+                  'angle_increment': .007, 'range_min': .1, 'range_max': 8.}
+        assert obj.add_scan(packet, pose, stamp, stamp)
+    monkeypatch.setattr(fusion, '_native_scan', None)
+    expected = obj.snapshot(pose, 10.4, 10.4)
+    calls = []
+
+    class Meter(object):
+        def __init__(self, decline_second=False):
+            self.decline_second = decline_second
+
+        def fast_transform_records(self, records, current_pose):
+            calls.append(sum(len(record['rays']) for record in records))
+            if self.decline_second and len(calls) == 2:
+                return None
+            return native.fast_transform_records(records, current_pose)
+
+    monkeypatch.setattr(fusion, '_native_scan', Meter())
+    actual = obj.snapshot(pose, 10.4, 10.4)
+    assert len(calls) == 2 and max(calls) <= 1536 and sum(calls) == 2005
+    assert actual == expected
+    assert any(hit['stamp'] == 10. and hit['point_base'][0] < .4 for hit in actual['occupied_hits'])
+    calls[:] = []
+    monkeypatch.setattr(fusion, '_native_scan', Meter(decline_second=True))
+    assert obj.snapshot(pose, 10.4, 10.4) == expected
+    assert len(calls) == 2
+
+
 def test_native_fusion_transform_rejects_unbounded_or_custom_values():
     import limo_scan_fusion as fusion
     native = fusion._native_scan

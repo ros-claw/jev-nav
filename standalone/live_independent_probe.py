@@ -92,7 +92,12 @@ def main(argv=None):
         def __init__(self):
             self.nav_workers = None
             self.recording = False
-            RosObservation.__init__(self, depth_projection_config=config)
+            sensors = ('odom',)
+            if args.stream in ('scan', 'both'):
+                sensors += ('scan',)
+            if args.stream in ('depth', 'both'):
+                sensors += ('depth', 'info')
+            RosObservation.__init__(self, depth_projection_config=config, sensor_names=sensors)
 
         def _receive(self, message, name):
             callback_at = _monotonic()

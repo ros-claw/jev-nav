@@ -59,8 +59,9 @@ already checked forward cross-section. Unusual input types and boundary ties
 fall back to the scalar checks. The expiry accelerator bounds its work to
 2,048 rays and eight distinct acquisition timestamps; larger histories use
 the scalar implementation. These changes do not extend sensor freshness.
-Fusion coordinate transforms can also use the accelerator for at most 1,536
-rays; the original checked implementation handles larger or unusual inputs.
+Fusion coordinate transforms use batches of up to 1,536 rays per native call.
+A single record beyond that bound or a declined batch triggers the checked
+scalar path for the whole snapshot, including its historical obstacles.
 For the longer supervised trial, observation production and final validation
 are serialized with a bounded wait. A failed observation or assessment blocks
 new proofs; hard failures latch for the trial. The final proof and relay pipe

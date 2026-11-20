@@ -82,6 +82,32 @@ def _valid_pose(pose):
     ) and -math.pi <= pose[2] <= math.pi
 
 
+def _transform_records_native(records, pose):
+    """Keep each native call bounded and preserve record and ray order."""
+    limit = 1536
+    batches = []
+    start = count = 0
+    for index, record in enumerate(records):
+        size = len(record["rays"])
+        if size > limit:
+            return None
+        if count + size > limit:
+            batches.append((records[start:index], count))
+            start, count = index, 0
+        count += size
+    batches.append((records[start:], count))
+    rays, hits = [], []
+    for batch, count in batches:
+        candidate = _native_scan.fast_transform_records(batch, pose)
+        if (not isinstance(candidate, tuple) or len(candidate) != 2
+                or type(candidate[0]) is not list or type(candidate[1]) is not list
+                or len(candidate[0]) != count or len(candidate[1]) != count):
+            return None
+        rays.extend(candidate[0])
+        hits.extend(candidate[1])
+    return rays, hits
+
+
 class RollingScanFusion(object):  # noqa: UP004 - Python 2 ROS worker
     def __init__(self, sensor_pose, max_evidence_age=1.0, max_scan_age=0.5,
                  max_pose_skew=0.05, max_current_pose_age=0.1, max_scans=20):
@@ -305,11 +331,7 @@ class RollingScanFusion(object):  # noqa: UP004 - Python 2 ROS worker
         accelerated = None
         if _native_scan is not None:
             try:
-                candidate = _native_scan.fast_transform_records(self._scans, pose)
-                if (isinstance(candidate, tuple) and len(candidate) == 2
-                        and type(candidate[0]) is list and type(candidate[1]) is list
-                        and len(candidate[0]) == len(candidate[1]) <= 1536):
-                    accelerated = candidate
+                accelerated = _transform_records_native(self._scans, pose)
             except Exception:
                 accelerated = None
         if accelerated is not None:
