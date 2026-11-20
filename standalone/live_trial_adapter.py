@@ -27,7 +27,9 @@ import threading
 import time
 
 import forward_trial as checks
+from async_safety_sampler import WAITING_REPLACEMENT
 from relay import _monotonic
+from split_sensor_validation import PENDING_PROOF
 
 _INITIAL_COVERAGE_PENDING = object()
 
@@ -175,6 +177,8 @@ class ObservationAdapter(object):
                     self._processing_latched = True
                 return None, None, None
             reason, assessment = validate(sample, now())
+            if reason is WAITING_REPLACEMENT:
+                return sample, reason, None
             if reason is _INITIAL_COVERAGE_PENDING:
                 self._processing_blocked = True
                 self._requires_validated_recovery = True
@@ -256,9 +260,17 @@ class ObservationAdapter(object):
     def read_command_evidence(self, sample):
         split = getattr(self.observation, '_split_validation', None)
         if split is not None:
+            self._split_revision = split.revision
             proof, issue = split.read(sample)
             return (proof['valid_until'], None) if proof is not None else (None, issue)
         return self.observation.read_command_evidence(sample, sample.get('_command_evidence'))
+
+    def wait_for_prepared_evidence(self, timeout):
+        split = getattr(self.observation, '_split_validation', None)
+        if split is not None:
+            split.wait_for_change(getattr(self, '_split_revision', None), timeout)
+        else:
+            time.sleep(timeout)
 
     def updates_prepared_evidence(self):
         return getattr(self.observation, '_split_validation', None) is not None
@@ -268,6 +280,11 @@ class ObservationAdapter(object):
 
     def seed_split_validation(self, sample, proof):
         self.observation.seed_split_validation(sample, proof)
+
+    def commit_split_validation(self, sample):
+        split = getattr(self.observation, '_split_validation', None)
+        if split is not None:
+            split.commit(sample)
 
     def current_valid_until(self, sample):
         if not self._acquire_processing():
@@ -1247,6 +1264,9 @@ class LiveTrial(object):
 
                 def validate_background(candidate, captured_at):
                     reason, assessment, detail = _assess_sample(candidate, captured_at, self.depth_gate, False)
+                    if (refresh_prepared and reason == 'sensor_unavailable'
+                            and detail.get('check') == 'front_forward_coverage_incomplete'):
+                        return WAITING_REPLACEMENT, None
                     if (not self._motion_started and reason == 'sensor_unavailable'
                             and detail.get('check') == 'front_forward_coverage_incomplete'):
                         return _INITIAL_COVERAGE_PENDING, None
@@ -1265,6 +1285,8 @@ class LiveTrial(object):
                                 candidate['_stationary_checked_at'] = end
                         began = self.clock.now()
                         proof, issue = self.source.prepare_command_evidence(candidate)
+                        if refresh_prepared and proof is None and issue == 'split_proof_pending':
+                            return WAITING_REPLACEMENT, None
                         if proof is None and issue not in (
                                 'scan_generation_changed', 'depth_generation_changed',
                                 'depth_replaced_during_retry', 'depth_preprojection_pending',
@@ -1345,14 +1367,30 @@ class LiveTrial(object):
                                     min(last_sent_at + self.period_sec, last_valid_until - 0.015))
                     early_wait = max(0.0, next_slot - now - 0.005)
                     if early_wait:
-                        self.clock.sleep(early_wait)
+                        if refresh_prepared:
+                            self.source.wait_for_prepared_evidence(early_wait)
+                            next_slot = min(next_slot, max(self._now(), last_sent_at + .012))
+                        else:
+                            self.clock.sleep(early_wait)
                     pending = sampler.poll()
                     if pending['state'] == 'fault':
                         self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
                         raise checks._StopError(pending['reason'])
                     if pending['state'] == 'ready':
-                        current = pending['sample']
-                        self._last_depth_assessment = pending['assessment']
+                        candidate = pending['sample']
+                        use_candidate = True
+                        if refresh_prepared and candidate is not current:
+                            candidate_until, _ = self.source.read_command_evidence(candidate)
+                            if candidate_until is None or candidate_until <= last_valid_until:
+                                # A staged scene can age while being handed
+                                # over. Keep the active scene available until
+                                # the replacement can advance its deadline.
+                                current_until, _ = self.source.read_command_evidence(current)
+                                use_candidate = current_until is None or (
+                                    candidate_until is not None and candidate_until > current_until)
+                        if use_candidate:
+                            current = candidate
+                            self._last_depth_assessment = pending['assessment']
                     now = self._now()
                 else:
                     # Do not capture the next sample immediately after a
@@ -1540,12 +1578,14 @@ class LiveTrial(object):
                             label = detail if isinstance(detail, str) and 0 < len(detail) <= 128 else 'unavailable'
                             reasons = result['initial_preparation']['sensor_rejections']
                             reasons[label] = reasons.get(label, 0) + 1
-                        if self.PREPARED_COMMANDS and not initial_split and (detail in (
-                                'prepared_pending', 'prepared_scan_advanced', 'prepared_depth_advanced')
+                        if self.PREPARED_COMMANDS and not initial_split and (detail in PENDING_PROOF
                                 or first_sent_at is None and detail in ('new_scan', 'new_depth_unchecked')):
                             # Withhold a new command while waiting for a
                             # complete proof. The previous deadline stands.
-                            sampler.wait_next(current, .005)
+                            if refresh_prepared:
+                                self.source.wait_for_prepared_evidence(.005)
+                            else:
+                                sampler.wait_next(current, .005)
                             continue
                         if first_sent_at is not None or self.PREPARED_COMMANDS and not initial_split:
                             raise checks._StopError("sensor_unavailable")
@@ -1563,6 +1603,18 @@ class LiveTrial(object):
                         largest = result['initial_preparation']['largest_window_sec']
                         if checks._finite(window) and (largest is None or window > largest):
                             result['initial_preparation']['largest_window_sec'] = window
+                    if (refresh_prepared and last_valid_until is not None
+                            and now + .005 < last_valid_until
+                            and valid_until <= last_valid_until
+                            and limiting in ("latest_sensors", "depth_gate", "snapshot",
+                                             "scan", "depth", "color")):
+                        # A renewal with an earlier deadline would shorten
+                        # the live intent. Hold its original expiry while
+                        # waiting for genuinely newer checked evidence.
+                        timing = result["motion_timing"]
+                        timing["nonadvancing_window_polls"] = timing.get("nonadvancing_window_polls", 0) + 1
+                        self.source.wait_for_prepared_evidence(.005)
+                        continue
                     if valid_until - now <= min_window:
                         if first_sent_at is None and 'initial_preparation' in result:
                             result['initial_preparation']['short_window'] += 1
@@ -1581,7 +1633,7 @@ class LiveTrial(object):
                             # deadline; never replace it with a short intent.
                             timing = result["motion_timing"]
                             timing["pending_window_polls"] = timing.get("pending_window_polls", 0) + 1
-                            sampler.wait_next(current, .005)
+                            self.source.wait_for_prepared_evidence(.005)
                             continue
                         # A still-valid but too-short proposal sends nothing.
                         # Try one fresh observation while the last intent
@@ -1634,6 +1686,8 @@ class LiveTrial(object):
                         raise checks._StopError("relay_failure")
                     check.update({"submitted": True, "sequence": sequence, "valid_until": valid_until})
                     check["submitted_returned_at"] = self._now()
+                    if refresh_prepared and not initial_split:
+                        self.source.commit_split_validation(current)
                     self._motion_started = True
                     if guarded:
                         wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)

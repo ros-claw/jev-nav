@@ -114,7 +114,45 @@ def test_split_pending_frame_does_not_extend_prior_proof(monkeypatch):
 def test_command_evidence_does_not_wait_for_a_busy_ros_lock():
     observer, sample = observer_and_sample()
     with observer.lock:
-        assert observer.read_command_evidence(sample, None, nonblocking=True) == (None, 'prepared_pending')
+        assert observer.read_command_evidence(sample, None, nonblocking=True) == (None, 'prepared_state_busy')
+
+
+def test_published_command_view_can_be_read_under_ros_lock_and_rejects_epoch_change(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    sample['scan_at'] = now
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._sensor_receipts = {}
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    evidence, issue = observer.prepare_initial_command_evidence(sample)
+    assert issue is None
+    with observer.lock:
+        observer._publish_split_inputs()
+        assert observer.read_command_evidence(sample, evidence, nonblocking=True) == (
+            evidence['valid_until'], None)
+        observer.epoch += 1
+        assert observer.read_command_evidence(sample, evidence, nonblocking=True) == (None, 'epoch_or_guard')
+
+
+def test_seeded_sensors_keep_their_individual_expiry(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    sample['scan_at'] = now
+    sample['_front_coverage_valid_until'] = now + .22
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    evidence, issue = observer.prepare_initial_command_evidence(sample)
+    assert issue is None
+    evidence['valid_until'] = now + .08
+    captured = []
+    observer._split_validation = Value()
+    observer._split_validation.seed = lambda *args: captured.extend(args)
+    observer.seed_split_validation(sample, evidence)
+    assert captured[0] is sample
+    assert captured[1]['expires'] == now + .22
+    assert captured[2]['expires'] == now + .15
 
 
 @pytest.mark.parametrize('changed', ('odom', 'scan', 'depth', 'status', 'epoch', 'guard', 'transform', 'calibration'))

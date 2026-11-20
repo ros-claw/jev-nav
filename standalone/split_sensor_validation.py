@@ -8,6 +8,9 @@ import threading
 from relay import _monotonic
 from processed_evidence import _number
 
+PENDING_PROOF = ('prepared_pending', 'prepared_scan_advanced', 'prepared_depth_advanced',
+                 'prepared_state_busy', 'prepared_scan_expired', 'prepared_depth_expired',
+                 'prepared_snapshot_expired', 'prepared_state_expired', 'prepared_evidence_expired')
 
 def pending_sensor_deadline(latest, checked, now, max_age, history=()):
     """Shorten a live proof to the oldest of at most two pending arrivals."""
@@ -35,6 +38,15 @@ def pending_sensor_deadline(latest, checked, now, max_age, history=()):
     return deadline if now < deadline else None
 
 
+class _Anchor(object):
+    def __init__(self, sample, parts=None):
+        self.sample = sample
+        self.expires = sample['snapshot_at'] + .25
+        self.parts = parts or {}
+        self.generations = {}
+        self.issue = None
+
+
 class SplitSensorValidation(object):
     STREAMS = ('scan', 'depth')
     STOPS = ('new_scan', 'new_depth_unchecked', 'epoch_or_guard', 'transform_changed')
@@ -43,117 +55,157 @@ class SplitSensorValidation(object):
     def __init__(self, capture, check, combine):
         self.capture, self.check, self.combine = capture, check, combine
         self._cv = threading.Condition()
-        self._job = None
-        self._parts = {}
+        self._active = self._staged = None
         self._fault = None
-        self._job_fault = None
         self._closed = False
         self._counts = collections.Counter()
+        self._reads = collections.Counter()
+        self._changed = threading.Event()
+        self.revision = 0
         self._input_ready = {stream: threading.Event() for stream in self.STREAMS}
         self._threads = []
-        for stream in self.STREAMS:
-            thread = threading.Thread(target=self._run, args=(stream,), name='limo-proof-' + stream)
+        for name in self.STREAMS:
+            thread = threading.Thread(target=self._run, args=(name,), name='limo-proof-' + name)
             thread.daemon = True
             self._threads.append(thread)
             thread.start()
 
     def _run(self, stream):
-        last_job = last_generation = None
         arrived = self._input_ready[stream]
         try:
             while True:
+                arrived.clear()
                 with self._cv:
                     if self._closed or self._fault is not None:
                         return
-                    job = self._job
-                    if job is None:
+                    now = _monotonic()
+                    anchors = [anchor for anchor in (self._active, self._staged)
+                               if anchor is not None and anchor.issue is None and now < anchor.expires]
+                    if not anchors:
                         self._cv.wait()
                         continue
-                    if _monotonic() >= job['snapshot_at'] + .25:
-                        self._cv.wait()
+                retry = False
+                for anchor in anchors:
+                    generation, inputs = self.capture(stream, anchor.sample)
+                    if generation == anchor.generations.get(stream):
                         continue
-                arrived.clear()
-                generation, inputs = self.capture(stream, job)
-                if job is last_job and generation == last_generation:
-                    arrived.wait(.025)
-                    continue
-                part, issue = self.check(stream, job, inputs)
-                # A not-yet-projected depth frame may become available with
-                # the same generation. Other results are assessed once.
-                last_job = job
-                retry = issue in ('depth_preprojection_pending', 'scan_alignment_pending')
-                last_generation = None if retry else generation
-                with self._cv:
-                    self._counts[stream + ':' + (issue or 'ready')] += 1
-                    if issue in self.LATCH and self._fault is None:
-                        self._fault = issue
-                        self._cv.notifyAll()
-                    if job is self._job:
-                        waiting = retry or issue in ('prepared_scan_advanced', 'prepared_depth_advanced',
-                                                     'scan_coverage_pending')
-                        if not waiting or stream not in self._parts:
-                            self._parts[stream] = (part, issue)
-                        if issue in self.STOPS and self._job_fault is None:
-                            self._job_fault = issue
-                        self._cv.notifyAll()
-                    if retry and not self._closed:
-                        self._cv.wait(.005)
+                    part, issue = self.check(stream, anchor.sample, inputs)
+                    unprocessed = issue in ('depth_preprojection_pending', 'depth_alignment_pending',
+                                            'scan_alignment_pending',
+                                            'prepared_scan_advanced', 'prepared_depth_advanced')
+                    retry = retry or unprocessed
+                    anchor.generations[stream] = None if unprocessed else generation
+                    with self._cv:
+                        self._counts[stream + ':' + (issue or 'ready')] += 1
+                        if issue in self.LATCH and self._fault is None:
+                            self._fault = issue
+                        if anchor in (self._active, self._staged):
+                            if not (unprocessed or issue == 'scan_coverage_pending') or stream not in anchor.parts:
+                                anchor.parts[stream] = part
+                            if issue in self.STOPS and anchor.issue is None:
+                                anchor.issue = issue
+                        self._changed_locked()
+                arrived.wait(.005 if retry else .025)
         except Exception:
             with self._cv:
-                self._fault = 'split_worker_failed'
-                self._cv.notifyAll()
+                if self._fault is None:
+                    self._fault = 'split_worker_failed'
+                self._changed_locked()
 
-    def _replace_locked(self, sample, parts):
-        self._job, self._parts, self._job_fault = sample, parts, None
+    def _changed_locked(self):
+        self.revision += 1
+        self._changed.set()
+        self._cv.notifyAll()
+
+    def _wake_locked(self):
         for event in self._input_ready.values():
             event.set()
-        self._cv.notifyAll()
+        self._changed_locked()
 
     def seed(self, sample, scan, depth):
         """Publish the already checked initial proof without changing expiry."""
         with self._cv:
-            self._replace_locked(sample, {'scan': (scan, None), 'depth': (depth, None)})
+            self._active = _Anchor(sample, {'scan': scan, 'depth': depth})
+            self._wake_locked()
 
     def prepare(self, sample, budget=.075):
         deadline = min(_monotonic() + budget, sample['snapshot_at'] + .25)
         with self._cv:
-            self._replace_locked(sample, {})
+            if self._staged is not None and _monotonic() < self._staged.expires:
+                return None, 'split_proof_pending'
+            anchor = _Anchor(sample)
+            self._staged = anchor
+            self._wake_locked()
             while True:
-                proof, issue = self._read_locked(sample)
-                if proof is not None or issue not in (
-                        'prepared_scan_advanced', 'prepared_depth_advanced', 'prepared_pending'):
-                    return proof, issue
+                proof, issue = self._read_anchor_locked(anchor)
+                if proof is not None and (not isinstance(proof, dict) or proof['valid_until'] - _monotonic() > .035):
+                    return proof, None
+                if proof is not None:
+                    issue = 'prepared_pending'
+                if issue in ('new_scan', 'new_depth_unchecked'):
+                    self._staged = None
+                    return None, 'split_proof_pending'
+                if issue not in PENDING_PROOF:
+                    self._staged = None
+                    return None, issue
                 remaining = deadline - _monotonic()
                 if remaining <= 0:
-                    # Keep the anchor alive until replaced. Either worker
-                    # can still finish during the handoff to the controller.
+                    self._staged = None
                     return None, 'split_proof_pending'
                 self._cv.wait(remaining)
 
-    def _read_locked(self, sample, nonblocking=False):
+    def _read_anchor_locked(self, anchor, nonblocking=False):
         if self._closed or self._fault is not None:
             return None, self._fault or 'split_worker_closed'
-        if sample is not self._job:
+        if anchor is None or _monotonic() >= anchor.expires:
+            if nonblocking:
+                self._reads['no_live_anchor'] += 1
             return None, 'prepared_pending'
-        if self._job_fault is not None:
-            return None, self._job_fault
-        if any(self._parts.get(name, (None,))[0] is None for name in self.STREAMS):
+        if anchor.issue is not None:
+            return None, anchor.issue
+        if any(anchor.parts.get(name) is None for name in self.STREAMS):
+            if nonblocking:
+                for stream in self.STREAMS:
+                    if anchor.parts.get(stream) is None:
+                        self._reads['missing_' + stream] += 1
             return None, 'prepared_pending'
         if nonblocking:
-            return self.combine(sample, self._parts['scan'][0], self._parts['depth'][0], nonblocking=True)
-        return self.combine(sample, self._parts['scan'][0], self._parts['depth'][0])
+            return self.combine(anchor.sample, anchor.parts['scan'], anchor.parts['depth'], nonblocking=True)
+        return self.combine(anchor.sample, anchor.parts['scan'], anchor.parts['depth'])
 
     def read(self, sample):
         if not self._cv.acquire(False):
+            self._reads['coordinator_busy'] += 1
             return None, 'prepared_pending'
         try:
-            return self._read_locked(sample, nonblocking=True)
+            anchor = next((a for a in (self._active, self._staged) if a is not None and a.sample is sample), None)
+            proof, issue = self._read_anchor_locked(anchor, nonblocking=True)
+            self._reads[issue or 'ready'] += 1
+            return proof, issue
+        finally:
+            self._cv.release()
+
+    def commit(self, sample):
+        """Switch the active anchor only after a command using it is submitted."""
+        if not self._cv.acquire(False):
+            return
+        try:
+            if self._staged is not None and sample is self._staged.sample:
+                self._active, self._staged = self._staged, None
+                self._wake_locked()
         finally:
             self._cv.release()
 
     def counts(self):
         with self._cv:
-            return dict(self._counts)
+            return dict(self._counts, **{'read:' + key: value for key, value in self._reads.items()})
+
+    def wait_for_change(self, revision, timeout):
+        """Wait for either stream to complete a check, without taking its lock."""
+        if revision == self.revision:
+            self._changed.clear()
+            if revision == self.revision:
+                self._changed.wait(timeout)
 
     def notify_input(self, stream):
         # ROS callbacks may hold their own lock. Never acquire the
@@ -165,9 +217,7 @@ class SplitSensorValidation(object):
     def close(self):
         with self._cv:
             self._closed = True
-            self._cv.notifyAll()
-            for event in self._input_ready.values():
-                event.set()
+            self._wake_locked()
         for thread in self._threads:
             thread.join(.15)
         return all(not thread.is_alive() for thread in self._threads)

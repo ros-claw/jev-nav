@@ -54,6 +54,31 @@ def test_sampler_latches_sensor_failure_and_discards_earlier_success():
         assert sampler.close(.5)
 
 
+def test_unfinished_replacement_preserves_published_sample_without_changing_it():
+    from async_safety_sampler import AsyncSafetySampler, WAITING_REPLACEMENT
+    entered = threading.Event()
+    candidate = {'index': 2}
+
+    class Source(object):
+        def snapshot(self):
+            return candidate
+
+    def validate(sample, _now):
+        assert sample is candidate
+        entered.set()
+        return WAITING_REPLACEMENT, None
+
+    seed, assessment = {'index': 1}, {'valid_until': _monotonic() + .1}
+    sampler = AsyncSafetySampler(Source(), validate, Clock())
+    try:
+        sampler.start(seed, assessment)
+        assert entered.wait(.5)
+        current = sampler.poll()
+        assert current['sample'] is seed and current['assessment'] is assessment
+    finally:
+        assert sampler.close(.5)
+
+
 def test_explicitly_transient_source_gaps_can_recover_without_fabricating_a_sample():
     from async_safety_sampler import AsyncSafetySampler
     class Source(object):

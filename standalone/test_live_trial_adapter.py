@@ -803,9 +803,9 @@ def test_split_trial_seeds_background_workers_from_the_checked_first_command():
         duration_sec=.6, period_sec=.02, serial_guard=FakeSerialGuard()).run()
     submissions = [item for item in result['renewal_checks'] if item['submitted']]
     assert len(seeded) == 1 and renewed and len(submissions) > 2
-    assert result['motion_timing']['pending_window_polls'] >= 2
+    assert result['motion_timing']['nonadvancing_window_polls'] >= 2
     assert submissions[0]['valid_until'] <= seeded[0][1]
-    assert submissions[1]['valid_until'] <= seeded[0][1]
+    assert submissions[1]['valid_until'] > submissions[0]['valid_until']
     assert result['sampler_closed'] and json.loads(relay.transport.lines[-1])['linear'] == 0
 
 

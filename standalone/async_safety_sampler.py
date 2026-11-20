@@ -11,6 +11,8 @@ from __future__ import division
 
 import threading
 
+WAITING_REPLACEMENT = object()
+
 
 class DecisionWarmup(object):  # noqa: UP004 - Python 2.7 ROS
     """Refresh observation history while a decision is pending; never command motion."""
@@ -97,6 +99,9 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
                     raise ValueError('sensor_unavailable')
                 if not validated:
                     reason, assessment = self.validate(sample, self.clock.now())
+                if reason is WAITING_REPLACEMENT:
+                    self._stop.wait(.005)
+                    continue
                 if reason is not None:
                     with self._lock:
                         self._fault = reason if isinstance(reason, str) and reason else 'sensor_unavailable'

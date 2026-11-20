@@ -43,9 +43,11 @@ def test_depth_advance_rechecks_depth_without_recomputing_scan():
 
     workers = SplitSensorValidation(capture, check, combine)
     try:
-        evidence, issue = workers.prepare({'snapshot_at': _monotonic()}, budget=.15)
+        first = {'snapshot_at': _monotonic()}
+        evidence, issue = workers.prepare(first, budget=.15)
         assert advance.is_set() and issue is None and evidence == (1, 2)
         assert calls == {'scan': [1], 'depth': [1, 2]}
+        workers.commit(first)
         sample = {'snapshot_at': _monotonic()}
         assert workers.prepare(sample, budget=.15) == ((1, 2), None)
         generation['depth'] = 3
@@ -66,5 +68,23 @@ def test_confirmed_stop_rejects_even_when_the_other_sensor_is_ready():
     try:
         for _ in range(2):
             assert workers.prepare({'snapshot_at': _monotonic()}, budget=.15) == (None, 'front_blocked')
+    finally:
+        assert workers.close()
+
+
+def test_replacement_keeps_active_proof_until_submission():
+    workers = SplitSensorValidation(
+        lambda stream, _sample: (stream, stream),
+        lambda _stream, sample, _value: (sample['name'], None),
+        lambda _sample, scan, depth, **_: ((scan, depth), None))
+    try:
+        old = {'snapshot_at': _monotonic(), 'name': 'old'}
+        new = {'snapshot_at': _monotonic(), 'name': 'new'}
+        workers.seed(old, 'old', 'old')
+        assert workers.prepare(new, budget=.15) == (('new', 'new'), None)
+        assert workers.read(old) == (('old', 'old'), None)
+        workers.commit(new)
+        assert workers.read(new) == (('new', 'new'), None)
+        assert workers.read(old) == (None, 'prepared_pending')
     finally:
         assert workers.close()
