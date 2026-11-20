@@ -64,6 +64,10 @@ are serialized with a bounded wait. A failed observation or assessment blocks
 new proofs; hard failures latch for the trial. The final proof and relay pipe
 write share the same processing guard. Sensor callbacks remain independent,
 and the relay still enforces each absolute intent expiry.
+The guarded longer trial starts its sampler while the relay is still at zero,
+waits for an assessed sample and a sufficiently long first intent, and retries
+temporarily incomplete forward coverage only while stationary. Once motion
+starts, the same incomplete coverage latches the trial to stop.
 
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also

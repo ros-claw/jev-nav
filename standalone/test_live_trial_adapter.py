@@ -172,6 +172,7 @@ def test_failed_serialized_snapshot_blocks_further_current_proofs():
     adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
     assert adapter.snapshot() is None
     assert adapter.current_valid_until({}) is None
+    assert adapter.current_issue() == 'source_depth_transform_changed'
 
 
 def test_hard_snapshot_failure_remains_latched_after_a_later_good_snapshot():
@@ -237,6 +238,34 @@ def test_transient_snapshot_gap_blocks_until_a_fresh_snapshot_succeeds():
     obs.snapshot = original
     assert isinstance(adapter.snapshot(), dict)
     assert adapter.current_valid_until({}) == 123.0
+
+
+def test_incomplete_coverage_requires_validated_recovery_not_just_a_snapshot():
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    assert adapter.validated_snapshot(lambda *_: (mod._INITIAL_COVERAGE_PENDING, None), clock.now)[0] is None
+    assert isinstance(adapter.snapshot(), dict)
+    assert adapter.current_valid_until({}) is None
+    assert isinstance(adapter.validated_snapshot(lambda *_: (None, {}), clock.now)[0], dict)
+    assert adapter.current_valid_until({}) == 123.0
+
+
+def test_depth_gate_rejection_cannot_collide_with_internal_coverage_pending():
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    rejected = {'candidate': False, 'reason': 'initial_coverage_pending'}
+    sample, reason, assessment = adapter.validated_snapshot(
+        lambda *_: ('initial_coverage_pending', rejected), clock.now)
+    assert isinstance(sample, dict) and reason == 'initial_coverage_pending' and assessment == rejected
+    assert adapter.current_valid_until({}) is None
+    adapter.validated_snapshot(lambda *_: (None, {}), clock.now)
+    assert adapter.current_valid_until({}) is None
 
 
 def test_background_assessment_failure_cannot_race_with_a_new_proof():
@@ -696,6 +725,231 @@ def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
                                    serial_guard=FakeSerialGuard()).run()
     assert result['motion_requested'] is True
     assert events == ['written', 'sampler']
+
+
+def test_guarded_trial_prepares_a_validated_sample_before_first_motion(monkeypatch):
+    import time
+    import async_safety_sampler
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    events = []
+    class RecordingRelay(mod.RelayAdapter):
+        def wait_for_frame_write(self, sequence):
+            events.append('written')
+            return True
+    original = async_safety_sampler.AsyncSafetySampler
+    class RecordingSampler(original):
+        def start(self):
+            events.append('sampler')
+            return original.start(self)
+        def poll(self):
+            result = original.poll(self)
+            if result['state'] == 'ready' and 'ready' not in events:
+                events.append('ready')
+            return result
+    monkeypatch.setattr(async_safety_sampler, 'AsyncSafetySampler', RecordingSampler)
+    clock = RealClock()
+    obs = Observation(clock)
+    adapter = mod.ObservationAdapter(obs, lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = RecordingRelay(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                           motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is True
+    assert events.index('sampler') < events.index('ready') < events.index('written')
+
+
+def test_incomplete_background_coverage_can_recover_only_before_motion(monkeypatch):
+    import time
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    clock = RealClock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    original = mod._assess_sample
+    background = []
+    def assess(sample, now, gate, require_image):
+        if threading.current_thread().name == 'limo-safety-sampler':
+            background.append(relay.had_motion)
+            if len(background) == 1:
+                return 'sensor_unavailable', None, {'check': 'front_forward_coverage_incomplete'}
+        return original(sample, now, gate, require_image)
+    monkeypatch.setattr(mod, '_assess_sample', assess)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=1., enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert len(background) >= 2 and background[0] is False
+    assert result['motion_requested'] is True
+
+
+def test_incomplete_background_coverage_after_motion_latches_stop(monkeypatch):
+    import time
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    clock = RealClock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    original = mod._assess_sample
+    failed_at = []
+    def assess(sample, now, gate, require_image):
+        if threading.current_thread().name == 'limo-safety-sampler' and relay.had_motion:
+            failed_at.append(clock.now())
+            return 'sensor_unavailable', None, {'check': 'front_forward_coverage_incomplete'}
+        return original(sample, now, gate, require_image)
+    monkeypatch.setattr(mod, '_assess_sample', assess)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=1., enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)['linear'] > 0]
+    assert moving and failed_at and result['stop_requested'] is True
+    assert all(frame['stamp'] <= failed_at[0] for frame in moving)
+
+
+@pytest.mark.parametrize('state', ('waiting', 'fault', 'stale', 'moving'))
+def test_guarded_trial_never_moves_on_unready_or_bad_initial_sample(monkeypatch, state):
+    import async_safety_sampler
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    adapter = mod.ObservationAdapter(obs, lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    class StubSampler(object):
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def start(self):
+            pass
+        def close(self, _timeout):
+            return True
+        def poll(self):
+            if state == 'waiting':
+                return {'state': 'waiting'}
+            if state == 'fault':
+                return {'state': 'fault', 'reason': 'sensor_unavailable'}
+            sample = adapter.snapshot()
+            if state == 'stale':
+                sample['snapshot_at'] = clock.now() - .3
+            else:
+                sample['state']['linear_x_mps'] = .01
+            return {'state': 'ready', 'sample': sample,
+                    'assessment': {'valid_until': clock.now() + .4}}
+    monkeypatch.setattr(async_safety_sampler, 'AsyncSafetySampler', StubSampler)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is False
+    assert all(json.loads(line)['linear'] == 0.0 for line in relay.transport.lines)
+
+
+def test_guarded_pre_motion_retry_waits_for_sampler_without_foreground_snapshot(monkeypatch):
+    import async_safety_sampler
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    adapter = mod.ObservationAdapter(obs, lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    original_snapshot = adapter.snapshot
+    active = [False]
+    def foreground_snapshot():
+        if active[0]:
+            raise AssertionError('foreground snapshot competes with the background sampler')
+        return original_snapshot()
+    adapter.snapshot = foreground_snapshot
+    calls = []
+    def validity(_sample):
+        calls.append(True)
+        return clock.now() + (.05 if len(calls) == 1 else .12)
+    adapter.current_valid_until = validity
+    class StubSampler(object):
+        def __init__(self, *_args, **_kwargs):
+            self.samples = []
+        def start(self):
+            self.samples = [original_snapshot() for _ in range(4)]
+            active[0] = True
+        def poll(self):
+            item = self.samples.pop(0) if len(self.samples) > 1 else self.samples[0]
+            return {'state': 'ready', 'sample': item,
+                    'assessment': {'valid_until': clock.now() + .4}}
+        def close(self, _timeout):
+            active[0] = False
+            return True
+    monkeypatch.setattr(async_safety_sampler, 'AsyncSafetySampler', StubSampler)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert len(calls) >= 2 and result['motion_requested'] is True
+    moving = [json.loads(line) for line in relay.transport.lines if json.loads(line)['linear'] > 0]
+    assert moving and all(frame['expires_at'] <= frame['stamp'] + .120001 for frame in moving)
+
+
+def test_guarded_pre_motion_retry_does_not_reuse_same_short_sample(monkeypatch):
+    import async_safety_sampler
+    mod = module()
+    clock = Clock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    calls = []
+    def validity(_sample):
+        calls.append(True)
+        return clock.now() + .05
+    adapter.current_valid_until = validity
+    class StubSampler(object):
+        def __init__(self, *_args, **_kwargs):
+            self.sample = None
+        def start(self):
+            self.sample = adapter.snapshot()
+        def poll(self):
+            return {'state': 'ready', 'sample': self.sample,
+                    'assessment': {'valid_until': clock.now() + .4}}
+        def close(self, _timeout):
+            return True
+    monkeypatch.setattr(async_safety_sampler, 'AsyncSafetySampler', StubSampler)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                   duration_sec=.6, enable_motion=True,
+                                   serial_guard=FakeSerialGuard()).run()
+    assert len(calls) == 1 and result['motion_requested'] is False
+    assert result['initial_preparation']['short_window'] == 1
+    assert result['initial_preparation']['same_sample'] > 0
+    assert result['initial_preparation']['largest_window_sec'] == pytest.approx(.05)
+    assert all(json.loads(line)['linear'] == 0.0 for line in relay.transport.lines)
 
 
 def test_longer_trial_requests_decision_after_relay_is_ready_at_zero():
@@ -1393,6 +1647,27 @@ def test_trial_refreshes_once_before_motion_if_initial_sample_is_nearly_expired(
     result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
                            enable_motion=True, serial_guard=FakeSerialGuard()).run()
     assert len(calls) > 1 and result['motion_requested'] is True
+
+
+def test_first_motion_waits_for_enough_time_to_prepare_the_next_observation():
+    mod = module()
+    clock = Clock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(), clock)
+    calls = []
+    def validity(_sample):
+        calls.append(True)
+        if len(calls) <= 2:
+            assert not relay.had_motion
+            return clock.now() + .05
+        return clock.now() + .12
+    adapter.current_valid_until = validity
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert len(calls) >= 3 and result['motion_requested'] is True
 
 
 def test_stationary_retry_can_outlast_two_seconds_without_sending_motion():

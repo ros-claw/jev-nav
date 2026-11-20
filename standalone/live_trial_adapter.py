@@ -27,6 +27,8 @@ import time
 import forward_trial as checks
 from relay import _monotonic
 
+_INITIAL_COVERAGE_PENDING = object()
+
 
 def _copy_scene(scene):
     """Own a fusion snapshot without recursively copying every numeric ray."""
@@ -65,6 +67,8 @@ class ObservationAdapter(object):
         self._processing_issue = None
         self._processing_blocked = False
         self._processing_latched = False
+        self._processing_blocked_reason = None
+        self._requires_validated_recovery = False
         self._processing_lock = threading.RLock() if serialize_processing else None
         self._encode_images = True
 
@@ -107,7 +111,7 @@ class ObservationAdapter(object):
             self._processing_issue = 'processing_busy'
             return False
         if self._processing_blocked:
-            self._processing_issue = 'snapshot_unavailable'
+            self._processing_issue = self._processing_blocked_reason or 'snapshot_unavailable'
             self._release_processing()
             return False
         return True
@@ -139,15 +143,18 @@ class ObservationAdapter(object):
             if self.serialize_processing:
                 if not isinstance(result, dict):
                     self._processing_blocked = True
+                    self._processing_blocked_reason = self.snapshot_issue() or 'snapshot_unavailable'
                     if not _transient_snapshot_gap(self):
                         self._processing_latched = True
-                elif not self._processing_latched:
+                elif not self._processing_latched and not self._requires_validated_recovery:
                     self._processing_blocked = False
+                    self._processing_blocked_reason = None
             return result
         except BaseException:
             if self.serialize_processing:
                 self._processing_blocked = True
                 self._processing_latched = True
+                self._processing_blocked_reason = 'snapshot_exception'
             raise
         finally:
             self._release_processing()
@@ -161,19 +168,31 @@ class ObservationAdapter(object):
             sample = self._snapshot_unlocked()
             if not isinstance(sample, dict):
                 self._processing_blocked = True
+                self._processing_blocked_reason = self.snapshot_issue() or 'snapshot_unavailable'
                 if not _transient_snapshot_gap(self):
                     self._processing_latched = True
                 return None, None, None
             reason, assessment = validate(sample, now())
+            if reason is _INITIAL_COVERAGE_PENDING:
+                self._processing_blocked = True
+                self._requires_validated_recovery = True
+                self._processing_blocked_reason = 'source_initial_coverage_pending'
+                self._set_snapshot_issue('source_initial_coverage_pending')
+                return None, None, None
             if reason is not None or not isinstance(assessment, dict):
                 self._processing_latched = True
                 self._processing_blocked = True
+                self._processing_blocked_reason = (reason if isinstance(reason, str) and 0 < len(reason) <= 128
+                                                   else 'assessment_invalid')
             elif not self._processing_latched:
                 self._processing_blocked = False
+                self._processing_blocked_reason = None
+                self._requires_validated_recovery = False
             return sample, reason, assessment
         except BaseException:
             self._processing_blocked = True
             self._processing_latched = True
+            self._processing_blocked_reason = 'snapshot_exception'
             raise
         finally:
             self._release_processing()
@@ -215,7 +234,7 @@ class ObservationAdapter(object):
         try:
             self._processing_issue = None
             if self._processing_blocked:
-                self._processing_issue = 'snapshot_unavailable'
+                self._processing_issue = self._processing_blocked_reason or 'snapshot_unavailable'
                 return False
             return self.observation.is_current_sample(sample) is True
         except Exception:
@@ -236,7 +255,7 @@ class ObservationAdapter(object):
         try:
             self._processing_issue = None
             if self._processing_blocked:
-                self._processing_issue = 'snapshot_unavailable'
+                self._processing_issue = self._processing_blocked_reason or 'snapshot_unavailable'
                 return None
             method = getattr(self.observation, "current_valid_until", None)
             if callable(method):
@@ -619,7 +638,7 @@ def _transient_snapshot_gap(source):
     issue = issue_method() if callable(issue_method) else getattr(source, 'last_issue', None)
     return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
                      'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException',
-                     'source_processing_busy')
+                     'source_processing_busy', 'source_initial_coverage_pending')
 
 
 class StrictDepthGate(object):
@@ -1155,17 +1174,31 @@ class LiveTrial(object):
             previous_odom = current["odom_at"]
             first_sent_at = last_sent_at = None
             last_valid_until = None
+            initial_sample_used = None
             path, sequence = 0.0, self.relay.sequence + 1
             result["stage"] = "motion_loop"
             result["motion_timing"] = {"last_sample_sec": None, "max_sample_sec": 0.0,
                                        "last_submit_interval_sec": None}
+            if self.ASYNC_SAMPLING and getattr(self.source, 'serialize_processing', False) is True:
+                result['initial_preparation'] = {'waiting': 0, 'same_sample': 0, 'ready': 0,
+                                                 'guard_retries': 0, 'short_window': 0,
+                                                 'largest_window_sec': None, 'last_guard_issue': None,
+                                                 'sensor_rejections': {}}
             if self.ASYNC_SAMPLING:
                 from async_safety_sampler import AsyncSafetySampler
                 def validate_background(candidate, captured_at):
-                    reason, assessment, _ = _assess_sample(candidate, captured_at, self.depth_gate, False)
+                    reason, assessment, detail = _assess_sample(candidate, captured_at, self.depth_gate, False)
+                    if (not self._motion_started and reason == 'sensor_unavailable'
+                            and detail.get('check') == 'front_forward_coverage_incomplete'):
+                        return _INITIAL_COVERAGE_PENDING, None
                     return reason, assessment
                 sampler = AsyncSafetySampler(self.source, validate_background, self.clock,
                                              transient_unavailable=_transient_snapshot_gap)
+                if getattr(self.source, 'serialize_processing', False) is True:
+                    # Prepare the next checked observation while the relay is
+                    # still sending zeros, before any short-lived motion intent.
+                    sampler.start()
+                    sampler_started = True
             while True:
                 now = self._now()
                 if now >= deadline:
@@ -1174,9 +1207,47 @@ class LiveTrial(object):
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 if first_sent_at is None:
-                    # The post-relay sample was just checked; revalidate it
-                    # below against the latest scan, pose and guard state.
-                    now = self._now()
+                    if sampler is not None and sampler_started:
+                        pending = sampler.poll()
+                        if pending['state'] == 'fault':
+                            self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
+                            raise checks._StopError(pending['reason'])
+                        if pending['state'] != 'ready':
+                            result['initial_preparation']['waiting'] += 1
+                            if self.relay.send_zero_heartbeat() is not True:
+                                raise checks._StopError('relay_failure')
+                            self.clock.sleep(.01)
+                            continue
+                        if pending['sample'] is initial_sample_used:
+                            result['initial_preparation']['same_sample'] += 1
+                            if self.relay.send_zero_heartbeat() is not True:
+                                raise checks._StopError('relay_failure')
+                            self.clock.sleep(.01)
+                            continue
+                        current = pending['sample']
+                        initial_sample_used = current
+                        result['initial_preparation']['ready'] += 1
+                        self._last_depth_assessment = pending['assessment']
+                        now = self._stationary_with_retry(sample)
+                        distance, yaw = checks._delta(sample['image_pose'], current['pose'])
+                        if (current['epoch'] != sample['epoch'] or distance > .005 or yaw > .01
+                                or current['state']['linear_x_mps'] > .005
+                                or abs(current['state']['linear_y_mps']) > .005
+                                or abs(current['state']['angular_z_radps']) > .01):
+                            self._last_diagnostic = {'step': 'background_initial_stationary',
+                                                     'epoch_matches': current['epoch'] == sample['epoch'],
+                                                     'distance_m': distance, 'yaw_rad': yaw}
+                            raise checks._StopError('sensor_unavailable')
+                        if not _live_timestamps_fresh(current, now):
+                            self.clock.sleep(.01)
+                            continue
+                        anchor = previous = current['pose']
+                        previous_odom = current['odom_at']
+                        sequence = self.relay.sequence + 1
+                    else:
+                        # The post-relay sample was just checked; revalidate it
+                        # below against the latest scan, pose and guard state.
+                        now = self._now()
                 elif sampler is not None:
                     now = self._now()
                     # The producer keeps refreshing in parallel. Poll close
@@ -1261,6 +1332,8 @@ class LiveTrial(object):
                     self._last_diagnostic = {"step": "motion_final_timestamps"}
                     if first_sent_at is None and now < pre_motion_retry_until:
                         self.clock.sleep(0.01)
+                        if sampler is not None and sampler_started:
+                            continue
                         current, now = self._aligned_stationary_sample(sample)
                         if self.relay.send_zero_heartbeat() is not True:
                             raise checks._StopError("relay_failure")
@@ -1310,14 +1383,30 @@ class LiveTrial(object):
                     begin_guard = getattr(self.source, 'begin_command_check', None)
                     end_guard = getattr(self.source, 'end_command_check', None)
                     if not callable(begin_guard) or not callable(end_guard) or begin_guard() is not True:
+                        issue = getattr(self.source, 'current_issue', None)
+                        detail = issue() if callable(issue) else None
+                        self._last_diagnostic = {'step': 'command_guard', 'detail': detail}
+                        if (first_sent_at is None and sampler is not None and sampler_started
+                                and detail in ('source_initial_coverage_pending', 'source_sensor_alignment',
+                                               'source_missing_color', 'source_missing_info',
+                                               'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException',
+                                               'processing_busy')):
+                            result['initial_preparation']['guard_retries'] += 1
+                            result['initial_preparation']['last_guard_issue'] = detail
+                            self.clock.sleep(.01)
+                            continue
                         raise checks._StopError('sensor_unavailable')
                 try:
                     final_sensor_until = current_limit(current) if callable(current_limit) else None
                     now = self._now()
                     if not checks._finite(final_sensor_until):
                         issue = getattr(self.source, "current_issue", None)
-                        self._last_diagnostic = {"step": "motion_final_latest",
-                                                 "detail": issue() if callable(issue) else None}
+                        detail = issue() if callable(issue) else None
+                        self._last_diagnostic = {"step": "motion_final_latest", "detail": detail}
+                        if first_sent_at is None and 'initial_preparation' in result:
+                            label = detail if isinstance(detail, str) and 0 < len(detail) <= 128 else 'unavailable'
+                            reasons = result['initial_preparation']['sensor_rejections']
+                            reasons[label] = reasons.get(label, 0) + 1
                         if first_sent_at is not None:
                             raise checks._StopError("sensor_unavailable")
                         limiting, valid_until = "latest_sensors", now
@@ -1325,7 +1414,18 @@ class LiveTrial(object):
                         limits["latest_sensors"] = final_sensor_until
                         limiting = min(limits, key=limits.get)
                         valid_until = limits[limiting]
-                    if valid_until - now <= 0.03:
+                    # Starting with only one short frame leaves no time for
+                    # the next observation. While stopped, wait for a longer
+                    # *already valid* window; never extend an expiry.
+                    min_window = .08 if guarded and first_sent_at is None else .03
+                    if first_sent_at is None and 'initial_preparation' in result:
+                        window = valid_until - now
+                        largest = result['initial_preparation']['largest_window_sec']
+                        if checks._finite(window) and (largest is None or window > largest):
+                            result['initial_preparation']['largest_window_sec'] = window
+                    if valid_until - now <= min_window:
+                        if first_sent_at is None and 'initial_preparation' in result:
+                            result['initial_preparation']['short_window'] += 1
                         detail = (self._last_diagnostic.get('detail') if limiting == 'latest_sensors'
                                   and isinstance(self._last_diagnostic, dict) else None)
                         self._last_diagnostic = {"step": "intent_deadline", "limiting": limiting,
@@ -1334,6 +1434,8 @@ class LiveTrial(object):
                             self._last_diagnostic['detail'] = detail
                         if (first_sent_at is None and now < pre_motion_retry_until
                                 and limiting not in ("relay", "trial", "model_color", "model_scan")):
+                            if sampler is not None and sampler_started:
+                                continue
                             self.clock.sleep(0.01)
                             current, now = self._aligned_stationary_sample(sample)
                             if self.relay.send_zero_heartbeat() is not True:
@@ -1366,6 +1468,7 @@ class LiveTrial(object):
                     if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
                                              valid_until=valid_until) is not True:
                         raise checks._StopError("relay_failure")
+                    self._motion_started = True
                     if guarded:
                         wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
                         if callable(wait_for_write) and wait_for_write(sequence) is not True:
@@ -1373,7 +1476,6 @@ class LiveTrial(object):
                 finally:
                     if guarded:
                         end_guard()
-                self._motion_started = True
                 if sampler is not None and not sampler_started:
                     # Let the pipe writer finish the first short-lived intent
                     # before starting CPU-heavy perception in another thread.
