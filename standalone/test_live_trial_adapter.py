@@ -1703,6 +1703,34 @@ def test_motion_refreshes_before_short_sensor_deadline():
     assert max(b['stamp'] - a['stamp'] for a, b in zip(moving, moving[1:])) <= 0.021
 
 
+def test_motion_uses_monitor_deadline_after_final_sensor_check():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    checks = []
+
+    class Watchdog(FakeArbiter):
+        def valid_until(self):
+            return clock.now() + (.15 if checks else .015)
+
+    def check(_sample):
+        clock.sleep(.005)
+        checks.append(clock.now())
+        return clock.now() + .10
+
+    adapter.current_valid_until = check
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, Watchdog(), clock, enable_motion=True,
+                           serial_guard=FakeSerialGuard()).run()
+    first = result['renewal_checks'][0]
+    assert first['submitted']
+    assert first['sensor_check_started_at'] < first['sensor_checked_at'] <= first['checked_at']
+    assert first['limits']['ros_monitor'] >= first['sensor_checked_at'] + .14
+    assert first['valid_until'] <= first['limits']['latest_sensors']
+
+
 def test_motion_never_submits_an_intent_with_too_little_time_to_reach_the_relay():
     mod = module()
     clock = Clock()

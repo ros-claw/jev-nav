@@ -992,34 +992,48 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 limits['new_scan_veto'] = scan_until
                 probe.validation_limits = limits
                 deadline = min(limits.values())
-            # A newer depth frame must be independently assessed after the
-            # scan. An unchecked frame never inherits an earlier verdict.
-            with self.lock:
-                if self.epoch != probe.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
-                    return reject('epoch_or_guard')
-                if self.latest.get('scan') is not selected_scan:
-                    return reject('scan_generation_changed')
-                selected_depth = self.latest.get('depth')
-                selected_info = self.latest.get('info')
-                depth_odom = self.latest.get('odom')
-                if selected_depth is captured.get('depth'):
-                    selected_info = captured.get('info')
-                if selected_depth is not captured.get('depth'):
-                    if (not isinstance(selected_depth, dict) or not _finite(selected_depth.get('stamp'))
-                            or selected_depth['stamp'] <= captured['depth']['stamp']):
+            # Retry just the depth stage once if a frame arrives while it is
+            # projected. A changed scan or epoch still invalidates the check.
+            previous_depth = None
+            for _ in range(2):
+                with self.lock:
+                    if self.epoch != probe.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
+                        return reject('epoch_or_guard')
+                    if self.latest.get('scan') is not selected_scan:
+                        return reject('scan_generation_changed')
+                    selected_depth = self.latest.get('depth')
+                    if (previous_depth is not None and
+                            (not isinstance(selected_depth, dict)
+                             or not _finite(selected_depth.get('stamp'))
+                             or selected_depth['stamp'] <= previous_depth['stamp'])):
                         return reject('depth_timestamp_regression')
-                    probe.latest = dict(self.latest)
-                    probe.odom_history = list(getattr(self, 'odom_history', []))
-            if selected_depth['stamp'] != sample['depth_at']:
-                depth_checked_at = _monotonic()
-                if (not _finite(depth_checked_at) or depth_checked_at < probe.validation_checked_at
-                        or not probe._newest_depth_safe_locked(sample, selected_depth, depth_odom, depth_checked_at)):
-                    return reject('new_depth_unchecked')
-                probe.validation_checked_at = depth_checked_at
-                limits = dict(probe.validation_limits)
-                limits['latest_depth'] = selected_depth['stamp'] + LATEST_INPUT_MAX_AGE_SEC
-                probe.validation_limits = limits
-                deadline = min(limits.values())
+                    selected_info = self.latest.get('info')
+                    depth_odom = self.latest.get('odom')
+                    if selected_depth is captured.get('depth'):
+                        selected_info = captured.get('info')
+                    if selected_depth is not captured.get('depth'):
+                        if (not isinstance(selected_depth, dict) or not _finite(selected_depth.get('stamp'))
+                                or selected_depth['stamp'] <= captured['depth']['stamp']):
+                            return reject('depth_timestamp_regression')
+                        probe.latest = dict(self.latest)
+                        probe.odom_history = list(getattr(self, 'odom_history', []))
+                if selected_depth['stamp'] != sample['depth_at']:
+                    depth_checked_at = _monotonic()
+                    if (not _finite(depth_checked_at) or depth_checked_at < probe.validation_checked_at
+                            or not 0 <= depth_checked_at - sample['snapshot_at'] < .25
+                            or not probe._newest_depth_safe_locked(sample, selected_depth, depth_odom, depth_checked_at)):
+                        return reject('new_depth_unchecked')
+                    probe.validation_checked_at = depth_checked_at
+                    limits = dict(probe.validation_limits)
+                    limits['latest_depth'] = selected_depth['stamp'] + LATEST_INPUT_MAX_AGE_SEC
+                    probe.validation_limits = limits
+                    deadline = min(limits.values())
+                with self.lock:
+                    if self.latest.get('depth') is selected_depth:
+                        break
+                    previous_depth = selected_depth
+            else:
+                return reject('depth_replaced_during_retry')
             with self.lock:
                 now = _monotonic()
                 if (not _finite(now) or now < probe.validation_checked_at

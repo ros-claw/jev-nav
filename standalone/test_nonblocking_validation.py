@@ -107,8 +107,10 @@ def test_new_depth_is_checked_and_a_later_frame_is_rechecked(replace_again, monk
     scan_entered, scan_release = threading.Event(), threading.Event()
     depth_entered, depth_release = threading.Event(), threading.Event()
     checked, result = [], []
+    scan_computations = []
 
     def scan_check(probe, *_args):
+        scan_computations.append(True)
         scan_entered.set()
         accepted = scan_release.wait(2)
         probe._scan_veto_valid_until = _monotonic() + .2
@@ -148,6 +150,7 @@ def test_new_depth_is_checked_and_a_later_frame_is_rechecked(replace_again, monk
     assert not checker.is_alive()
     if replace_again is True:
         assert len(checked) == 2 and checked[-1] is observer.latest['depth']
+        assert len(scan_computations) == 1
         assert result and result[0] is not None and result[0] > _monotonic()
     elif replace_again == 'info':
         assert result == [None]

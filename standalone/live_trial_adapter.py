@@ -10,6 +10,7 @@ None of their status messages prove physical stopping or clearance.
 """
 from __future__ import division
 
+import collections
 import copy
 import errno
 import fcntl
@@ -1048,6 +1049,9 @@ class LiveTrial(object):
                 self._last_diagnostic = {"step": "post_trace_recheck", "timestamps_fresh": fresh,
                                          "current_sample": current,
                                          "snapshot_age_sec": now - sample["snapshot_at"]}
+                issue = getattr(self.source, "current_issue", None)
+                if not current and callable(issue):
+                    self._last_diagnostic["detail"] = issue()
                 if now >= deadline:
                     raise checks._StopError("sensor_unavailable")
                 self.clock.sleep(min(0.01, deadline - now))
@@ -1208,6 +1212,7 @@ class LiveTrial(object):
             result["stage"] = "motion_loop"
             result["motion_timing"] = {"last_sample_sec": None, "max_sample_sec": 0.0,
                                        "last_submit_interval_sec": None}
+            renewal_checks = collections.deque(maxlen=128)
             if self.ASYNC_SAMPLING and getattr(self.source, 'serialize_processing', False) is True:
                 result['initial_preparation'] = {'waiting': 0, 'same_sample': 0, 'ready': 0,
                                                  'guard_retries': 0, 'short_window': 0,
@@ -1392,9 +1397,7 @@ class LiveTrial(object):
                     raise checks._StopError("clock_invalid")
                 ros_limit = getattr(self.arbiter, "valid_until", None)
                 serial_limit = getattr(self.serial_guard, "valid_until", None)
-                ros_until = ros_limit() if callable(ros_limit) else None
-                serial_until = serial_limit() if callable(serial_limit) else None
-                limits = {"ros_monitor": ros_until, "serial_monitor": serial_until, "trial": deadline,
+                limits = {"trial": deadline,
                           "relay": proposed_first + self.MOTION_LIMIT_SEC,
                           "model_color": sample["color_at"] + checks.MODEL_MAX_AGE_SEC,
                           "model_scan": sample["scan_at"] + checks.MODEL_MAX_AGE_SEC,
@@ -1427,10 +1430,29 @@ class LiveTrial(object):
                             continue
                         raise checks._StopError('sensor_unavailable')
                 try:
+                    check_started = self._now()
                     final_sensor_until = current_limit(current) if callable(current_limit) else None
+                    sensor_checked = self._now()
+                    # These calls revalidate the monitor caches. Use the
+                    # current deadlines after sensor work, not those read
+                    # before it while a new watchdog packet could arrive.
+                    limits["ros_monitor"] = ros_limit() if callable(ros_limit) else None
+                    limits["serial_monitor"] = serial_limit() if callable(serial_limit) else None
                     now = self._now()
+                    check = {"sample_at": current["snapshot_at"], "sensor_check_started_at": check_started,
+                             "sensor_checked_at": sensor_checked, "checked_at": now,
+                             "previous_valid_until": last_valid_until,
+                             "limits": dict(limits, latest_sensors=final_sensor_until
+                                            if checks._finite(final_sensor_until) else None),
+                             "submitted": False}
+                    renewal_checks.append(check)
                     if last_valid_until is not None and now >= last_valid_until:
                         raise checks._StopError("intent_expired")
+                    missing = [name for name in ("ros_monitor", "serial_monitor")
+                               if not checks._finite(limits[name])]
+                    if missing:
+                        self._last_diagnostic = {"step": "intent_deadline", "missing": missing}
+                        raise checks._StopError("expiry_unavailable")
                     if not checks._finite(final_sensor_until):
                         issue = getattr(self.source, "current_issue", None)
                         detail = issue() if callable(issue) else None
@@ -1511,6 +1533,7 @@ class LiveTrial(object):
                     if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
                                              valid_until=valid_until) is not True:
                         raise checks._StopError("relay_failure")
+                    check.update({"submitted": True, "sequence": sequence, "valid_until": valid_until})
                     self._motion_started = True
                     if guarded:
                         wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
@@ -1541,6 +1564,8 @@ class LiveTrial(object):
             result["reason"] = "exception"
             result["error_class"] = type(exc).__name__
         finally:
+            if "motion_timing" in result:
+                result["renewal_checks"] = list(renewal_checks)
             if sampler is not None:
                 sampler.close(0)
             relay_exited = not attempted_arm
