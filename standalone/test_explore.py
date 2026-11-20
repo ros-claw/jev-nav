@@ -148,6 +148,33 @@ def test_base_state_keeps_mode_and_all_planar_velocities():
     assert base_state(odom, status, float('nan')) is None
 
 
+def test_current_sample_rejects_evidence_that_expires_during_check(monkeypatch):
+    import explore
+    class Value(object):
+        pass
+    class Guard(object):
+        faulted = False
+    clock = iter((100.0, 100.2))
+    monkeypatch.setattr(explore, '_monotonic', lambda: next(clock))
+    odom, status = Value(), Value()
+    odom.twist = Value()
+    odom.twist.twist = Value()
+    odom.twist.twist.linear, odom.twist.twist.angular = Value(), Value()
+    odom.twist.twist.linear.x = odom.twist.twist.linear.y = odom.twist.twist.angular.z = 0.0
+    status.motion_mode = status.error_code = status.vehicle_state = 0
+    status.control_mode, status.battery_voltage = 1, 12.2
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock = threading.Lock()
+    observer.epoch = 2
+    observer.clock_guard, observer.odom_guard = Guard(), Guard()
+    observer.latest = {'odom': {'stamp': 100.0, 'pose': (0.0, 0.0, 0.0), 'message': odom},
+                       'status': {'stamp': 100.0, 'message': status}, 'scan': {'stamp': 100.0},
+                       'depth': {'stamp': 100.0}}
+    sample = {'epoch': 2, 'snapshot_at': 100.0, 'scan_at': 100.0, 'status_at': 100.0,
+              'depth_at': 100.0, 'color_at': 100.0, 'pose': (0.0, 0.0, 0.0)}
+    assert observer.current_valid_until(sample) is None
+
+
 def test_current_sample_rejects_new_scan_odom_drift_or_base_fault():
     class Value(object):
         pass

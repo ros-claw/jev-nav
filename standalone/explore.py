@@ -882,7 +882,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                           "color": sample["color_at"] + 0.5}
                 self.current_limit_kind = min(limits, key=limits.get)
                 deadline = limits[self.current_limit_kind]
-                if not _finite(deadline) or deadline <= now:
+                checked_at = _monotonic()
+                if (not _finite(checked_at) or checked_at < now
+                        or not _finite(deadline) or deadline <= checked_at):
                     return reject("timestamps")
                 self.current_last_issue = None
                 return deadline
