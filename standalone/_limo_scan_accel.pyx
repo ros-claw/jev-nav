@@ -1,8 +1,70 @@
 # cython: language_level=2
-from libc.math cimport cos, fabs, sin, isnan, isinf
+from libc.math cimport atan2, cos, fabs, sin, isnan, isinf
 
 cdef inline bint finite(double x):
     return not isnan(x) and not isinf(x)
+
+
+def fast_newest_raw(ranges, angle_min_obj, increment_obj, lower_obj, upper_obj,
+                    extrinsics, scan_pose, current_pose, half_pi_obj):
+    """Project current raw rays, or return None for the checked scalar path."""
+    cdef double angle_min, increment, lower, upper, half_pi
+    cdef double theta, c, s, cc, cs, dx, dy, tx, ty, ex, ey, yaw
+    cdef double start_x, start_y, value, angle, x, y, bx, by, fraction, crossing
+    cdef Py_ssize_t index
+    cdef list crossings = []
+    try:
+        if (type(ranges) not in (list, tuple) or type(extrinsics) is not tuple or len(extrinsics) != 6
+                or type(scan_pose) is not tuple or len(scan_pose) != 3
+                or type(current_pose) is not tuple or len(current_pose) != 3
+                or any(type(v) is not float for v in
+                       (angle_min_obj, increment_obj, lower_obj, upper_obj, half_pi_obj)
+                       + extrinsics + scan_pose + current_pose)):
+            return None
+        angle_min, increment, lower, upper, half_pi = (angle_min_obj, increment_obj,
+                                                        lower_obj, upper_obj, half_pi_obj)
+        ex, ey, yaw = extrinsics[0], extrinsics[1], extrinsics[5]
+        theta = scan_pose[2] - current_pose[2]
+        c, s = cos(theta), sin(theta)
+        cc, cs = cos(current_pose[2]), sin(current_pose[2])
+        dx, dy = scan_pose[0] - current_pose[0], scan_pose[1] - current_pose[1]
+        tx, ty = cc * dx + cs * dy, -cs * dx + cc * dy
+        start_x, start_y = tx + c * ex - s * ey, ty + s * ex + c * ey
+        for index in range(len(ranges)):
+            item = ranges[index]
+            if type(item) is not float and type(item) is not int:
+                return None
+            value = item
+            if not finite(value) or not lower <= value < upper:
+                continue
+            angle = angle_min + index * increment + yaw
+            if not finite(angle):
+                return None
+            angle = atan2(sin(angle), cos(angle))
+            if fabs(fabs(angle) - half_pi) <= 1e-12:
+                return None
+            if angle < -half_pi or angle > half_pi:
+                continue
+            bx, by = ex + value * cos(angle), ey + value * sin(angle)
+            x, y = tx + c * bx - s * by, ty + s * bx + c * by
+            if not finite(x) or not finite(y):
+                return None
+            if (fabs(x + .20) <= 1e-12 or fabs(x - .65) <= 1e-12
+                    or fabs(fabs(y) - .17) <= 1e-12 or fabs(start_x - .60) <= 1e-12
+                    or fabs(x - .60) <= 1e-12):
+                return None
+            if -.20 <= x <= .65 and fabs(y) <= .17:
+                return True, []
+            if start_x <= .60 < x:
+                fraction = (.60 - start_x) / (x - start_x)
+                crossing = start_y + fraction * (y - start_y)
+                if not finite(crossing) or fabs(fabs(crossing) - .15) <= 1e-12:
+                    return None
+                if -.15 <= crossing <= .15:
+                    crossings.append(float(crossing))
+        return False, crossings
+    except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def fast_scan_points(ranges, double angle_min, double increment, double range_min,
@@ -115,6 +177,70 @@ cdef double largest_gap(list values, double half_width):
         if current > gap:
             gap = current
     return gap
+
+
+def fast_front_expiry(rays, scan_at_obj, snapshot_at_obj):
+    """Find expiry for a previously validated scene, or use scalar fallback."""
+    cdef double stamp, sx, sy, hx, hy, y, gap, deadline, expires, scan_at, snapshot_at
+    cdef Py_ssize_t index
+    cdef list crossings = []
+    cdef list latest = []
+    cdef list remaining
+    cdef set stamps = set()
+    try:
+        if (type(rays) is not list or not 32 <= len(rays) <= 2048
+                or type(scan_at_obj) is not float or type(snapshot_at_obj) is not float):
+            return None
+        scan_at, snapshot_at = scan_at_obj, snapshot_at_obj
+        for index in range(len(rays)):
+            ray = rays[index]
+            if type(ray) is not dict:
+                return None
+            stamp_obj, start, end = ray['stamp'], ray['start_base'], ray['hit_base']
+            if (type(stamp_obj) is not float or type(start) is not tuple or len(start) != 2
+                    or type(end) is not tuple or len(end) != 2
+                    or type(start[0]) is not float or type(start[1]) is not float
+                    or type(end[0]) is not float or type(end[1]) is not float):
+                return None
+            stamp, sx, sy, hx, hy = stamp_obj, start[0], start[1], end[0], end[1]
+            if not finite(stamp) or not 0 <= snapshot_at - stamp <= .65 or not 0 <= scan_at - stamp <= .4:
+                continue
+            if fabs(sx - .60) <= 1e-12 or fabs(hx - .60) <= 1e-12:
+                return None
+            if sx <= .60 < hx:
+                y = sy + (.60 - sx) / (hx - sx) * (hy - sy)
+                if not finite(y) or fabs(fabs(y) - .15) <= 1e-12:
+                    return None
+                if -.15 <= y <= .15:
+                    crossings.append((float(y), stamp_obj))
+                    stamps.add(stamp_obj)
+                    if len(stamps) > 8:
+                        return None
+                    if stamp == scan_at:
+                        latest.append(float(y))
+        if not crossings or not latest:
+            return None
+        gap = largest_gap([item[0] for item in crossings], .15)
+        if fabs(gap - (.035 + 1e-12)) <= 1e-11 or gap > .035 + 1e-12:
+            return None
+        gap = largest_gap(latest, .15)
+        if fabs(gap - (.07 + 1e-12)) <= 1e-11 or gap > .07 + 1e-12:
+            return None
+        deadline = scan_at + .5
+        for stamp_obj in sorted(stamps):
+            stamp = stamp_obj
+            expires = stamp + .65
+            if expires >= deadline:
+                break
+            remaining = [item[0] for item in crossings if item[1] > stamp_obj]
+            gap = largest_gap(remaining, .15)
+            if fabs(gap - (.035 - 1e-12)) <= 1e-11:
+                return None
+            if gap > .035 - 1e-12:
+                return float(expires)
+        return float(deadline)
+    except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def fast_assess_rays(rays, hits, double scan_stamp, long latest_valid, double now,

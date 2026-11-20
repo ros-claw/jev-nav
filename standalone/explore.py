@@ -374,27 +374,45 @@ def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
             gaps.extend(values[index] - values[index - 1] for index in range(1, len(values)))
             return max(gaps)
 
-        start = from_scan((extrinsics[0], extrinsics[1]))
-        crossings = []
-        for index, value in enumerate(ranges):
-            if isinstance(value, bool) or not isinstance(value, NUMBER_TYPES):
+        accelerated = None
+        if _native_scan is not None:
+            try:
+                candidate = _native_scan.fast_newest_raw(
+                    ranges, angle_min, increment, lower, upper, extrinsics,
+                    scan_pose, current_pose, math.pi / 2)
+                if (isinstance(candidate, tuple) and len(candidate) == 2
+                        and type(candidate[0]) is bool and isinstance(candidate[1], list)
+                        and len(candidate[1]) <= len(ranges)
+                        and all(type(value) is float and _finite(value) for value in candidate[1])):
+                    accelerated = candidate
+            except Exception:  # noqa: BLE001 - preserve checked scalar fallback
+                pass
+        if accelerated is not None:
+            blocked, crossings = accelerated
+            if blocked:
                 return False
-            if not _finite(value) or not lower <= value < upper:
-                continue
-            angle = angle_min + index * increment + extrinsics[5]
-            if not _finite(angle):
-                return False
-            angle = math.atan2(math.sin(angle), math.cos(angle))
-            if not -math.pi / 2 <= angle <= math.pi / 2:
-                continue
-            x = extrinsics[0] + value * math.cos(angle)
-            y = extrinsics[1] + value * math.sin(angle)
-            x, y = from_scan((x, y))
-            if -0.20 <= x <= 0.65 and abs(y) <= 0.17:
-                return False
-            value = crossing(start, (x, y))
-            if value is not None:
-                crossings.append(value)
+        else:
+            start = from_scan((extrinsics[0], extrinsics[1]))
+            crossings = []
+            for index, value in enumerate(ranges):
+                if isinstance(value, bool) or not isinstance(value, NUMBER_TYPES):
+                    return False
+                if not _finite(value) or not lower <= value < upper:
+                    continue
+                angle = angle_min + index * increment + extrinsics[5]
+                if not _finite(angle):
+                    return False
+                angle = math.atan2(math.sin(angle), math.cos(angle))
+                if not -math.pi / 2 <= angle <= math.pi / 2:
+                    continue
+                x = extrinsics[0] + value * math.cos(angle)
+                y = extrinsics[1] + value * math.sin(angle)
+                x, y = from_scan((x, y))
+                if -0.20 <= x <= 0.65 and abs(y) <= 0.17:
+                    return False
+                value = crossing(start, (x, y))
+                if value is not None:
+                    crossings.append(value)
         if not crossings or gap(crossings) > 0.07:
             return False
         if not have_history:

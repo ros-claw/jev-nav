@@ -591,6 +591,15 @@ def _validated_front_expiry(sample):
     """
     try:
         scan_at, snapshot_at = sample['scan_at'], sample['snapshot_at']
+        native = getattr(checks, '_native_scan', None)
+        if native is not None:
+            try:
+                accelerated = native.fast_front_expiry(sample['scene']['rays'], scan_at, snapshot_at)
+                if (type(accelerated) is float and checks._finite(accelerated)
+                        and 0 <= accelerated <= scan_at + .5):
+                    return accelerated
+            except Exception:  # noqa: BLE001 - use the existing checked scalar path
+                pass
         crossings = []
         for ray in sample['scene']['rays']:
             stamp = ray['stamp']

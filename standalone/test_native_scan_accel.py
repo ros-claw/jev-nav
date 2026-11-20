@@ -194,6 +194,205 @@ def test_native_raw_veto_matches_full_validation_on_varied_scans(monkeypatch):
     assert sum(calls) > 100
 
 
+def test_native_newest_raw_matches_scalar_scan_veto(monkeypatch):
+    from test_policy import fusion_scene
+    native = explore._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    assert hasattr(native, 'fast_newest_raw')
+    calls = []
+    class Meter(object):
+        def fast_newest_raw(self, *args):
+            value = native.fast_newest_raw(*args)
+            calls.append(value is not None)
+            return value
+        def fast_newest_history(self, *args):
+            return native.fast_newest_history(*args)
+    class Obj(object):
+        pass
+    scan = Obj()
+    scan.header = Obj()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -.8, 1.6 / 180.
+    scan.time_increment, scan.range_min, scan.range_max = 0., .1, 8.
+    pose = (0., 0., 0.)
+    scene = fusion_scene(10.0, 10.1, [2.] * 33, [2.] * 33)
+    extrinsics = (.105, 0., .1, 0., 0., 0.)
+    random.seed(6724)
+    for case in range(250):
+        scan.ranges = [random.uniform(.1, 4.) if random.random() < .7 else 0. for _ in range(181)]
+        if case % 4 == 0:
+            scan.ranges[90] = .3
+        if case % 7 == 0:
+            scan.ranges[15] = float('nan')
+        if case % 11 == 0:
+            scan.ranges[45] = float('inf')
+        if case % 13 == 0:
+            scan.ranges[55] = None
+        if case % 17 == 0:
+            scan.ranges[65] = True
+        shifted = (random.uniform(-.005, .005), random.uniform(-.005, .005),
+                   random.uniform(-.005, .005))
+        args = (scan, extrinsics, scene, 10.2, 10.1, pose, shifted, pose)
+        monkeypatch.setattr(explore, '_native_scan', None)
+        expected = explore.newest_scan_veto(*args)
+        monkeypatch.setattr(explore, '_native_scan', Meter())
+        assert explore.newest_scan_veto(*args) is expected
+    assert sum(calls) > 100
+    accepted = rejected = 0
+    for case in range(100):
+        scan.ranges = [2. if random.random() > .1 else 0. for _ in range(181)]
+        shifted = (random.uniform(-.002, .002), random.uniform(-.002, .002),
+                   random.uniform(-.002, .002))
+        if case % 3 == 0:
+            scan.ranges[90] = .3
+        args = (scan, extrinsics, scene, 10.2, 10.1, pose, shifted, pose)
+        monkeypatch.setattr(explore, '_native_scan', None)
+        expected = explore.newest_scan_veto(*args)
+        accepted += int(expected)
+        rejected += int(not expected)
+        monkeypatch.setattr(explore, '_native_scan', Meter())
+        assert explore.newest_scan_veto(*args) is expected
+    assert accepted > 0 and rejected > 0
+
+
+def test_native_newest_raw_falls_back_for_geometry_boundaries_and_malformed_ranges():
+    native = explore._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    pose = (0., 0., 0.)
+    extrinsics = (.1, 0., .1, 0., 0., 0.)
+    # A hit on the obstacle boundary must use the scalar comparison.
+    assert native.fast_newest_raw([.55], 0., .1, .1, 8., extrinsics,
+                                  pose, pose, explore.math.pi / 2) is None
+    assert native.fast_newest_raw([True], 0., .1, .1, 8., extrinsics,
+                                  pose, pose, explore.math.pi / 2) is None
+    assert native.fast_newest_raw([None], 0., .1, .1, 8., extrinsics,
+                                  pose, pose, explore.math.pi / 2) is None
+
+
+def test_native_newest_raw_never_bypasses_custom_range_iteration(monkeypatch):
+    native = explore._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    class MisleadingRanges(list):
+        def __iter__(self):
+            for index, value in enumerate(list.__iter__(self)):
+                yield .3 if index == 90 else value
+    class Obj(object):
+        pass
+    scan = Obj()
+    scan.header = Obj()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -.9, .01
+    scan.time_increment, scan.range_min, scan.range_max = 0., .1, 8.
+    scan.ranges = MisleadingRanges([2.] * 181)
+    extrinsics, pose = (.1, 0., .1, 0., 0., 0.), (0., 0., 0.)
+    assert native.fast_newest_raw(scan.ranges, scan.angle_min, scan.angle_increment,
+                                  scan.range_min, scan.range_max, extrinsics, pose, pose,
+                                  explore.math.pi / 2) is None
+    monkeypatch.setattr(explore, '_native_scan', native)
+    assert explore.newest_scan_veto(scan, extrinsics) is False
+
+
+def test_native_newest_raw_never_bypasses_numeric_subclass_semantics(monkeypatch):
+    native = explore._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    class Lower(float):
+        def __le__(self, _other):
+            return False
+    class Obj(object):
+        pass
+    scan = Obj()
+    scan.header = Obj()
+    scan.header.frame_id = 'laser_link'
+    scan.angle_min, scan.angle_increment = -.9, .01
+    scan.time_increment, scan.range_min, scan.range_max = 0., Lower(.1), 8.
+    scan.ranges = [2.] * 181
+    extrinsics = (.1, 0., .1, 0., 0., 0.)
+    monkeypatch.setattr(explore, '_native_scan', None)
+    expected = explore.newest_scan_veto(scan, extrinsics)
+    monkeypatch.setattr(explore, '_native_scan', native)
+    assert expected is False
+    assert explore.newest_scan_veto(scan, extrinsics) is expected
+
+
+def test_native_newest_raw_agrees_near_coverage_gap_threshold(monkeypatch):
+    native = explore._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    class Obj(object):
+        pass
+    scan = Obj()
+    scan.header = Obj()
+    scan.header.frame_id = 'laser_link'
+    scan.time_increment, scan.range_min, scan.range_max = 0., .1, 8.
+    scan.ranges = [2.] * 10
+    extrinsics = (.1, 0., .1, 0., 0., 0.)
+    lower, upper = .067, .068
+    monkeypatch.setattr(explore, '_native_scan', None)
+    for _ in range(35):
+        step = (lower + upper) / 2.
+        scan.angle_min, scan.angle_increment = -4.5 * step, step
+        if explore.newest_scan_veto(scan, extrinsics):
+            lower = step
+        else:
+            upper = step
+    values = []
+    for adjustment in (-1e-9, -1e-12, 0., 1e-12, 1e-9):
+        step = (lower + upper) / 2. + adjustment
+        scan.angle_min, scan.angle_increment = -4.5 * step, step
+        monkeypatch.setattr(explore, '_native_scan', None)
+        expected = explore.newest_scan_veto(scan, extrinsics)
+        monkeypatch.setattr(explore, '_native_scan', native)
+        assert explore.newest_scan_veto(scan, extrinsics) is expected
+        values.append(expected)
+    assert any(values) and not all(values)
+
+
+def test_native_front_expiry_matches_checked_scalar_across_ray_histories(monkeypatch):
+    import forward_trial
+    import live_trial_adapter
+    from test_policy import fusion_scene
+    native = forward_trial._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    assert hasattr(native, 'fast_front_expiry')
+    calls = []
+    class Meter(object):
+        def fast_front_expiry(self, *args):
+            value = native.fast_front_expiry(*args)
+            calls.append(value is not None)
+            return value
+    random.seed(1843)
+    hits = [2.] * 33
+    for case in range(180):
+        scene = fusion_scene(10., 10.1, hits, hits)
+        for ray in scene['rays']:
+            if random.random() < .15:
+                ray['stamp'] = 9.7
+            if random.random() < .15:
+                ray['hit_base'] = (2., random.uniform(-.5, .5))
+        sample = {'scan_at': 10.1, 'snapshot_at': 10.2, 'scene': scene}
+        monkeypatch.setattr(forward_trial, '_native_scan', None)
+        expected = live_trial_adapter._validated_front_expiry(sample)
+        monkeypatch.setattr(forward_trial, '_native_scan', Meter())
+        assert live_trial_adapter._validated_front_expiry(sample) == expected
+    assert sum(calls) > 20
+
+
+def test_native_front_expiry_bounds_work_for_pathological_histories():
+    import forward_trial
+    native = forward_trial._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    ray = {'stamp': 10., 'start_base': (.1, 0.), 'hit_base': (2., 0.)}
+    assert native.fast_front_expiry([ray] * 2049, 10., 10.1) is None
+    rays = [dict(ray, stamp=10. - i * .001) for i in range(32)]
+    assert native.fast_front_expiry(rays, 10., 10.1) is None
+
+
 def test_optional_native_scan_ingest_matches_scalar_fusion(monkeypatch):
     import limo_scan_fusion as fusion
     assert hasattr(fusion, '_native_scan')

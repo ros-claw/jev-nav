@@ -52,6 +52,11 @@ controller process after building. The binary is local and excluded from git;
 without it, the existing checked Python implementation is used. Geometric
 threshold ties and inputs outside the accelerated format also use that
 implementation. This optimization does not establish physical clearance.
+The accelerator also projects new raw scans and computes the expiry of an
+already checked forward cross-section. Unusual input types and boundary ties
+fall back to the scalar checks. The expiry accelerator bounds its work to
+2,048 rays and eight distinct acquisition timestamps; larger histories use
+the scalar implementation. These changes do not extend sensor freshness.
 
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
