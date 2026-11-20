@@ -65,6 +65,64 @@ def test_source_timestamp_uses_sensor_age_and_rejects_future_or_stale():
     assert source_time(100.0, 50.0, float('nan'), 0.5) is None
 
 
+def test_callback_retains_receipt_from_same_clock_pair_as_sensor_stamp(monkeypatch):
+    import explore
+    class Guard(object):
+        faulted = False
+        def observe(self, *_args):
+            return True
+    class Stamp(object):
+        def to_sec(self):
+            return 99.9
+    class Obj(object):
+        pass
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock = threading.Lock()
+    observer.clock_guard = observer.odom_guard = Guard()
+    observer.latest, observer.epoch, observer.limits = {}, 0, {'scan': .5}
+    observer.rospy = Obj()
+    observer.rospy.Time = Obj()
+    observer.rospy.Time.now = lambda: None
+    message = Obj()
+    message.header = Obj()
+    message.header.stamp = Stamp()
+    monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (100., 50.))
+    observer._receive(message, 'scan')
+    assert observer.latest['scan']['received_at'] == 50.
+    assert observer.latest['scan']['stamp'] == pytest.approx(49.9)
+    message.header.stamp.to_sec = lambda: 99.8
+    observer._receive(message, 'scan')
+    assert observer.epoch == 1
+    assert observer.epoch_issue == {'reason': 'sensor_time_regression', 'sensor': 'scan'}
+
+
+def test_callback_records_sensor_age_when_source_time_is_invalid(monkeypatch):
+    import explore
+    class Guard(object):
+        def observe(self, *_args):
+            return True
+    class Obj(object):
+        pass
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock, observer.clock_guard = threading.Lock(), Guard()
+    observer.latest, observer.epoch, observer.limits = {}, 0, {'odom': .25}
+    observer.rospy = Obj()
+    observer.rospy.Time = Obj()
+    observer.rospy.Time.now = lambda: None
+    message = Obj()
+    message.header = Obj()
+    message.header.stamp = Obj()
+    message.header.stamp.to_sec = lambda: 100.02
+    monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (100., 50.))
+    observer._receive(message, 'odom')
+    assert observer.epoch_issue['reason'] == 'source_time_invalid'
+    assert observer.epoch_issue['sensor_age_sec'] == pytest.approx(-.02)
+    message.header.stamp.to_sec = lambda: -1e308
+    monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (1e308, 50.))
+    observer._receive(message, 'odom')
+    assert 'sensor_age_sec' not in observer.epoch_issue
+
+
 def test_delayed_clock_pair_is_discarded_instead_of_false_clock_jump():
     times = iter([10.0, 10.004, 10.1, 10.14])
     first = sample_clocks(lambda: next(times), lambda: 100.0)

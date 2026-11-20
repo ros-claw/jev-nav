@@ -73,10 +73,11 @@ def _timestamps_fresh(sample, now):
         return False
 
 
-def _raw_scan(sample, need_canonical=True):
+def _raw_scan(sample, need_canonical=True, return_counts=False):
     """Validate and classify raw sensor-frame rays; retain unknown encodings."""
     try:
-        if type(need_canonical) is not bool:
+        if (type(need_canonical) is not bool or type(return_counts) is not bool
+                or return_counts and need_canonical):
             return "sensor_unavailable", None
         raw, extrinsics = sample["raw_scan"], sample["laser_extrinsics"]
         if (not isinstance(raw, dict) or not isinstance(raw.get("frame_id"), STRING_TYPES)
@@ -115,6 +116,8 @@ def _raw_scan(sample, need_canonical=True):
                     blocked, front_count, valid_count = accelerated
                     if blocked:
                         return "front_blocked", None
+                    if return_counts:
+                        return None, (front_count, valid_count)
                     coverage = sample["scene"]["coverage"]
                     if (front_count != coverage.get("front_samples")
                             or valid_count != coverage.get("latest_valid_samples")):
@@ -161,6 +164,8 @@ def _raw_scan(sample, need_canonical=True):
                 blocked = True
         if blocked:
             return "front_blocked", None
+        if return_counts:
+            return None, (front_count, valid_count)
         coverage = sample["scene"]["coverage"]
         if (front_count != coverage.get("front_samples")
                 or valid_count != coverage.get("latest_valid_samples")):

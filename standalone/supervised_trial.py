@@ -16,6 +16,11 @@ import os
 import threading
 import time
 
+try:
+    INTEGER_TYPES = (int, long)  # noqa: F821 - Python 2.7 ROS
+except NameError:
+    INTEGER_TYPES = (int,)
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
@@ -51,6 +56,31 @@ def trial_period(args):
     return 0.025 if args.single_threaded else 0.05
 
 
+def trial_exit_code(result, observed):
+    """Report diagnostic success only for a completed trial with odom movement.
+
+    Five millimetres is a diagnostic threshold, not independently verified
+    physical displacement or a navigation acceptance threshold.
+    """
+    try:
+        displacement = observed['odom_displacement_m']
+        commands = observed['nonzero_cmd_vel_messages']
+        if (result.get('reason') in ('time_limit', 'motion_limit', 'distance_limit')
+                and result.get('motion_requested') is True
+                and result.get('stop_requested') is True
+                and ('sampler_closed' not in result or result['sampler_closed'] is True)
+                and result.get('source_restore_failed', False) is False
+                and observed.get('measurement_scope') == 'relay_callback_window'
+                and observed.get('relay_caller_observed') is True
+                and not isinstance(displacement, bool) and not math.isnan(displacement)
+                and not math.isinf(displacement) and displacement >= .005
+                and not isinstance(commands, bool) and isinstance(commands, INTEGER_TYPES) and commands > 0):
+            return 0
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        pass
+    return 2
+
+
 def summarize_observations(odometry, commands):
     """Keep reported odometry separate from observed commands and physical proof."""
     result = {'odom_samples': 0, 'odom_displacement_m': None, 'max_abs_odom_speed_mps': None,
@@ -73,6 +103,42 @@ def summarize_observations(odometry, commands):
         1 for item in commands if isinstance(item, (tuple, list)) and len(item) == 3
         and all(finite(value) for value in item) and (item[1] != 0 or item[2] != 0))
     return result
+
+
+def summarize_trial_observations(odometry, commands, expected_caller, started, ended):
+    """Use relay-attributed command and odometry callback timestamps.
+
+    ROS caller IDs are not authenticated; the result is not independent
+    physical motion or stopping verification. ROS topic callbacks can be
+    delayed or reordered, so this is not the relay's actual motion interval.
+    """
+    summary = summarize_observations([], [])
+    summary.update({'measurement_scope': 'relay_callback_window', 'relay_caller_observed': False})
+    try:
+        if (not isinstance(expected_caller, str) or not expected_caller.startswith('/')
+                or math.isnan(started) or math.isinf(started) or math.isnan(ended) or math.isinf(ended)
+                or not 0 <= started <= ended):
+            return summary
+        relevant = sorted(item for item in commands if isinstance(item, (tuple, list)) and len(item) == 4
+                          and item[3] == expected_caller and started <= item[0] <= ended)
+        selected = [item for item in relevant if item[1] != 0 or item[2] != 0]
+        if not selected:
+            return summary
+        first = selected[0][0]
+        zeros = [item[0] for item in relevant if item[0] > first and item[1] == 0 and item[2] == 0]
+        stop = min(zeros) if zeros else selected[-1][0]
+        if any(item[0] > stop for item in selected):
+            return summary
+        # Exclude pre-command movement and post-session motion. This may
+        # undercount the first short movement but avoids attributing unrelated
+        # movement to the trial.
+        scoped_odom = sorted(item for item in odometry if isinstance(item, (tuple, list)) and len(item) == 4
+                             and first <= item[0] <= stop)
+        summary = summarize_observations(scoped_odom, [item[:3] for item in selected])
+        summary.update({'measurement_scope': 'relay_callback_window', 'relay_caller_observed': True})
+    except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        pass
+    return summary
 
 
 class RealClock(object):  # noqa: UP004 - ROS Melodic Python 2
@@ -119,7 +185,8 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def _command(self, message):
         try:
-            item = (self.clock.now(), float(message.linear.x), float(message.angular.z))
+            caller = getattr(message, '_connection_header', {}).get('callerid')
+            item = (self.clock.now(), float(message.linear.x), float(message.angular.z), caller)
             with self.lock:
                 self.commands.append(item)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -127,7 +194,11 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def summary(self):
         with self.lock:
-            return summarize_observations(list(self.odometry), list(self.commands))
+            return summarize_observations(list(self.odometry), [item[:3] for item in self.commands])
+
+    def trial_summary(self, caller, started, ended):
+        with self.lock:
+            return summarize_trial_observations(list(self.odometry), list(self.commands), caller, started, ended)
 
 
 def main(argv=None):
@@ -191,13 +262,19 @@ def main(argv=None):
                         period_sec=trial_period(args),
                         serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
                         operator_site_report=report)
+    trial_started = clock.now()
     result = trial.run()
+    trial_ended = clock.now()
     # Continue read-only observation briefly after the relay has been closed.
     time.sleep(0.7)
+    caller = result.get('ros_guard_evidence', {}).get('relay_node')
+    observed = recorder.trial_summary(caller, trial_started, trial_ended)
+    exit_code = trial_exit_code(result, observed)
     print(json.dumps({'mode': 'supervised_single_trial', 'result': result,
-                      'observed': recorder.summary(), 'observation': observation.diagnostic_status()},
+                      'observed': observed, 'exit_code': exit_code,
+                      'observation': observation.diagnostic_status()},
                      allow_nan=False))
-    return 0
+    return exit_code
 
 
 if __name__ == '__main__':

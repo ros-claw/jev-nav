@@ -71,6 +71,18 @@ waits for an assessed sample and a sufficiently long first intent, and retries
 temporarily incomplete forward coverage only while stationary. Once motion
 starts, the same incomplete coverage latches the trial to stop.
 
+The November 20 perception and renewal work adds **read-only diagnostics**:
+`sensing_timeline.py` and `live_independent_probe.py` record acquisition,
+queueing and processing times, while `multiprocess_probe.py` runs independent
+scan and depth workers and an in-memory `RelayGate`. The latter does not
+publish velocity or check base status, odometry continuity or clearance.
+Its `timeline_complete`/`mux_writer_complete` field refers to the mux writer
+only; child shutdown events can be present only in the child timelines.
+The immutable cache and local cell evidence modules are experimental and are
+not connected to a motion controller. Sampled centers do not prove continuous
+3-D coverage or a swept-footprint clearance. Full scan/depth coverage and
+independent fault propagation remain open problems.
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import select
 import subprocess
 import sys
@@ -341,7 +342,8 @@ class DecisionsAdapter(object):
                     or result.get("choice") not in ("forward", "left", "right", "stop")):
                 return rejected
             return {"ok": True, "choice": result["choice"], "observation_id": evidence["observation_id"]}
-        except Exception:
+        except Exception as exc:
+            rejected['error_class'] = type(exc).__name__
             return rejected
 
 
@@ -796,7 +798,24 @@ def _assess_sample(sample, now, depth_gate, require_image):
                 or assessment["depth_at"] != sample["depth_at"]
                 or assessment.get("geometric_clearance_verified") is not False):
             return "depth_gate_invalid", None, detail
-        assessment = copy.deepcopy(assessment)
+        allowed = (('depth_grid_accepted', 'sampled_depth_corridor') if assessment['candidate'] else
+                   ('depth_unavailable', 'depth_grid_incomplete', 'depth_near_or_unknown',
+                    'depth_obstacle', 'depth_unclassified'))
+        if assessment['reason'] not in allowed:
+            return 'depth_gate_invalid', None, detail
+        keep = ('candidate', 'reason', 'depth_at', 'geometric_clearance_verified',
+                'valid_until', 'valid_count', 'ground_count', 'unobserved_space',
+                'unknown_space', 'calibration_verified')
+        assessment = {name: assessment[name] for name in keep if name in assessment}
+        if 'valid_until' in assessment and not checks._finite(assessment['valid_until']):
+            return 'depth_gate_invalid', None, detail
+        for name in ('unobserved_space', 'unknown_space', 'calibration_verified'):
+            if name in assessment and type(assessment[name]) is not bool:
+                return 'depth_gate_invalid', None, detail
+        for name in ('valid_count', 'ground_count'):
+            if name in assessment and (isinstance(assessment[name], bool)
+                    or not isinstance(assessment[name], checks.INTEGER_TYPES) or assessment[name] < 0):
+                return 'depth_gate_invalid', None, detail
         if not assessment['candidate']:
             return assessment['reason'], assessment, detail
         # Do not extend a gap-filled front proof beyond the first expiry that
@@ -903,6 +922,9 @@ class LiveTrial(object):
         self._model_fresh(sample, now)
         if (not isinstance(decision, dict) or decision.get("ok") is not True
                 or decision.get("observation_id") != evidence["observation_id"]):
+            name = decision.get('error_class') if isinstance(decision, dict) else None
+            if isinstance(name, str) and re.match(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$', name):
+                self._last_diagnostic = {'step': 'decision', 'error_class': name}
             raise checks._StopError("model_invalid")
         result["model_choice"] = decision.get("choice")
         if decision.get("choice") != "forward":
@@ -1500,8 +1522,9 @@ class LiveTrial(object):
                     raise checks._StopError("time_limit")
         except checks._StopError as exc:
             result["reason"] = str(exc)
-        except BaseException:
+        except BaseException as exc:
             result["reason"] = "exception"
+            result["error_class"] = type(exc).__name__
         finally:
             if sampler is not None:
                 sampler.close(0)

@@ -552,6 +552,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self._scan_veto_cache = []
         self.projection_only = False
         self.epoch = 0
+        self.epoch_issue = None
         self.fusion_epoch = None
         self.snapshot_last_issue = None
         self.current_last_issue = None
@@ -580,18 +581,28 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 if not self.clock_guard.observe(ros_now, received):
                     self.latest.clear()
                     self.epoch += 1
+                    self.epoch_issue = {'reason': 'clock_fault', 'sensor': name}
                     return
-                stamp = source_time(ros_now, received, message.header.stamp.to_sec(), self.limits[name])
+                header_stamp = message.header.stamp.to_sec()
+                stamp = source_time(ros_now, received, header_stamp, self.limits[name])
                 if stamp is None:
                     self.latest.pop(name, None)
                     self.epoch += 1
+                    self.epoch_issue = {'reason': 'source_time_invalid', 'sensor': name}
+                    if _finite(header_stamp) and _finite(ros_now):
+                        age = ros_now - header_stamp
+                        if _finite(age):
+                            self.epoch_issue['sensor_age_sec'] = age
                     return
-                entry = {"message": message, "stamp": stamp}
+                # Keep the receipt in the same monotonic/ROS clock pairing as
+                # the acquisition stamp; it must never predate that stamp.
+                entry = {"message": message, "stamp": stamp, "received_at": received}
                 if name == "odom":
                     if (message.header.frame_id.lstrip("/") != "odom"
                             or message.child_frame_id.lstrip("/") != "base_link"):
                         self.latest.pop(name, None)
                         self.epoch += 1
+                        self.epoch_issue = {'reason': 'odom_frame_invalid', 'sensor': name}
                         return
                     p = message.pose.pose.position
                     q = message.pose.pose.orientation
@@ -600,22 +611,26 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                             or not 0.99 <= sum(x * x for x in quaternion) <= 1.01):
                         self.latest.pop(name, None)
                         self.epoch += 1
+                        self.epoch_issue = {'reason': 'odom_pose_invalid', 'sensor': name}
                         return
                     roll, pitch, yaw = self.tf.transformations.euler_from_quaternion(quaternion)
                     if abs(roll) > 0.1 or abs(pitch) > 0.1:
                         self.latest.pop(name, None)
                         self.epoch += 1
+                        self.epoch_issue = {'reason': 'odom_tilt_invalid', 'sensor': name}
                         return
                     entry["pose"] = (p.x, p.y, yaw)
                     if not self.odom_guard.observe(message.header.seq, stamp, entry["pose"]):
                         self.latest.clear()
                         self.odom_history.clear()
                         self.epoch += 1
+                        self.epoch_issue = {'reason': 'odom_discontinuity', 'sensor': name}
                         return
                 previous = self.latest.get(name)
                 if previous is not None and stamp <= previous["stamp"]:
                     self.latest.pop(name, None)
                     self.epoch += 1
+                    self.epoch_issue = {'reason': 'sensor_time_regression', 'sensor': name}
                     return
                 self.latest[name] = entry
                 if name == "odom":
@@ -625,6 +640,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             with self.lock:
                 self.latest.pop(name, None)
                 self.epoch += 1
+                self.epoch_issue = {'reason': 'callback_invalid', 'sensor': name}
             return
 
     def snapshot(self):
@@ -774,6 +790,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     def break_epoch(self):
         with self.lock:
             self.epoch += 1
+            self.epoch_issue = {'reason': 'explicit_epoch_break', 'sensor': 'unknown'}
 
     def is_current_epoch(self, epoch):
         with self.lock:
@@ -1185,6 +1202,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     for name, record in self.latest.items()}
             return {"epoch": self.epoch, "clock_fault": self.clock_guard.fault_reason,
                     "odom_fault": self.odom_guard.fault_reason, "sensor_ages_sec": ages,
+                    "epoch_issue": getattr(self, 'epoch_issue', None),
                     "snapshot_issue": getattr(self, "snapshot_last_issue", None)}
 
 

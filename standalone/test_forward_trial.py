@@ -27,6 +27,16 @@ class Clock(object):
         self.t += seconds
 
 
+def test_raw_scan_can_return_validated_counts_without_requiring_a_fused_scene():
+    mod = trial_module()
+    sample = Source(Clock()).snapshot()
+    sample['scene'] = {'coverage': {'scan_pose': sample['pose']}}
+    reason, counts = mod._raw_scan(sample, need_canonical=False, return_counts=True)
+    assert reason is None and counts == (33, 33)
+    sample['raw_scan']['ranges'][0] = True
+    assert mod._raw_scan(sample, need_canonical=False, return_counts=True)[0] == 'sensor_unavailable'
+
+
 class Source(object):
     simulation_only = True
 

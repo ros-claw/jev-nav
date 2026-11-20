@@ -569,6 +569,29 @@ def test_decisions_adapter_binds_response_to_image_scan_and_epoch():
     assert mod.make_evidence(altered)["observation_id"] != bound["observation_id"]
 
 
+def test_model_exception_exposes_only_class_not_sensitive_message():
+    mod = module()
+    bound = mod.make_evidence(source(Clock())[0].snapshot())
+    def fail(_payload, _timeout):
+        raise RuntimeError('Authorization secret details')
+    decision = mod.DecisionsAdapter(fail).decide(bound)
+    assert decision['ok'] is False and decision['error_class'] == 'RuntimeError'
+    assert 'secret' not in str(decision) and 'Authorization' not in str(decision)
+
+
+def test_model_invalid_diagnostic_never_copies_untrusted_error_text():
+    mod = module()
+    class BadModel(object):
+        def decide(self, _evidence):
+            return {'ok': False, 'error_class': 'Authorization secret details'}
+    clock = Clock()
+    relay = mod.RelayAdapter(Transport(), clock)
+    result = mod.LiveTrial(source(clock)[0], BadModel(), relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'model_invalid'
+    assert 'secret' not in str(result) and 'Authorization' not in str(result)
+
+
 def test_decisions_adapter_rejects_mismatched_or_failed_response():
     mod = module()
     bound = mod.make_evidence(source(Clock())[0].snapshot())
@@ -1212,7 +1235,7 @@ class ProjectedDepthFixture(object):
         self.candidate, self.mismatched = candidate, mismatched
 
     def assess(self, sample, now):
-        return {"candidate": self.candidate, "reason": "projected_obstacle" if not self.candidate else "diagnostic",
+        return {"candidate": self.candidate, "reason": "depth_obstacle" if not self.candidate else "sampled_depth_corridor",
                 "depth_at": sample["depth_at"] - (1.0 if self.mismatched else 0),
                 "geometric_clearance_verified": False, "unknown_space": True}
 
@@ -1235,12 +1258,46 @@ def test_explicit_depth_gate_can_classify_ground_without_claiming_clearance():
 
 def test_depth_gate_rejection_and_wrong_frame_are_fail_closed():
     mod = module()
-    for gate, reason in ((ProjectedDepthFixture(False), "projected_obstacle"),
+    for gate, reason in ((ProjectedDepthFixture(False), "depth_obstacle"),
                          (ProjectedDepthFixture(True, mismatched=True), "depth_gate_invalid")):
         clock = Clock()
         result = mod.LiveTrial(source(clock)[0], None, mod.RelayAdapter(Transport(), clock),
                                None, clock, depth_gate=gate).run()
         assert result["reason"] == reason
+
+
+def test_untrusted_depth_gate_reason_does_not_enter_result():
+    mod = module()
+    class BadGate(object):
+        def assess(self, sample, _now):
+            return {'candidate': False, 'reason': 'AUTH_SECRET_EVIDENCE',
+                    'depth_at': sample['depth_at'], 'geometric_clearance_verified': False}
+    clock = Clock()
+    result = mod.LiveTrial(source(clock)[0], None, mod.RelayAdapter(Transport(), clock),
+                           None, clock, depth_gate=BadGate()).run()
+    assert result['reason'] == 'depth_gate_invalid' and 'AUTH_SECRET' not in str(result)
+
+
+def test_untrusted_depth_gate_extra_fields_are_not_returned():
+    mod = module()
+    class BadGate(object):
+        def assess(self, sample, _now):
+            return {'candidate': True, 'reason': 'sampled_depth_corridor', 'depth_at': sample['depth_at'],
+                    'geometric_clearance_verified': False, 'header': 'AUTH_SECRET_EVIDENCE'}
+    sample = source(Clock())[0].snapshot()
+    reason, assessment, _ = mod._assess_sample(sample, 100., BadGate(), True)
+    assert reason is None and 'AUTH_SECRET' not in str(assessment)
+
+
+def test_rejected_depth_gate_cannot_smuggle_non_numeric_deadline():
+    mod = module()
+    class BadGate(object):
+        def assess(self, sample, _now):
+            return {'candidate': False, 'reason': 'depth_obstacle', 'depth_at': sample['depth_at'],
+                    'geometric_clearance_verified': False, 'valid_until': 'AUTH_SECRET_EVIDENCE'}
+    sample = source(Clock())[0].snapshot()
+    reason, assessment, _ = mod._assess_sample(sample, 100., BadGate(), True)
+    assert reason == 'depth_gate_invalid' and 'AUTH_SECRET' not in str(assessment)
 
 
 def test_motion_opt_in_still_requires_atomic_exclusive_arbitration():

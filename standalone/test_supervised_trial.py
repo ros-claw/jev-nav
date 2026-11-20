@@ -6,6 +6,8 @@ from supervised_trial import (
     parse_args,
     summarize_observations,
     trial_period,
+    trial_exit_code,
+    summarize_trial_observations,
 )
 
 
@@ -61,6 +63,55 @@ def test_motion_accepts_explicit_assumptions_and_process_identity():
                        '--ground-z=-0.1', '--assume-rectified', '--driver-exe=/tmp/candidate',
                        '--driver-sha256=' + 'a' * 64])
     assert args.execute and args.driver_pid == 11139 and args.ground_z == -0.1
+
+
+def test_business_failure_and_no_measurable_odom_do_not_exit_successfully():
+    assert trial_exit_code({'reason': 'relay_failure', 'motion_requested': True},
+                           {'odom_displacement_m': .01, 'nonzero_cmd_vel_messages': 2}) != 0
+    assert trial_exit_code({'reason': 'time_limit', 'motion_requested': True},
+                           {'odom_displacement_m': .000001, 'nonzero_cmd_vel_messages': 2}) != 0
+    observed = {'odom_displacement_m': .006, 'nonzero_cmd_vel_messages': 2,
+                'measurement_scope': 'relay_callback_window', 'relay_caller_observed': True}
+    assert trial_exit_code({'reason': 'motion_limit', 'motion_requested': True, 'stop_requested': True},
+                           observed) == 0
+    assert trial_exit_code({'reason': 'motion_limit', 'motion_requested': True},
+                           {'odom_displacement_m': float('nan'), 'nonzero_cmd_vel_messages': 2}) != 0
+    assert trial_exit_code({'reason': 'motion_limit', 'motion_requested': True},
+                           {'odom_displacement_m': .006, 'nonzero_cmd_vel_messages': '2'}) != 0
+    for extra in ({'stop_requested': False}, {'stop_requested': True, 'sampler_closed': False},
+                  {'stop_requested': True, 'source_restore_failed': True}):
+        result = {'reason': 'motion_limit', 'motion_requested': True}
+        result.update(extra)
+        assert trial_exit_code(result, observed) != 0
+
+
+def test_trial_summary_excludes_warmup_and_nonrelay_commands():
+    odom = [(1., 0., 0., 0.), (2., .2, 0., 0.), (2.95, .2, 0., 0.),
+            (3.1, .2, 0., 0.), (3.15, .2, 0., 0.), (3.4, .2, 0., 0.)]
+    commands = [(1.5, .02, 0., '/other'), (3., .02, 0., '/other'),
+                (3.05, .02, 0., '/relay'), (3.2, 0., 0., '/relay')]
+    summary = summarize_trial_observations(odom, commands, '/relay', 2.5, 3.2)
+    assert summary['nonzero_cmd_vel_messages'] == 1
+    assert summary['odom_displacement_m'] == pytest.approx(0.)
+    assert summary['measurement_scope'] == 'relay_callback_window'
+    assert summary['relay_caller_observed'] is True
+    missing = summarize_trial_observations(odom, commands, '/wrong', 2.5, 3.2)
+    assert missing['nonzero_cmd_vel_messages'] == 0 and missing['odom_displacement_m'] is None
+
+
+def test_trial_summary_never_counts_motion_before_first_command_or_after_end():
+    odom = [(9.95, 0., 0., 0.), (10.05, .01, 0., 0.), (10.2, .01, 0., 0.),
+            (11.2, .02, 0., 0.)]
+    commands = [(10., .02, 0., '/relay'), (10.3, 0., 0., '/relay')]
+    summary = summarize_trial_observations(odom, commands, '/relay', 9.5, 11.)
+    assert summary['odom_displacement_m'] == pytest.approx(0.)
+
+
+def test_trial_summary_excludes_motion_after_relay_zero_even_before_run_returns():
+    odom = [(10.12, 0., 0., 0.), (10.19, 0., 0., 0.), (10.8, .01, 0., 0.)]
+    commands = [(10.1, .02, 0., '/relay'), (10.2, 0., 0., '/relay')]
+    summary = summarize_trial_observations(odom, commands, '/relay', 10., 11.)
+    assert summary['odom_displacement_m'] == pytest.approx(0.)
 
 
 def test_observation_summary_distinguishes_command_from_reported_odometry():
