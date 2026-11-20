@@ -71,7 +71,13 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
     def _run(self):
         try:
             while not self._stop.is_set():
-                sample = self.source.snapshot()
+                validated = (getattr(self.source, 'serialize_processing', False) is True
+                             and callable(getattr(self.source, 'validated_snapshot', None)))
+                if validated:
+                    sample, reason, assessment = self.source.validated_snapshot(
+                        self.validate, self.clock.now)
+                else:
+                    sample = self.source.snapshot()
                 if self._stop.is_set():
                     return
                 if not isinstance(sample, dict):
@@ -80,7 +86,8 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
                         self._stop.wait(.01)
                         continue
                     raise ValueError('sensor_unavailable')
-                reason, assessment = self.validate(sample, self.clock.now())
+                if not validated:
+                    reason, assessment = self.validate(sample, self.clock.now())
                 if reason is not None:
                     with self._lock:
                         self._fault = reason if isinstance(reason, str) and reason else 'sensor_unavailable'

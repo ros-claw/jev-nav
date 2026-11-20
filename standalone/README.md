@@ -57,6 +57,13 @@ already checked forward cross-section. Unusual input types and boundary ties
 fall back to the scalar checks. The expiry accelerator bounds its work to
 2,048 rays and eight distinct acquisition timestamps; larger histories use
 the scalar implementation. These changes do not extend sensor freshness.
+Fusion coordinate transforms can also use the accelerator for at most 1,536
+rays; the original checked implementation handles larger or unusual inputs.
+For the longer supervised trial, observation production and final validation
+are serialized with a bounded wait. A failed observation or assessment blocks
+new proofs; hard failures latch for the trial. The final proof and relay pipe
+write share the same processing guard. Sensor callbacks remain independent,
+and the relay still enforces each absolute intent expiry.
 
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also

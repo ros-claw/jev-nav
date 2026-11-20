@@ -154,7 +154,7 @@ def main(argv=None):
     recorder = ObservationRecorder(clock)
     source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
                                 projection_only_after_model=True, recheck_snapshot=False,
-                                predecision_warmup=True)
+                                predecision_warmup=True, serialize_processing=args.longer_forward)
     # Populate subscriptions and scan fusion before the bounded session starts.
     warm_until = clock.now() + 2.0
     while clock.now() < warm_until and not rospy.is_shutdown():

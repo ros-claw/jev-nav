@@ -22,8 +22,10 @@ import select
 import subprocess
 import sys
 import threading
+import time
 
 import forward_trial as checks
+from relay import _monotonic
 
 
 def _copy_scene(scene):
@@ -42,9 +44,10 @@ class ObservationAdapter(object):
     simulation_only = False
 
     def __init__(self, observation, jpeg_encoder, take_scene_ownership=False, projection_only_after_model=False,
-                 recheck_snapshot=True, predecision_warmup=False):
+                 recheck_snapshot=True, predecision_warmup=False, serialize_processing=False):
         if (type(take_scene_ownership) is not bool or type(projection_only_after_model) is not bool
-                or type(recheck_snapshot) is not bool or type(predecision_warmup) is not bool):
+                or type(recheck_snapshot) is not bool or type(predecision_warmup) is not bool
+                or type(serialize_processing) is not bool):
             raise ValueError("scene ownership must be explicit")
         self.observation = observation
         self.jpeg_encoder = jpeg_encoder
@@ -56,8 +59,61 @@ class ObservationAdapter(object):
         # every motion command may explicitly defer this expensive check.
         self.recheck_snapshot = recheck_snapshot
         self.predecision_warmup = predecision_warmup
+        self.serialize_processing = serialize_processing
         self.last_issue = None
+        self._snapshot_issues = threading.local()
+        self._processing_issue = None
+        self._processing_blocked = False
+        self._processing_latched = False
+        self._processing_lock = threading.RLock() if serialize_processing else None
         self._encode_images = True
+
+    def _acquire_processing(self):
+        if self._processing_lock is None:
+            return True
+        try:
+            started = _monotonic()
+            if not checks._finite(started) or started < 0:
+                return False
+            deadline = started + .1
+            for _ in range(100):
+                if self._processing_lock.acquire(False):
+                    return True
+                now = _monotonic()
+                if not checks._finite(now) or now < started:
+                    return False
+                remaining = deadline - now
+                if remaining <= 0:
+                    return False
+                time.sleep(min(.002, remaining))
+            return False
+        except Exception:  # noqa: BLE001 - inability to lock cannot authorize motion
+            return False
+
+    def _release_processing(self):
+        if self._processing_lock is not None:
+            self._processing_lock.release()
+
+    def _set_snapshot_issue(self, issue):
+        self._snapshot_issues.value = issue
+        self.last_issue = issue
+
+    def snapshot_issue(self):
+        return getattr(self._snapshot_issues, 'value', self.last_issue)
+
+    def begin_command_check(self):
+        """Serialize the final proof and command submission with perception."""
+        if not self._acquire_processing():
+            self._processing_issue = 'processing_busy'
+            return False
+        if self._processing_blocked:
+            self._processing_issue = 'snapshot_unavailable'
+            self._release_processing()
+            return False
+        return True
+
+    def end_command_check(self):
+        self._release_processing()
 
     def enable_safety_snapshots(self):
         """Skip repeated JPEG encoding once model evidence has been captured."""
@@ -75,11 +131,59 @@ class ObservationAdapter(object):
         self._encode_images = True
 
     def snapshot(self):
+        if not self._acquire_processing():
+            self._set_snapshot_issue('source_processing_busy')
+            return None
+        try:
+            result = self._snapshot_unlocked()
+            if self.serialize_processing:
+                if not isinstance(result, dict):
+                    self._processing_blocked = True
+                    if not _transient_snapshot_gap(self):
+                        self._processing_latched = True
+                elif not self._processing_latched:
+                    self._processing_blocked = False
+            return result
+        except BaseException:
+            if self.serialize_processing:
+                self._processing_blocked = True
+                self._processing_latched = True
+            raise
+        finally:
+            self._release_processing()
+
+    def validated_snapshot(self, validate, now):
+        """Keep snapshot acquisition and its background validation atomic."""
+        if not self._acquire_processing():
+            self._set_snapshot_issue('source_processing_busy')
+            return None, None, None
+        try:
+            sample = self._snapshot_unlocked()
+            if not isinstance(sample, dict):
+                self._processing_blocked = True
+                if not _transient_snapshot_gap(self):
+                    self._processing_latched = True
+                return None, None, None
+            reason, assessment = validate(sample, now())
+            if reason is not None or not isinstance(assessment, dict):
+                self._processing_latched = True
+                self._processing_blocked = True
+            elif not self._processing_latched:
+                self._processing_blocked = False
+            return sample, reason, assessment
+        except BaseException:
+            self._processing_blocked = True
+            self._processing_latched = True
+            raise
+        finally:
+            self._release_processing()
+
+    def _snapshot_unlocked(self):
         try:
             sample = self.observation.snapshot()
             if not isinstance(sample, dict):
                 issue = getattr(self.observation, "snapshot_last_issue", None)
-                self.last_issue = "source_" + issue if isinstance(issue, str) else "source_unavailable"
+                self._set_snapshot_issue("source_" + issue if isinstance(issue, str) else "source_unavailable")
                 return None
             scan, color = sample["scan"], sample["color"]
             result = {key: (value if self.take_scene_ownership else _copy_scene(value))
@@ -96,28 +200,44 @@ class ObservationAdapter(object):
                                   "range_min": scan.range_min, "range_max": scan.range_max,
                                   "time_increment": scan.time_increment, "ranges": list(scan.ranges)}
             if self.recheck_snapshot and not self.observation.is_current_sample(result):
-                self.last_issue = "current_after_copy"
+                self._set_snapshot_issue("current_after_copy")
                 return None
-            self.last_issue = None
+            self._set_snapshot_issue(None)
             return result
         except Exception:  # malformed observations are unavailable
-            self.last_issue = "adapter_error"
+            self._set_snapshot_issue("adapter_error")
             return None
 
     def is_current_sample(self, sample):
+        if not self._acquire_processing():
+            self._processing_issue = 'processing_busy'
+            return False
         try:
+            self._processing_issue = None
+            if self._processing_blocked:
+                self._processing_issue = 'snapshot_unavailable'
+                return False
             return self.observation.is_current_sample(sample) is True
         except Exception:
             return False
+        finally:
+            self._release_processing()
 
     def current_issue(self):
-        return getattr(self.observation, "current_last_issue", None)
+        return self._processing_issue or getattr(self.observation, "current_last_issue", None)
 
     def current_limit_kind(self):
         return getattr(self.observation, "current_limit_kind", None)
 
     def current_valid_until(self, sample):
+        if not self._acquire_processing():
+            self._processing_issue = 'processing_busy'
+            return None
         try:
+            self._processing_issue = None
+            if self._processing_blocked:
+                self._processing_issue = 'snapshot_unavailable'
+                return None
             method = getattr(self.observation, "current_valid_until", None)
             if callable(method):
                 return method(sample)
@@ -130,6 +250,8 @@ class ObservationAdapter(object):
                        sample['depth_at'] + 0.5, sample['color_at'] + 0.5)
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None
+        finally:
+            self._release_processing()
 
     def is_current_epoch(self, epoch):
         try:
@@ -493,9 +615,11 @@ def _live_timestamps_fresh(sample, now, latest_odom_rechecked=False):
 
 def _transient_snapshot_gap(source):
     """Retry only timing gaps; the previous proof keeps its original expiry."""
-    issue = getattr(source, 'last_issue', None)
+    issue_method = getattr(source, 'snapshot_issue', None)
+    issue = issue_method() if callable(issue_method) else getattr(source, 'last_issue', None)
     return issue in ('source_sensor_alignment', 'source_missing_color', 'source_missing_info',
-                     'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException')
+                     'source_refreshed_odom', 'source_snapshot_exception_ExtrapolationException',
+                     'source_processing_busy')
 
 
 class StrictDepthGate(object):
@@ -1181,67 +1305,81 @@ class LiveTrial(object):
                 if missing:
                     self._last_diagnostic = {"step": "intent_deadline", "missing": missing}
                     raise checks._StopError("expiry_unavailable")
-                final_sensor_until = current_limit(current) if callable(current_limit) else None
-                now = self._now()
-                if not checks._finite(final_sensor_until):
-                    issue = getattr(self.source, "current_issue", None)
-                    self._last_diagnostic = {"step": "motion_final_latest",
-                                             "detail": issue() if callable(issue) else None}
-                    if first_sent_at is not None:
-                        raise checks._StopError("sensor_unavailable")
-                    limiting, valid_until = "latest_sensors", now
-                else:
-                    limits["latest_sensors"] = final_sensor_until
-                    limiting = min(limits, key=limits.get)
-                    valid_until = limits[limiting]
-                if valid_until - now <= 0.03:
-                    detail = (self._last_diagnostic.get('detail') if limiting == 'latest_sensors'
-                              and isinstance(self._last_diagnostic, dict) else None)
-                    self._last_diagnostic = {"step": "intent_deadline", "limiting": limiting,
-                                             "remaining_sec": valid_until - now}
-                    if detail is not None:
-                        self._last_diagnostic['detail'] = detail
-                    if (first_sent_at is None and now < pre_motion_retry_until
-                            and limiting not in ("relay", "trial", "model_color", "model_scan")):
-                        self.clock.sleep(0.01)
-                        current, now = self._aligned_stationary_sample(sample)
-                        if self.relay.send_zero_heartbeat() is not True:
-                            raise checks._StopError("relay_failure")
-                        ready_at = self._now()
-                        deadline = ready_at + self.duration_sec
-                        anchor = previous = current["pose"]
-                        previous_odom = current["odom_at"]
-                        path, sequence = 0.0, self.relay.sequence + 1
-                        continue
-                    if limiting == "relay":
-                        raise checks._StopError("motion_limit")
-                    if limiting == "trial":
-                        raise checks._StopError("time_limit")
-                    raise checks._StopError("expiry_unavailable")
-                result["motion_timing"]["last_intent_valid_sec"] = valid_until - now
-                result["motion_timing"]["last_intent_limit"] = limiting
-                if limiting == "latest_sensors":
-                    sensor_kind = getattr(self.source, "current_limit_kind", None)
-                    if callable(sensor_kind):
-                        result["motion_timing"]["last_sensor_limit"] = sensor_kind()
-                if sampler is not None:
-                    pending = sampler.poll()
-                    if pending['state'] == 'fault':
-                        self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
-                        raise checks._StopError(pending['reason'])
-                if first_sent_at is None:
-                    first_sent_at = now
-                result["motion_requested"] = True
-                if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
-                                         valid_until=valid_until) is not True:
-                    raise checks._StopError("relay_failure")
+                guarded = getattr(self.source, 'serialize_processing', False) is True
+                if guarded:
+                    begin_guard = getattr(self.source, 'begin_command_check', None)
+                    end_guard = getattr(self.source, 'end_command_check', None)
+                    if not callable(begin_guard) or not callable(end_guard) or begin_guard() is not True:
+                        raise checks._StopError('sensor_unavailable')
+                try:
+                    final_sensor_until = current_limit(current) if callable(current_limit) else None
+                    now = self._now()
+                    if not checks._finite(final_sensor_until):
+                        issue = getattr(self.source, "current_issue", None)
+                        self._last_diagnostic = {"step": "motion_final_latest",
+                                                 "detail": issue() if callable(issue) else None}
+                        if first_sent_at is not None:
+                            raise checks._StopError("sensor_unavailable")
+                        limiting, valid_until = "latest_sensors", now
+                    else:
+                        limits["latest_sensors"] = final_sensor_until
+                        limiting = min(limits, key=limits.get)
+                        valid_until = limits[limiting]
+                    if valid_until - now <= 0.03:
+                        detail = (self._last_diagnostic.get('detail') if limiting == 'latest_sensors'
+                                  and isinstance(self._last_diagnostic, dict) else None)
+                        self._last_diagnostic = {"step": "intent_deadline", "limiting": limiting,
+                                                 "remaining_sec": valid_until - now}
+                        if detail is not None:
+                            self._last_diagnostic['detail'] = detail
+                        if (first_sent_at is None and now < pre_motion_retry_until
+                                and limiting not in ("relay", "trial", "model_color", "model_scan")):
+                            self.clock.sleep(0.01)
+                            current, now = self._aligned_stationary_sample(sample)
+                            if self.relay.send_zero_heartbeat() is not True:
+                                raise checks._StopError("relay_failure")
+                            ready_at = self._now()
+                            deadline = ready_at + self.duration_sec
+                            anchor = previous = current["pose"]
+                            previous_odom = current["odom_at"]
+                            path, sequence = 0.0, self.relay.sequence + 1
+                            continue
+                        if limiting == "relay":
+                            raise checks._StopError("motion_limit")
+                        if limiting == "trial":
+                            raise checks._StopError("time_limit")
+                        raise checks._StopError("expiry_unavailable")
+                    result["motion_timing"]["last_intent_valid_sec"] = valid_until - now
+                    result["motion_timing"]["last_intent_limit"] = limiting
+                    if limiting == "latest_sensors":
+                        sensor_kind = getattr(self.source, "current_limit_kind", None)
+                        if callable(sensor_kind):
+                            result["motion_timing"]["last_sensor_limit"] = sensor_kind()
+                    if sampler is not None:
+                        pending = sampler.poll()
+                        if pending['state'] == 'fault':
+                            self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
+                            raise checks._StopError(pending['reason'])
+                    if first_sent_at is None:
+                        first_sent_at = now
+                    result["motion_requested"] = True
+                    if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
+                                             valid_until=valid_until) is not True:
+                        raise checks._StopError("relay_failure")
+                    if guarded:
+                        wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
+                        if callable(wait_for_write) and wait_for_write(sequence) is not True:
+                            raise checks._StopError('relay_failure')
+                finally:
+                    if guarded:
+                        end_guard()
                 self._motion_started = True
                 if sampler is not None and not sampler_started:
                     # Let the pipe writer finish the first short-lived intent
                     # before starting CPU-heavy perception in another thread.
                     # The child still enforces the unmodified absolute expiry.
                     wait_for_write = getattr(self.relay, 'wait_for_frame_write', None)
-                    if callable(wait_for_write) and wait_for_write(sequence) is not True:
+                    if not guarded and callable(wait_for_write) and wait_for_write(sequence) is not True:
                         raise checks._StopError('relay_failure')
                     sampler.start()
                     sampler_started = True

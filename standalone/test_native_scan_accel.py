@@ -19,6 +19,18 @@ def test_accelerator_loads_when_policy_is_imported_before_observer():
     assert result == 0
 
 
+def test_accelerator_loads_when_fusion_is_imported_before_observer():
+    if explore._native_scan is None:
+        pytest.skip('optional native scan accelerator is not built')
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {'PYTHONPATH': os.pathsep.join((os.path.join(root, 'worker'),
+                                          os.path.join(root, 'standalone'))),
+           'PATH': '/usr/bin:/bin'}
+    code = ('import limo_scan_fusion as fusion; import explore; '
+            'assert fusion._native_scan is not None')
+    assert subprocess.call([sys.executable, '-c', code], env=env) == 0
+
+
 def test_optional_native_scan_path_matches_existing_checker(monkeypatch):
     assert hasattr(explore, '_native_scan')
     native = explore._native_scan
@@ -426,3 +438,55 @@ def test_optional_native_scan_ingest_matches_scalar_fusion(monkeypatch):
         actual = accelerated.snapshot(pose, stamp, stamp)
         assert actual_ok == expected_ok
         assert actual == expected
+
+
+def test_native_fusion_transform_matches_scalar_and_keeps_shared_hit_identity(monkeypatch):
+    import limo_scan_fusion as fusion
+    native = fusion._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    assert hasattr(native, 'fast_transform_records')
+    calls = []
+    class Meter(object):
+        def fast_scan_points(self, *args):
+            return native.fast_scan_points(*args)
+        def fast_transform_records(self, *args):
+            result = native.fast_transform_records(*args)
+            calls.append(result is not None)
+            return result
+    random.seed(4902)
+    for case in range(100):
+        obj = fusion.RollingScanFusion((.105, 0., .01))
+        for frame in range(3):
+            stamp = 10. + .1 * frame
+            values = [random.uniform(.1, 5.) if random.random() < .7 else 0. for _ in range(121)]
+            packet = {'stamp': stamp, 'ranges': values, 'angle_min': -1.4,
+                      'angle_increment': 2.8 / 120., 'range_min': .1, 'range_max': 8.}
+            pose = (random.uniform(-.01, .01), random.uniform(-.01, .01), random.uniform(-.02, .02))
+            assert obj.add_scan(packet, pose, stamp, stamp)
+        current = (random.uniform(-.01, .01), random.uniform(-.01, .01), random.uniform(-.02, .02))
+        monkeypatch.setattr(fusion, '_native_scan', None)
+        expected = obj.snapshot(current, 10.2, 10.2)
+        monkeypatch.setattr(fusion, '_native_scan', Meter())
+        actual = obj.snapshot(current, 10.2, 10.2)
+        assert actual == expected
+        for ray, hit in zip(actual['rays'], actual['occupied_hits']):
+            assert ray['hit_base'] is hit['point_base']
+            assert ray['stamp'] is hit['stamp']
+    assert sum(calls) > 90
+
+
+def test_native_fusion_transform_rejects_unbounded_or_custom_values():
+    import limo_scan_fusion as fusion
+    native = fusion._native_scan
+    if native is None:
+        pytest.skip('optional native scan accelerator is not built')
+    ray = {'start_world': (.1, 0.), 'hit_world': (2., 0.), 'stamp': 10.}
+    pose = (0., 0., 0.)
+    assert native.fast_transform_records([{'rays': [ray] * 1537}], pose) is None
+    class CustomFloat(float):
+        pass
+    bad = dict(ray, hit_world=(CustomFloat(2.), 0.))
+    assert native.fast_transform_records([{'rays': [bad]}], pose) is None
+    bad = dict(ray, hit_world=(float('inf'), 0.))
+    assert native.fast_transform_records([{'rays': [bad]}], pose) is None

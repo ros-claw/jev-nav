@@ -89,6 +89,245 @@ def test_deferred_adapter_check_still_cannot_authorize_motion_with_stale_source(
     assert all(json.loads(line)['linear'] == 0 for line in relay.transport.lines)
 
 
+def test_serialized_processing_waits_for_snapshot_before_current_validation():
+    import time
+    mod = module()
+    obs = Observation(Clock())
+    entered, release, checked = threading.Event(), threading.Event(), threading.Event()
+    original_snapshot = obs.snapshot
+    def slow_snapshot():
+        entered.set()
+        assert release.wait(1.)
+        return original_snapshot()
+    def current(_sample):
+        checked.set()
+        return 123.0
+    obs.snapshot = slow_snapshot
+    obs.current_valid_until = current
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    worker = threading.Thread(target=adapter.snapshot)
+    worker.start()
+    try:
+        assert entered.wait(.5)
+        result = []
+        verifier = threading.Thread(target=lambda: result.append(adapter.current_valid_until({})))
+        verifier.start()
+        time.sleep(.02)
+        assert not checked.is_set()
+        release.set()
+        verifier.join(.5)
+        assert not verifier.is_alive()
+        assert result == [123.0] and checked.is_set()
+    finally:
+        release.set()
+        worker.join(.5)
+
+
+def test_serialized_processing_timeout_cannot_return_a_validity_proof():
+    from relay import _monotonic
+    mod = module()
+    obs = Observation(Clock())
+    entered, release = threading.Event(), threading.Event()
+    def blocked():
+        entered.set()
+        release.wait(1.)
+        return None
+    obs.snapshot = blocked
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    worker = threading.Thread(target=adapter.snapshot)
+    worker.start()
+    try:
+        assert entered.wait(.5)
+        started = _monotonic()
+        assert adapter.current_valid_until({}) is None
+        assert _monotonic() - started < .3
+        assert adapter.current_issue() == 'processing_busy'
+    finally:
+        release.set()
+        worker.join(.5)
+
+
+def test_serialized_processing_rejects_invalid_or_regressing_clock(monkeypatch):
+    mod = module()
+    adapter = mod.ObservationAdapter(Observation(Clock()), lambda _: b'jpeg',
+                                     serialize_processing=True)
+    class Busy(object):
+        def acquire(self, _blocking):
+            return False
+    adapter._processing_lock = Busy()
+    for times in ([float('nan')], [10., 9.]):
+        values = iter(times)
+        monkeypatch.setattr(mod, '_monotonic', lambda: next(values))
+        assert adapter.current_valid_until({}) is None
+        assert adapter.current_issue() == 'processing_busy'
+
+
+def test_failed_serialized_snapshot_blocks_further_current_proofs():
+    mod = module()
+    obs = Observation(Clock())
+    obs.snapshot_last_issue = 'depth_transform_changed'
+    obs.snapshot = lambda: None
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    assert adapter.snapshot() is None
+    assert adapter.current_valid_until({}) is None
+
+
+def test_hard_snapshot_failure_remains_latched_after_a_later_good_snapshot():
+    mod = module()
+    obs = Observation(Clock())
+    original = obs.snapshot
+    obs.snapshot_last_issue = 'depth_transform_changed'
+    obs.snapshot = lambda: None
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    assert adapter.snapshot() is None
+    obs.snapshot = original
+    assert isinstance(adapter.snapshot(), dict)
+    assert adapter.current_valid_until({}) is None
+
+
+def test_concurrent_busy_snapshot_cannot_hide_a_hard_snapshot_failure():
+    mod = module()
+    obs = Observation(Clock())
+    original_observation = obs.snapshot
+    obs.snapshot_last_issue = 'depth_transform_changed'
+    obs.snapshot = lambda: None
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    original = adapter._snapshot_unlocked
+    entered, release = threading.Event(), threading.Event()
+    def paused():
+        result = original()
+        entered.set()
+        assert release.wait(1.)
+        return result
+    adapter._snapshot_unlocked = paused
+    first = threading.Thread(target=adapter.snapshot)
+    first.start()
+    try:
+        assert entered.wait(.5)
+        second = threading.Thread(target=adapter.snapshot)
+        second.start()
+        second.join(.5)
+        assert not second.is_alive()
+        release.set()
+        first.join(.5)
+        assert not first.is_alive()
+    finally:
+        release.set()
+        first.join(.5)
+    adapter._snapshot_unlocked = original
+    obs.snapshot = original_observation
+    assert isinstance(adapter.snapshot(), dict)
+    assert adapter.current_valid_until({}) is None
+
+
+def test_transient_snapshot_gap_blocks_until_a_fresh_snapshot_succeeds():
+    mod = module()
+    obs = Observation(Clock())
+    original = obs.snapshot
+    obs.snapshot_last_issue = 'sensor_alignment'
+    obs.snapshot = lambda: None
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    assert adapter.snapshot() is None
+    assert adapter.current_valid_until({}) is None
+    obs.snapshot = original
+    assert isinstance(adapter.snapshot(), dict)
+    assert adapter.current_valid_until({}) == 123.0
+
+
+def test_background_assessment_failure_cannot_race_with_a_new_proof():
+    import time
+    from async_safety_sampler import AsyncSafetySampler
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    obs.current_valid_until = lambda _sample: 123.0
+    entered, release = threading.Event(), threading.Event()
+    def validator(_sample, _now):
+        entered.set()
+        assert release.wait(1.)
+        return 'front_blocked', None
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    sampler = AsyncSafetySampler(adapter, validator, clock)
+    sampler.start()
+    try:
+        assert entered.wait(.5)
+        assert adapter.current_valid_until({}) is None
+        release.set()
+        for _ in range(100):
+            if sampler.poll()['state'] == 'fault':
+                break
+            time.sleep(.005)
+        assert sampler.poll()['state'] == 'fault'
+        assert adapter.current_valid_until({}) is None
+    finally:
+        release.set()
+        assert sampler.close(.5)
+
+
+def test_command_guard_prevents_snapshot_failure_between_proof_and_submission():
+    mod = module()
+    obs = Observation(Clock())
+    entered = threading.Event()
+    def failed_snapshot():
+        entered.set()
+        return None
+    obs.snapshot = failed_snapshot
+    obs.snapshot_last_issue = 'depth_transform_changed'
+    obs.current_valid_until = lambda _sample: 123.0
+    adapter = mod.ObservationAdapter(obs, lambda _: b'jpeg', serialize_processing=True)
+    assert adapter.begin_command_check()
+    worker = threading.Thread(target=adapter.snapshot)
+    try:
+        assert adapter.current_valid_until({}) == 123.0
+        worker.start()
+        assert not entered.wait(.02)
+        # The caller can submit only while holding this same guard.
+    finally:
+        adapter.end_command_check()
+        worker.join(.5)
+    assert entered.is_set()
+    assert adapter.current_valid_until({}) is None
+
+
+def test_motion_submission_occurs_inside_processing_guard():
+    mod = module()
+    clock = Clock()
+    obs = Observation(clock)
+    source = mod.ObservationAdapter(obs, lambda _: b'\xff\xd8offline\xff\xd9',
+                                    serialize_processing=True)
+    guarded = []
+    begin = source.begin_command_check
+    end = source.end_command_check
+    active = [False]
+    def begin_guard():
+        ok = begin()
+        active[0] = ok
+        return ok
+    def end_guard():
+        active[0] = False
+        end()
+    source.begin_command_check, source.end_command_check = begin_guard, end_guard
+    class GuardedRelay(mod.RelayAdapter):
+        def send_frame(self, *args, **kwargs):
+            guarded.append(active[0])
+            return mod.RelayAdapter.send_frame(self, *args, **kwargs)
+        def wait_for_frame_write(self, _sequence):
+            guarded.append(active[0])
+            return True
+    relay = GuardedRelay(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(source, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] and guarded and all(guarded)
+    assert active == [False]
+
+
 def test_observation_adapter_owns_mutable_scan_and_scene_evidence():
     adapter, observation = source(Clock())
     raw_snapshot = observation.snapshot

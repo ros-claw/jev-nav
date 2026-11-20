@@ -5,6 +5,47 @@ cdef inline bint finite(double x):
     return not isnan(x) and not isinf(x)
 
 
+def fast_transform_records(records, pose):
+    """Transform bounded fusion records, or use the checked Python path."""
+    cdef double pose_x, pose_y, cosine, sine, sx, sy, hx, hy, ax, ay, bx, by
+    cdef Py_ssize_t total = 0
+    cdef list rays = []
+    cdef list hits = []
+    try:
+        if (type(records) is not list or type(pose) is not tuple or len(pose) != 3
+                or any(type(v) is not float for v in pose)):
+            return None
+        pose_x, pose_y = pose[0], pose[1]
+        cosine, sine = cos(pose[2]), sin(pose[2])
+        for record in records:
+            if type(record) is not dict or type(record['rays']) is not list:
+                return None
+            total += len(record['rays'])
+            if total > 1536:
+                return None
+        for record in records:
+            for ray in record['rays']:
+                if type(ray) is not dict:
+                    return None
+                start, end, stamp = ray['start_world'], ray['hit_world'], ray['stamp']
+                if (type(start) is not tuple or len(start) != 2 or type(end) is not tuple or len(end) != 2
+                        or type(stamp) is not float
+                        or any(type(v) is not float for v in start + end)):
+                    return None
+                sx, sy = start[0] - pose_x, start[1] - pose_y
+                hx, hy = end[0] - pose_x, end[1] - pose_y
+                ax, ay = cosine * sx + sine * sy, -sine * sx + cosine * sy
+                bx, by = cosine * hx + sine * hy, -sine * hx + cosine * hy
+                if not finite(ax) or not finite(ay) or not finite(bx) or not finite(by):
+                    return None
+                hit = (float(bx), float(by))
+                rays.append({'start_base': (float(ax), float(ay)), 'hit_base': hit, 'stamp': stamp})
+                hits.append({'point_base': hit, 'stamp': stamp})
+        return rays, hits
+    except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def fast_newest_raw(ranges, angle_min_obj, increment_obj, lower_obj, upper_obj,
                     extrinsics, scan_pose, current_pose, half_pi_obj):
     """Project current raw rays, or return None for the checked scalar path."""

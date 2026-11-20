@@ -302,41 +302,54 @@ class RollingScanFusion(object):  # noqa: UP004 - Python 2 ROS worker
             result["status"] = "no_valid_front_rays"
         else:
             result["status"] = "ok"
-        rays = []
-        hits = []
-        # The pose is constant throughout this snapshot. Compute its rotation
-        # once rather than repeating trigonometry for every retained endpoint.
-        cosine, sine = math.cos(pose[2]), math.sin(pose[2])
-        pose_x, pose_y = pose[0], pose[1]
-        for record in self._scans:
-            for ray in record["rays"]:
-                sx = ray["start_world"][0] - pose_x
-                sy = ray["start_world"][1] - pose_y
-                hx = ray["hit_world"][0] - pose_x
-                hy = ray["hit_world"][1] - pose_y
-                start_x = cosine * sx + sine * sy
-                start_y = -sine * sx + cosine * sy
-                hit_x = cosine * hx + sine * hy
-                hit_y = -sine * hx + cosine * hy
-                if (type(start_x) is float and type(start_y) is float
-                        and type(hit_x) is float and type(hit_y) is float):
-                    nonfinite = not (-_INFINITY < start_x < _INFINITY
-                                     and -_INFINITY < start_y < _INFINITY
-                                     and -_INFINITY < hit_x < _INFINITY
-                                     and -_INFINITY < hit_y < _INFINITY)
-                else:
-                    # Preserve math's coercion semantics for unusual numeric
-                    # subclasses, whose comparisons can be overloaded.
-                    nonfinite = any(math.isnan(value) or math.isinf(value)
-                                    for value in (start_x, start_y, hit_x, hit_y))
-                if nonfinite:
-                    result["status"] = "pose_invalid"
-                    result["coverage"]["sensor_fresh"] = False
-                    return result
-                hit = (hit_x, hit_y)
-                stamp = ray["stamp"]
-                rays.append({"start_base": (start_x, start_y), "hit_base": hit, "stamp": stamp})
-                hits.append({"point_base": hit, "stamp": stamp})
+        accelerated = None
+        if _native_scan is not None:
+            try:
+                candidate = _native_scan.fast_transform_records(self._scans, pose)
+                if (isinstance(candidate, tuple) and len(candidate) == 2
+                        and type(candidate[0]) is list and type(candidate[1]) is list
+                        and len(candidate[0]) == len(candidate[1]) <= 1536):
+                    accelerated = candidate
+            except Exception:
+                accelerated = None
+        if accelerated is not None:
+            rays, hits = accelerated
+        else:
+            rays = []
+            hits = []
+            # The pose is constant throughout this snapshot. Compute its rotation
+            # once rather than repeating trigonometry for every retained endpoint.
+            cosine, sine = math.cos(pose[2]), math.sin(pose[2])
+            pose_x, pose_y = pose[0], pose[1]
+            for record in self._scans:
+                for ray in record["rays"]:
+                    sx = ray["start_world"][0] - pose_x
+                    sy = ray["start_world"][1] - pose_y
+                    hx = ray["hit_world"][0] - pose_x
+                    hy = ray["hit_world"][1] - pose_y
+                    start_x = cosine * sx + sine * sy
+                    start_y = -sine * sx + cosine * sy
+                    hit_x = cosine * hx + sine * hy
+                    hit_y = -sine * hx + cosine * hy
+                    if (type(start_x) is float and type(start_y) is float
+                            and type(hit_x) is float and type(hit_y) is float):
+                        nonfinite = not (-_INFINITY < start_x < _INFINITY
+                                         and -_INFINITY < start_y < _INFINITY
+                                         and -_INFINITY < hit_x < _INFINITY
+                                         and -_INFINITY < hit_y < _INFINITY)
+                    else:
+                        # Preserve math's coercion semantics for unusual numeric
+                        # subclasses, whose comparisons can be overloaded.
+                        nonfinite = any(math.isnan(value) or math.isinf(value)
+                                        for value in (start_x, start_y, hit_x, hit_y))
+                    if nonfinite:
+                        result["status"] = "pose_invalid"
+                        result["coverage"]["sensor_fresh"] = False
+                        return result
+                    hit = (hit_x, hit_y)
+                    stamp = ray["stamp"]
+                    rays.append({"start_base": (start_x, start_y), "hit_base": hit, "stamp": stamp})
+                    hits.append({"point_base": hit, "stamp": stamp})
         result["occupied_hits"] = hits
         if result["status"] == "ok":
             result["rays"] = rays

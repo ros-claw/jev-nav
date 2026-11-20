@@ -37,11 +37,16 @@ if WORKER not in sys.path:
     sys.path.insert(0, WORKER)
 
 from limo_mapless_worker import run_decision_process, summarize_forward_view
+import limo_scan_fusion as _fusion_module
 from limo_scan_fusion import RollingScanFusion
 from observation_guards import ClockGuard, OdomGuard, sensors_aligned
 from policy import ForwardPolicy, assess_front
 from projected_depth_gate import ProjectedDepthGate, project_depth_frame
 from relay import _monotonic
+
+# The worker may have been imported before the optional local accelerator was
+# discoverable. Reuse the loader's verified binary regardless of import order.
+_fusion_module._native_scan = _native_scan
 
 try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - ROS Melodic Python 2

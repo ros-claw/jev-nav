@@ -55,7 +55,7 @@ while not rospy.is_shutdown():
 CHILD_TEMPLATE = r'''
 from __future__ import print_function
 import json, threading, time
-from live_trial_adapter import DecisionsAdapter, LiveTrial, LongerForwardTrial, RelayProcessTransport
+from live_trial_adapter import DecisionsAdapter, LiveTrial, LongerForwardTrial, ObservationAdapter, RelayProcessTransport
 from relay import _monotonic
 from test_live_trial_adapter import FakeArbiter, FakeSerialGuard, source
 from threaded_relay_adapter import ThreadedRelayAdapter
@@ -68,7 +68,9 @@ class Clock(object):
         time.sleep(seconds)
 
 clock = Clock()
-observation, _ = source(clock)
+observation, raw_observation = source(clock)
+if case in ('long', 'long_expired', 'long_model_pause'):
+    observation = ObservationAdapter(raw_observation, observation.jpeg_encoder, serialize_processing=True)
 transport = RelayProcessTransport(clock)
 writes, reads, submissions = [], [], []
 real_write, real_read = transport.write_line, transport.read_line
@@ -96,14 +98,19 @@ def submit(sequence, stamp, linear, angular, valid_until=None):
 relay.send_frame = submit
 pause = {}
 class PausedSource(object):
-    def snapshot(self):
+    def maybe_pause(self):
         trigger = (case == 'live' and relay.armed or
                    case in ('expired', 'long_expired') and relay.evidence['wire_nonzero'] > 0)
         if trigger and not pause:
             pause['start'] = clock.now()
             time.sleep(0.30)
             pause['end'] = clock.now()
+    def snapshot(self):
+        self.maybe_pause()
         return observation.snapshot()
+    def validated_snapshot(self, validate, now):
+        self.maybe_pause()
+        return observation.validated_snapshot(validate, now)
     def __getattr__(self, name):
         return getattr(observation, name)
 
