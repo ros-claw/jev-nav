@@ -218,12 +218,16 @@ def main(argv=None):
                        for value in (pose.position.x, pose.position.y)):
                 raise RuntimeError('invalid_probe_pose')
             with lock:
-                target[0] = (pose.position.x + .5 * math.cos(yaw), pose.position.y + .5 * math.sin(yaw))
+                # Keep the injected point away from the 5 cm cell boundaries;
+                # serialized float32 resolution can round a boundary into the
+                # adjacent cell when the diagnostic looks it up.
+                target[0] = (pose.position.x + .525 * math.cos(yaw) - .025 * math.sin(yaw),
+                             pose.position.y + .525 * math.sin(yaw) + .025 * math.cos(yaw))
             publisher = rospy.Publisher('/' + namespace + '/depth_points', PointCloud2, queue_size=1)
             until = _monotonic() + 4.0
             while _monotonic() < until and not rospy.is_shutdown():
                 header = Header(stamp=rospy.Time.now(), frame_id='base_link')
-                publisher.publish(point_cloud2.create_cloud_xyz32(header, [[.5, 0., .1]]))
+                publisher.publish(point_cloud2.create_cloud_xyz32(header, [[.525, .025, .1]]))
                 time.sleep(.1)
             with lock:
                 marked = sum(value == 100 for value in costs)
