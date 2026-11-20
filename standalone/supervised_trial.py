@@ -31,6 +31,8 @@ def parse_args(argv=None):
                         help='experiment with synchronous sensing in the longer trial')
     parser.add_argument('--prepared-forward', action='store_true',
                         help='run final sensor processing in the longer trial worker')
+    parser.add_argument('--preproject-depth', action='store_true',
+                        help='use an independent depth projection worker in prepared mode')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -42,6 +44,8 @@ def parse_args(argv=None):
         parser.error('--single-threaded requires --longer-forward')
     if args.prepared_forward and (not args.longer_forward or args.single_threaded):
         parser.error('--prepared-forward requires --longer-forward without --single-threaded')
+    if args.preproject_depth and not args.prepared_forward:
+        parser.error('--preproject-depth requires --prepared-forward')
     if args.execute:
         digest = args.driver_sha256
         if (args.driver_pid is None or args.driver_pid <= 1
@@ -73,6 +77,7 @@ def trial_exit_code(result, observed):
                 and result.get('motion_requested') is True
                 and result.get('stop_requested') is True
                 and ('sampler_closed' not in result or result['sampler_closed'] is True)
+                and ('depth_worker_closed' not in result or result['depth_worker_closed'] is True)
                 and result.get('source_restore_failed', False) is False
                 and observed.get('measurement_scope') == 'relay_callback_window'
                 and observed.get('relay_caller_observed') is True
@@ -270,7 +275,15 @@ def main(argv=None):
                         serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
                         operator_site_report=report)
     trial_started = clock.now()
-    result = trial.run()
+    if args.preproject_depth:
+        observation.start_depth_preprojection()
+    try:
+        result = trial.run()
+    finally:
+        depth_worker_closed = observation.close_depth_preprojection() if args.preproject_depth else None
+    if args.preproject_depth:
+        result['depth_worker_closed'] = depth_worker_closed
+        result['depth_preprojection_counts'] = dict(observation.depth_preprojection_counts)
     trial_ended = clock.now()
     # Continue read-only observation briefly after the relay has been closed.
     time.sleep(0.7)

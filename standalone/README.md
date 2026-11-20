@@ -92,6 +92,12 @@ withholds commands if a new frame supersedes the prepared proof. The first live
 tests of this mode completed at zero because proofs were repeatedly superseded.
 See the [November 20 trial records](../docs/2026-11-20-perception-renewal-progress.md).
 
+Add `--preproject-depth` to the prepared mode to project depth on a dedicated
+worker. This experiment checks the original frame identity, its calibration
+and its transform before reusing a projection. The perception worker waits
+up to 20 ms for an exact cache result during the final depth check. A missing
+projection cannot authorize a command.
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

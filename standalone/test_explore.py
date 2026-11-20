@@ -706,11 +706,54 @@ def test_depth_projection_reuses_frame_with_equivalent_calibration(monkeypatch):
 
     monkeypatch.setattr(explore, 'project_depth_frame', project)
     trans, rotation = (0., 0., 0.), (0., 0., 0., 1.)
+    assert observer._depth_projection(image, info, 10., 0, trans, rotation, cache_only=True) is None
+    assert calls == []
     first = observer._depth_projection(image, info, 10., 0, trans, rotation)
     first['nearest_obstacle']['x'] = 1.
     assert copy.copy(observer)._depth_projection(image, copy.copy(info), 10., 0, trans, rotation
                                                  )['nearest_obstacle']['x'] == .5
     assert calls == [10.]
+    assert observer._depth_projection(image, info, 10., 0, trans, rotation, cache_only=True)['stamp'] == 10.
     observer._depth_projection(image, info, 10., 1, trans, rotation)
     observer._depth_projection(image, info, 10., 1, (.01, 0., 0.), rotation)
     assert calls == [10., 10., 10.]
+
+
+def test_depth_worker_processes_same_calibrated_frame_once_and_closes(monkeypatch):
+    import explore
+
+    class Obj(object):
+        def __init__(self, **fields):
+            self.__dict__.update(fields)
+
+    observer = explore.RosObservation.__new__(explore.RosObservation)
+    observer._depth_worker = None
+    observer.lock = threading.Lock()
+    observer.epoch = 1
+    observer.clock_guard = observer.odom_guard = Obj(faulted=False)
+    observer.depth_extrinsics = (0., 0., 0., 0., 0., 0.)
+    observer.depth_projection_config = {'sample_stride': 4}
+    observer.listener = observer.rospy = None
+    rotations = Obj(euler_from_quaternion=lambda _: (0., 0., 0.),
+                    quaternion_from_euler=lambda *_: (0., 0., 0., 1.))
+    observer.tf = Obj(transformations=rotations)
+    frame = Obj(frame_id='camera_depth_optical_frame', stamp=None)
+    image = Obj(header=frame, width=10, height=10)
+    info = Obj(header=frame, width=10, height=10, K=[1.] * 9)
+    observer.latest = {'depth': {'stamp': 10., 'message': image},
+                       'info': {'stamp': 10., 'message': info}}
+    monkeypatch.setattr(explore, '_monotonic', lambda: 10.01)
+    monkeypatch.setattr(explore, 'lookup_rigid_transform', lambda *_: ((0., 0., 0.), (0., 0., 0., 1.)))
+    calls = []
+    observer._depth_projection = lambda *args: calls.append(args)
+    observer.start_depth_preprojection()
+    try:
+        assert observer._depth_ready.wait(.3)
+        # Simulate a fresh CameraInfo header with identical calibration.
+        with observer.lock:
+            observer.latest['info'] = {'stamp': 10.01, 'message': info}
+        observer._depth_event.set()
+    finally:
+        assert observer.close_depth_preprojection()
+    assert observer.depth_preprojection_counts['processed'] == 1
+    assert len(calls) == 1 and calls[0][:4] == (image, info, 10., 1)

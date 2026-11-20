@@ -1249,7 +1249,8 @@ class LiveTrial(object):
                         proof, issue = self.source.prepare_command_evidence(candidate)
                         if proof is None and issue not in (
                                 'scan_generation_changed', 'depth_generation_changed',
-                                'depth_replaced_during_retry', 'stale_snapshot', 'timestamps'):
+                                'depth_replaced_during_retry', 'depth_preprojection_pending',
+                                'stale_snapshot', 'timestamps'):
                             if self._motion_started or issue not in ('new_scan', 'new_depth_unchecked'):
                                 return issue or 'sensor_unavailable', None
                         candidate['_command_evidence'] = proof

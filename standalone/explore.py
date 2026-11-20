@@ -549,6 +549,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
         self._depth_projections = collections.deque(maxlen=4)
+        self._depth_event = None
+        self._depth_worker = None
         self._scan_veto_cache = []
         self.projection_only = False
         self.epoch = 0
@@ -638,6 +640,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self.epoch_issue = {'reason': 'sensor_time_regression', 'sensor': name}
                     return
                 self.latest[name] = entry
+                depth_event = getattr(self, '_depth_event', None)
+                if depth_event is not None and name in ('depth', 'info'):
+                    depth_event.set()
                 if name == "odom":
                     entry["epoch"] = self.epoch
                     self.odom_history.append(entry)
@@ -731,8 +736,19 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self.depth_extrinsics = depth_signature
                 elif not transform_matches(self.depth_extrinsics, depth_signature):
                     return reject("depth_transform_changed")
-                depth_summary["corridor"] = self._depth_projection(
-                    depth, info, current["depth"]["stamp"], epoch, depth_trans, depth_rot, depth_array)
+                stamp = current["depth"]["stamp"]
+                prepared = None
+                if (projection_only and self._depth_worker is not None
+                        and depth_signature == self.depth_extrinsics):
+                    # The worker uses the rigid transform's canonical
+                    # quaternion, so equivalent ROS quaternion signs must
+                    # not prevent a cache hit for the same geometry.
+                    rotation = self.tf.transformations.quaternion_from_euler(*depth_signature[3:])
+                    prepared = self._depth_projection(
+                        depth, info, stamp, epoch, depth_signature[:3], rotation, cache_only=True)
+                if prepared is None:
+                    prepared = self._depth_projection(depth, info, stamp, epoch, depth_trans, depth_rot, depth_array)
+                depth_summary["corridor"] = prepared
             image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
             depth_pose = nearest_odometry(odom_history, current["depth"]["stamp"])
             if (image_pose is None or image_pose.get("epoch") != epoch
@@ -796,7 +812,64 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             return (_valid_epoch(epoch) and epoch == self.epoch and not self.clock_guard.faulted
                     and not self.odom_guard.faulted)
 
-    def _depth_projection(self, image, info, stamp, epoch, trans, rotation, array=None):
+    def start_depth_preprojection(self):
+        """Process incoming depth independently of scan and command work."""
+        if self._depth_worker is not None:
+            raise ValueError('depth projection worker already started')
+        self._depth_event = threading.Event()
+        self._depth_ready = threading.Event()
+        self._depth_stop = threading.Event()
+        self.depth_preprojection_counts = collections.Counter()
+        self._depth_worker = threading.Thread(target=self._preproject_depth, name='limo-depth-preprojection')
+        self._depth_worker.daemon = True
+        self._depth_worker.start()
+
+    def close_depth_preprojection(self):
+        if self._depth_worker is None:
+            return True
+        self._depth_stop.set()
+        self._depth_event.set()
+        self._depth_ready.set()
+        self._depth_worker.join(.3)
+        return not self._depth_worker.is_alive()
+
+    def _preproject_depth(self):
+        # Read one latest frame per wake. If overloaded, intermediate frames
+        # never get a cached verdict and therefore cannot authorize renewal.
+        previous = None
+        while not self._depth_stop.is_set():
+            self._depth_event.clear()
+            with self.lock:
+                depth = self.latest.get('depth')
+                info = self.latest.get('info')
+                epoch = self.epoch
+                extrinsics = self.depth_extrinsics
+                config = self.depth_projection_config
+                guarded = not self.clock_guard.faulted and not self.odom_guard.faulted
+            try:
+                if guarded and depth and info and config is not None and transform_matches(extrinsics, extrinsics):
+                    stamp, image = depth['stamp'], depth['message']
+                    calibration = info['message']
+                    key = (epoch, stamp, tuple(calibration.K), tuple(extrinsics), tuple(sorted(config.items())))
+                    if (key != previous and 0 <= _monotonic() - stamp < LATEST_INPUT_MAX_AGE_SEC
+                            and abs(stamp - info['stamp']) <= .2
+                            and image.header.frame_id.lstrip('/') == 'camera_depth_optical_frame'
+                            and image.header.frame_id == calibration.header.frame_id
+                            and image.width == calibration.width and image.height == calibration.height):
+                        trans, rot = lookup_rigid_transform(self.listener, self.tf, self.rospy,
+                                                            image.header.frame_id, image.header.stamp, extrinsics)
+                        signature = tuple(trans) + tuple(self.tf.transformations.euler_from_quaternion(rot))
+                        if transform_matches(extrinsics, signature):
+                            rotation = self.tf.transformations.quaternion_from_euler(*extrinsics[3:])
+                            self._depth_projection(image, calibration, stamp, epoch, extrinsics[:3], rotation)
+                            self.depth_preprojection_counts['processed'] += 1
+                            self._depth_ready.set()
+                            previous = key
+            except Exception:  # no result for failed calibration, TF or conversion
+                pass
+            self._depth_event.wait(.02)
+
+    def _depth_projection(self, image, info, stamp, epoch, trans, rotation, array=None, cache_only=False):
         """Reuse geometry only; callers still check age, TF and aligned pose."""
         k = info.K
         key = (epoch, stamp, image.encoding, image.width, image.height, image.header.frame_id,
@@ -810,6 +883,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             for old_image, old_data, old_key, projection in list(cache):
                 if old_image is image and old_data is data and old_key == key:
                     return copy.deepcopy(projection)
+        if cache_only:
+            return None
         matrix = self.tf.transformations.quaternion_matrix(rotation)
         matrix[:3, 3] = trans
         intrinsics = {'width': image.width, 'height': image.height, 'fx': k[0], 'fy': k[4],
@@ -830,6 +905,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         certificate, and retains the configured unverified calibration.
         """
         try:
+            self._depth_projection_pending = False
             if self.depth_projection_config is None or not transform_matches(
                     self.depth_extrinsics, self.depth_extrinsics):
                 return False
@@ -851,7 +927,24 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return False
             trans = self.depth_extrinsics[:3]
             rotation = self.tf.transformations.quaternion_from_euler(*self.depth_extrinsics[3:])
-            corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation)
+            cached_only = getattr(self, '_prepared_depth_only', False)
+            corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation,
+                                              cache_only=cached_only)
+            if cached_only and corridor is None:
+                # This is the perception worker, not the command thread. Let
+                # the depth producer finish this exact frame without throwing
+                # away the valid scan work. The final generation and deadline
+                # checks are unchanged.
+                self._depth_ready.clear()
+                corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation, cache_only=True)
+                if corridor is None:
+                    self._depth_ready.wait(.020)
+                    corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation, cache_only=True)
+            if cached_only:
+                self.depth_preprojection_counts['cache_miss' if corridor is None else 'cache_hit'] += 1
+            if corridor is None and cached_only:
+                self._depth_projection_pending = True
+                return False
             candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': corridor}}
             return ProjectedDepthGate().assess(candidate, now).get('candidate') is True
         except Exception:  # noqa: BLE001 - an unprocessed depth frame must veto
@@ -1001,6 +1094,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 probe.clock_guard = copy.copy(self.clock_guard)
                 probe.odom_guard = copy.copy(self.odom_guard)
                 probe.defer_depth_validation = True
+                probe._prepared_depth_only = evidence is not None and getattr(self, '_depth_worker', None) is not None
                 config = getattr(self, 'depth_projection_config', None)
                 probe.depth_projection_config = dict(config) if isinstance(config, dict) else config
                 captured = probe.latest
@@ -1069,7 +1163,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     if (not _finite(depth_checked_at) or depth_checked_at < probe.validation_checked_at
                             or not 0 <= depth_checked_at - sample['snapshot_at'] < .25
                             or not probe._newest_depth_safe_locked(sample, selected_depth, depth_odom, depth_checked_at)):
-                        return reject('new_depth_unchecked')
+                        return reject('depth_preprojection_pending' if getattr(probe, '_depth_projection_pending', False)
+                                      else 'new_depth_unchecked')
                     probe.validation_checked_at = depth_checked_at
                     limits = dict(probe.validation_limits)
                     limits['latest_depth'] = selected_depth['stamp'] + LATEST_INPUT_MAX_AGE_SEC

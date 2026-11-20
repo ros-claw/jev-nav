@@ -45,6 +45,9 @@ def test_prepared_mode_requires_explicit_longer_trial():
     with pytest.raises(SystemExit):
         parse_args(['--longer-forward', '--prepared-forward', '--single-threaded'])
     assert trial_period(parse_args(['--longer-forward', '--prepared-forward'])) == .025
+    with pytest.raises(SystemExit):
+        parse_args(['--longer-forward', '--preproject-depth'])
+    assert parse_args(['--longer-forward', '--prepared-forward', '--preproject-depth']).preproject_depth
 
 
 def test_trial_monitor_allows_ros_rpc_scheduling_delay_without_changing_watchdog_freshness():
