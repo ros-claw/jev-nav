@@ -12,12 +12,15 @@ from __future__ import division, print_function
 import argparse
 import base64
 import collections
+import copy
 import json
 import math
 import os
 import sys
 import threading
 import time
+
+from native_scan_loader import load_native_scan
 
 try:
     import numpy as _np
@@ -26,6 +29,7 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+_native_scan = load_native_scan()
 WORKER = os.path.join(ROOT, "worker")
 if not os.path.isdir(WORKER):
     WORKER = os.path.join(ROOT, "worktrees", "limo-mcp", "worker")
@@ -61,6 +65,18 @@ def _finite(value):
         return (not isinstance(value, bool) and isinstance(value, NUMBER_TYPES)
                 and not math.isnan(value) and not math.isinf(value))
     except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _same_depth_intrinsics(first, second):
+    """Compare exactly the camera fields consumed by depth projection."""
+    if first is second:
+        return True
+    try:
+        a, b = first['message'], second['message']
+        return (a.header.frame_id == b.header.frame_id and a.width == b.width and a.height == b.height
+                and tuple(a.K) == tuple(b.K))
+    except (AttributeError, KeyError, TypeError, ValueError):
         return False
 
 
@@ -235,6 +251,14 @@ def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, curren
     """Vectorize the immutable ray/hit tuples created by the scan fusion."""
     if _np is None or len(rays) < 32:
         return None
+    if _native_scan is not None:
+        try:
+            accelerated = _native_scan.fast_newest_history(
+                rays, hits, crossings, now, scan_at, scene_pose, current_pose)
+            if type(accelerated) is bool:
+                return accelerated
+        except Exception:  # noqa: BLE001 - retain the existing checked fallback
+            pass
     rows = []
     for ray, hit in zip(rays, hits):
         if type(ray) is not dict or type(hit) is not dict:
@@ -802,6 +826,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             entries = getattr(self, '_scan_veto_cache', [])
             for cached_scene, cached_key, expires, accepted in entries:
                 if cached_scene is scene and cached_key == key and now < expires:
+                    self._scan_veto_valid_until = expires if accepted else None
                     return accepted
             accepted = newest_scan_veto(message, self.extrinsics, scene, now, scan['stamp'],
                                         sample['pose'], aligned['pose'], odom['pose'])
@@ -810,8 +835,19 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 stamps = [ray['stamp'] for ray in scene['rays'] if _finite(ray.get('stamp'))
                           and 0 <= now - ray['stamp'] <= 0.65 and 0 <= scan['stamp'] - ray['stamp'] <= 0.4]
                 if stamps:
-                    expiry = min(expiry, min(stamps) + 0.65)
+                    conservative_expiry = min(expiry, min(stamps) + 0.65)
+                    # Some old rays do not contribute to coverage. Only use a
+                    # longer lifetime if the same checker still passes after
+                    # all rays expiring before that time have been removed.
+                    future = expiry - 1e-6
+                    if (future > conservative_expiry + .015
+                            and newest_scan_veto(message, self.extrinsics, scene, future, scan['stamp'],
+                                                sample['pose'], aligned['pose'], odom['pose'])):
+                        expiry = future
+                    else:
+                        expiry = conservative_expiry
             self._scan_veto_cache = (entries + [(scene, key, expiry, accepted)])[-4:]
+            self._scan_veto_valid_until = expiry if accepted else None
             return accepted
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return False
@@ -820,6 +856,181 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         return self.current_valid_until(sample) is not None
 
     def current_valid_until(self, sample):
+        """Retry only replaced sensor generations, within the original lifetime."""
+        for attempt in range(3):
+            failure = [None]
+            result = self._current_valid_until_once(sample, failure)
+            if result is not None:
+                now = _monotonic()
+                stamp = sample.get('snapshot_at') if isinstance(sample, dict) else None
+                if (not _finite(now) or not _finite(stamp) or not _finite(result)
+                        or not 0 <= now - stamp < .25):
+                    self.current_last_issue = 'timestamps'
+                    return None
+                result = min(result, stamp + .25)
+                if result <= now:
+                    self.current_last_issue = 'timestamps'
+                    return None
+                self.current_last_issue = None
+                return result
+            reason = failure[0] or 'sensor_unavailable'
+            self.current_last_issue = reason
+            if reason not in ('scan_generation_changed', 'depth_generation_changed') or attempt == 2:
+                return None
+            now = _monotonic()
+            stamp = sample.get('snapshot_at') if isinstance(sample, dict) else None
+            if not _finite(now) or not _finite(stamp) or not 0 <= now - stamp < .25:
+                return None
+        return None
+
+    def _current_valid_until_once(self, sample, failure):
+        """Validate a captured generation without blocking sensor callbacks.
+
+        Heavy checks use an owned view of the input records. New laser or
+        depth data invalidates that view; newer odometry and status are
+        independently checked before the result is returned.
+        """
+        def reject(reason):
+            failure[0] = reason
+            self.current_last_issue = reason
+            return None
+
+        try:
+            with self.lock:
+                probe = copy.copy(self)
+                probe.lock = threading.Lock()
+                probe.latest = dict(self.latest)
+                probe.odom_history = list(getattr(self, 'odom_history', []))
+                probe.clock_guard = copy.copy(self.clock_guard)
+                probe.odom_guard = copy.copy(self.odom_guard)
+                probe.defer_depth_validation = True
+                config = getattr(self, 'depth_projection_config', None)
+                probe.depth_projection_config = dict(config) if isinstance(config, dict) else config
+                captured = probe.latest
+            # Only this private copy takes the lock during expensive work.
+            deadline = probe._captured_valid_until(sample)
+            if deadline is None:
+                return reject(getattr(probe, 'current_last_issue', 'sensor_unavailable'))
+            # Recheck one newer scan without blocking callbacks. A still
+            # newer generation at the final check invalidates this result.
+            with self.lock:
+                if self.epoch != probe.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
+                    return reject('epoch_or_guard')
+                selected_scan = self.latest.get('scan')
+                scan_odom = self.latest.get('odom')
+                if selected_scan is not captured.get('scan'):
+                    if (not isinstance(selected_scan, dict) or not _finite(selected_scan.get('stamp'))
+                            or selected_scan['stamp'] <= captured['scan']['stamp']):
+                        return reject('scan_timestamp_regression')
+                    probe.latest = dict(self.latest)
+                    probe.odom_history = list(getattr(self, 'odom_history', []))
+            if selected_scan is not captured.get('scan'):
+                scan_checked_at = _monotonic()
+                aligned = nearest_odometry(probe.odom_history, selected_scan['stamp'])
+                if (not _finite(scan_checked_at) or scan_checked_at < probe.validation_checked_at
+                        or not 0 <= scan_checked_at - selected_scan['stamp'] <= .3
+                        or aligned is None or aligned.get('epoch') != probe.epoch
+                        or not probe._cached_newest_scan_safe_locked(
+                            sample, selected_scan, aligned, scan_odom, scan_checked_at)):
+                    return reject('new_scan')
+                scan_until = getattr(probe, '_scan_veto_valid_until', None)
+                if not _finite(scan_until):
+                    return reject('new_scan_expiry')
+                probe.validation_checked_at = scan_checked_at
+                limits = dict(probe.validation_limits)
+                limits['latest_scan'] = selected_scan['stamp'] + .3
+                limits['new_scan_veto'] = scan_until
+                probe.validation_limits = limits
+                deadline = min(limits.values())
+            # A newer depth frame must be independently assessed after the
+            # scan. An unchecked frame never inherits an earlier verdict.
+            with self.lock:
+                if self.epoch != probe.epoch or self.clock_guard.faulted or self.odom_guard.faulted:
+                    return reject('epoch_or_guard')
+                if self.latest.get('scan') is not selected_scan:
+                    return reject('scan_generation_changed')
+                selected_depth = self.latest.get('depth')
+                selected_info = self.latest.get('info')
+                depth_odom = self.latest.get('odom')
+                if selected_depth is captured.get('depth'):
+                    selected_info = captured.get('info')
+                if selected_depth is not captured.get('depth'):
+                    if (not isinstance(selected_depth, dict) or not _finite(selected_depth.get('stamp'))
+                            or selected_depth['stamp'] <= captured['depth']['stamp']):
+                        return reject('depth_timestamp_regression')
+                    probe.latest = dict(self.latest)
+                    probe.odom_history = list(getattr(self, 'odom_history', []))
+            if selected_depth['stamp'] != sample['depth_at']:
+                depth_checked_at = _monotonic()
+                if (not _finite(depth_checked_at) or depth_checked_at < probe.validation_checked_at
+                        or not probe._newest_depth_safe_locked(sample, selected_depth, depth_odom, depth_checked_at)):
+                    return reject('new_depth_unchecked')
+                probe.validation_checked_at = depth_checked_at
+                limits = dict(probe.validation_limits)
+                limits['latest_depth'] = selected_depth['stamp'] + LATEST_INPUT_MAX_AGE_SEC
+                probe.validation_limits = limits
+                deadline = min(limits.values())
+            with self.lock:
+                now = _monotonic()
+                if (not _finite(now) or now < probe.validation_checked_at
+                        or self.epoch != probe.epoch or self.clock_guard.faulted or self.odom_guard.faulted):
+                    return reject('epoch_or_guard')
+                if self.latest.get('scan') is not selected_scan:
+                    return reject('scan_generation_changed')
+                if self.latest.get('depth') is not selected_depth:
+                    return reject('depth_generation_changed')
+                # Camera calibration is used when validating a newer frame.
+                if (selected_depth['stamp'] != sample['depth_at']
+                        and not _same_depth_intrinsics(self.latest.get('info'), selected_info)):
+                    return reject('camera_info_changed')
+                if (getattr(self, 'extrinsics', None) != getattr(probe, 'extrinsics', None)
+                        or getattr(self, 'depth_extrinsics', None) != getattr(probe, 'depth_extrinsics', None)
+                        or getattr(self, 'depth_projection_config', None) != probe.depth_projection_config):
+                    return reject('transform_changed')
+                odom, status = self.latest['odom'], self.latest['status']
+                if (not _finite(odom.get('stamp')) or odom['stamp'] < captured['odom']['stamp']
+                        or not 0 <= now - odom['stamp'] <= LATEST_INPUT_MAX_AGE_SEC
+                        or not _finite(status.get('stamp')) or status['stamp'] < captured['status']['stamp']
+                        or not 0 <= now - status['stamp'] <= 1.0):
+                    return reject('stale_latest_state')
+                distance, rotation = _pose_delta(sample['pose'], odom['pose'])
+                odom_distance, odom_rotation = _pose_delta(captured['odom']['pose'], odom['pose'])
+                scan_distance, scan_rotation = _pose_delta(scan_odom['pose'], odom['pose'])
+                depth_distance, depth_rotation = _pose_delta(depth_odom['pose'], odom['pose'])
+                if (not all(_finite(value) for value in (distance, rotation, odom_distance, odom_rotation,
+                                                          scan_distance, scan_rotation, depth_distance,
+                                                          depth_rotation))
+                        or max(distance, odom_distance, scan_distance, depth_distance) > .005
+                        or max(rotation, odom_rotation, scan_rotation, depth_rotation) > .01):
+                    return reject('pose_changed')
+                state = base_state(odom['message'], status['message'], now)
+                if (state is None or state['motion_mode'] != 0 or state['error_code'] != 0
+                        or state['vehicle_state'] != 0 or state['control_mode'] != 1
+                        or state['battery_voltage'] < 10):
+                    return reject('base_state')
+                if (not 0 <= state['linear_x_mps'] <= .02 or abs(state['linear_y_mps']) > .005
+                        or abs(state['angular_z_radps']) > .02):
+                    return reject('base_speed')
+                limits = {'captured_sensors': deadline, 'latest_odom': odom['stamp'] + LATEST_INPUT_MAX_AGE_SEC,
+                          'latest_status': status['stamp'] + 1.0}
+                limit_kind = min(limits, key=limits.get)
+                result = limits[limit_kind]
+                self.current_limit_kind = (min(probe.validation_limits, key=probe.validation_limits.get)
+                                           if limit_kind == 'captured_sensors' else limit_kind)
+                if not _finite(result) or result <= now:
+                    return reject('timestamps')
+                # Only reuse caches from a view which survived the generation,
+                # pose and state rechecks above; their keys and expiries are
+                # still checked again on every later lookup.
+                for name in ('_scan_veto_cache', '_depth_veto_cache'):
+                    if hasattr(probe, name):
+                        setattr(self, name, getattr(probe, name))
+                self.current_last_issue = None
+                return result
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            return reject('malformed')
+
+    def _captured_valid_until(self, sample):
         """Recheck the candidate and return its earliest local expiry."""
         def reject(reason):
             self.current_last_issue = reason
@@ -852,15 +1063,20 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 # A newer frame must be projected and checked rather than
                 # silently authorizing motion from the earlier depth image.
                 if (not _finite(depth.get("stamp")) or depth["stamp"] < sample["depth_at"]
-                        or depth["stamp"] != sample["depth_at"]
-                        and not self._newest_depth_safe_locked(sample, depth, odom, now)):
+                        or (not getattr(self, 'defer_depth_validation', False)
+                        and depth["stamp"] != sample["depth_at"]
+                        and not self._newest_depth_safe_locked(sample, depth, odom, now))):
                     return reject("new_depth_unchecked")
+                scan_veto_until = None
                 if scan["stamp"] != sample["scan_at"]:
                     aligned_scan = nearest_odometry(self.odom_history, scan["stamp"])
                     if (not isinstance(sample.get("scene"), dict)
                             or aligned_scan is None or aligned_scan.get("epoch") != self.epoch
                             or not self._cached_newest_scan_safe_locked(sample, scan, aligned_scan, odom, now)):
                         return reject("new_scan")
+                    scan_veto_until = getattr(self, '_scan_veto_valid_until', None)
+                    if not _finite(scan_veto_until):
+                        return reject('new_scan_expiry')
                 distance, rotation = _pose_delta(sample["pose"], odom["pose"])
                 state = base_state(odom["message"], status["message"], now)
                 if not _finite(distance) or not _finite(rotation) or distance > 0.005 or rotation > 0.01:
@@ -880,9 +1096,16 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                           "snapshot": sample["snapshot_at"] + 0.25, "scan": sample["scan_at"] + 0.5,
                           "status": sample["status_at"] + 1.0, "depth": sample["depth_at"] + 0.5,
                           "color": sample["color_at"] + 0.5}
+                if scan_veto_until is not None:
+                    limits['new_scan_veto'] = scan_veto_until
+                # The live odometry is rechecked after this captured view is
+                # evaluated, so its old expiry must not mask newer odometry.
+                del limits['latest_odom']
+                self.validation_limits = dict(limits)
                 self.current_limit_kind = min(limits, key=limits.get)
                 deadline = limits[self.current_limit_kind]
                 checked_at = _monotonic()
+                self.validation_checked_at = checked_at
                 if (not _finite(checked_at) or checked_at < now
                         or not _finite(deadline) or deadline <= checked_at):
                     return reject("timestamps")

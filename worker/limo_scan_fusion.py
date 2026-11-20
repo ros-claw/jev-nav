@@ -42,6 +42,11 @@ import math
 import sys
 
 try:
+    import _limo_scan_accel as _native_scan
+except ImportError:
+    _native_scan = None
+
+try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - Python 2 ROS worker
 except NameError:
     INTEGER_TYPES = (int,)
@@ -165,45 +170,64 @@ class RollingScanFusion(object):  # noqa: UP004 - Python 2 ROS worker
         if not all(_finite(value) for value in sensor_origin):
             self._fault = "invalid_scan"
             return False
-        rays = []
-        valid_indices = set()
-        front_samples = 0
-        valid_samples = 0
-        nan_bins = 0
-        zero_bins = 0
-        other_bins = 0
-        for index, distance in enumerate(ranges):
-            angle = angle_min + index * increment
-            if not -math.pi / 2 <= angle <= math.pi / 2:
-                continue
-            front_samples += 1
-            if isinstance(distance, float) and math.isnan(distance):
-                nan_bins += 1
-                continue
-            if (not isinstance(distance, bool) and isinstance(distance, NUMBER_TYPES)
-                    and distance == 0):
-                zero_bins += 1
-                continue
-            if not _finite(distance) or not 0 < distance < range_max or distance < range_min:
-                other_bins += 1
-                continue
-            yaw = sensor_yaw + angle
-            cosine, sine = math.cos(yaw), math.sin(yaw)
-            start = (sensor_origin[0] + range_min * cosine,
-                     sensor_origin[1] + range_min * sine)
-            hit = (sensor_origin[0] + distance * cosine,
-                   sensor_origin[1] + distance * sine)
-            if not all(_finite(value) for value in start + hit):
-                self._fault = "invalid_scan"
-                return False
-            valid_samples += 1
-            valid_indices.add(index)
-            rays.append({
-                "start_world": start,
-                "hit_world": hit,
-                "stamp": stamp,
-                "index": index,
-            })
+        accelerated = None
+        if _native_scan is not None:
+            try:
+                candidate = _native_scan.fast_scan_points(
+                    ranges, angle_min, increment, range_min, range_max,
+                    sensor_origin, sensor_yaw, stamp, math.pi / 2)
+                if (isinstance(candidate, tuple) and len(candidate) == 7
+                        and isinstance(candidate[0], list) and isinstance(candidate[1], set)
+                        and all(type(value) is int and value >= 0 for value in candidate[2:])
+                        and candidate[2] <= len(ranges)
+                        and candidate[2] == sum(candidate[3:])
+                        and len(candidate[0]) == len(candidate[1]) == candidate[3]):
+                    accelerated = candidate
+            except Exception:
+                accelerated = None
+        if accelerated is not None:
+            (rays, valid_indices, front_samples, valid_samples,
+             nan_bins, zero_bins, other_bins) = accelerated
+        else:
+            rays = []
+            valid_indices = set()
+            front_samples = 0
+            valid_samples = 0
+            nan_bins = 0
+            zero_bins = 0
+            other_bins = 0
+            for index, distance in enumerate(ranges):
+                angle = angle_min + index * increment
+                if not -math.pi / 2 <= angle <= math.pi / 2:
+                    continue
+                front_samples += 1
+                if isinstance(distance, float) and math.isnan(distance):
+                    nan_bins += 1
+                    continue
+                if (not isinstance(distance, bool) and isinstance(distance, NUMBER_TYPES)
+                        and distance == 0):
+                    zero_bins += 1
+                    continue
+                if not _finite(distance) or not 0 < distance < range_max or distance < range_min:
+                    other_bins += 1
+                    continue
+                yaw = sensor_yaw + angle
+                cosine, sine = math.cos(yaw), math.sin(yaw)
+                start = (sensor_origin[0] + range_min * cosine,
+                         sensor_origin[1] + range_min * sine)
+                hit = (sensor_origin[0] + distance * cosine,
+                       sensor_origin[1] + distance * sine)
+                if not all(_finite(value) for value in start + hit):
+                    self._fault = "invalid_scan"
+                    return False
+                valid_samples += 1
+                valid_indices.add(index)
+                rays.append({
+                    "start_world": start,
+                    "hit_world": hit,
+                    "stamp": stamp,
+                    "index": index,
+                })
         signature = (tuple(pose), angle_min, increment, range_min, range_max, len(ranges))
         record = {"stamp": stamp, "rays": rays, "signature": signature,
                   "valid_indices": valid_indices}

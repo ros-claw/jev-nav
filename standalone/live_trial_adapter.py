@@ -42,9 +42,9 @@ class ObservationAdapter(object):
     simulation_only = False
 
     def __init__(self, observation, jpeg_encoder, take_scene_ownership=False, projection_only_after_model=False,
-                 recheck_snapshot=True):
+                 recheck_snapshot=True, predecision_warmup=False):
         if (type(take_scene_ownership) is not bool or type(projection_only_after_model) is not bool
-                or type(recheck_snapshot) is not bool):
+                or type(recheck_snapshot) is not bool or type(predecision_warmup) is not bool):
             raise ValueError("scene ownership must be explicit")
         self.observation = observation
         self.jpeg_encoder = jpeg_encoder
@@ -55,6 +55,7 @@ class ObservationAdapter(object):
         # Only a consumer that separately rechecks current inputs before
         # every motion command may explicitly defer this expensive check.
         self.recheck_snapshot = recheck_snapshot
+        self.predecision_warmup = predecision_warmup
         self.last_issue = None
         self._encode_images = True
 
@@ -540,7 +541,7 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None, require_image=Tru
         stamps = [sample[name] for name in ("color_at", "scan_at", "depth_at")]
         if max(stamps) - min(stamps) > 0.25:
             return reject("sensor_skew")
-        reason, _ = checks._raw_scan(sample)
+        reason, _ = checks._raw_scan(sample, need_canonical=False)
         if reason:
             return reject("raw_scan", reason)
         state = sample["state"]
@@ -702,7 +703,7 @@ class LiveTrial(object):
         self._last_time = now
         return now
 
-    def _sample(self):
+    def _sample(self, defer_current_check=False):
         sample = self.source.snapshot()
         now = self._now()
         if sample is None:
@@ -716,7 +717,7 @@ class LiveTrial(object):
             self._last_diagnostic.update(self._validation_detail)
             raise checks._StopError(reason)
         if (not self._motion_started and (self.source.is_current_epoch(sample["epoch"]) is not True
-                or self.source.is_current_sample(sample) is not True)):
+                or not defer_current_check and self.source.is_current_sample(sample) is not True)):
             issue = getattr(self.source, "current_issue", None)
             self._last_diagnostic = {"step": "latest_sample_recheck",
                                      "detail": issue() if callable(issue) else None}
@@ -839,7 +840,9 @@ class LiveTrial(object):
                                      or self.relay.send_zero_heartbeat() is not True):
                 raise checks._StopError("relay_failure")
             try:
-                sample, now = self._sample()
+                # A final current-sensor check follows the stationary history;
+                # avoid doing the same expensive check twice before moving.
+                sample, now = self._sample(defer_current_check=True)
             except checks._StopError as exc:
                 if str(exc) != "sensor_unavailable":
                     raise
@@ -859,7 +862,8 @@ class LiveTrial(object):
                 raise checks._StopError("sensor_unavailable")
             now = self._stationary_with_retry(before)
             fresh = _live_timestamps_fresh(sample, now)
-            current = self.source.is_current_sample(sample) is True
+            current = (self.source.is_current_epoch(sample['epoch']) is True
+                       and self.source.is_current_sample(sample) is True)
             if not fresh or not current:
                 self._last_diagnostic = {"step": "post_trace_recheck", "timestamps_fresh": fresh,
                                          "current_sample": current,
@@ -982,11 +986,23 @@ class LiveTrial(object):
                 # at zero, so startup latency does not age the decision.
                 sample = current
                 self._stationary_proof_at = self._stationary_proof_key = None
-                self._request_forward_decision(sample, result)
                 enable_safety_snapshots = getattr(self.source, "enable_safety_snapshots", None)
                 if callable(enable_safety_snapshots):
                     safety_mode_enabled = True
                     enable_safety_snapshots()
+                warmup = None
+                try:
+                    if getattr(self.source, 'predecision_warmup', False) is True:
+                        from async_safety_sampler import DecisionWarmup
+                        warmup = DecisionWarmup(self.source)
+                        warmup.start()
+                    self._request_forward_decision(sample, result)
+                finally:
+                    if warmup is not None and not warmup.close(2.0):
+                        # Do not concurrently restore or reuse a source whose
+                        # outstanding snapshot did not finish.
+                        safety_mode_enabled = False
+                        raise checks._StopError('predecision_warmup_busy')
                 self._image_required = False
                 result["stage"] = "post_decision_observation"
                 current, now = self._aligned_stationary_sample(sample)
@@ -996,7 +1012,9 @@ class LiveTrial(object):
             # fresh, stationary observation and retain the relay's independent
             # first-motion deadline as the actual motion limit.
             ready_at = self._now()
-            pre_motion_retry_until = ready_at + 2.0
+            # While still stationary, permit extra fresh-sample attempts.
+            # Model freshness and every per-command expiry remain unchanged.
+            pre_motion_retry_until = ready_at + 4.0
             deadline = ready_at + self.duration_sec
             if not checks._finite(deadline) or deadline <= ready_at:
                 raise checks._StopError("clock_invalid")
@@ -1168,8 +1186,12 @@ class LiveTrial(object):
                     limiting = min(limits, key=limits.get)
                     valid_until = limits[limiting]
                 if valid_until - now <= 0.03:
+                    detail = (self._last_diagnostic.get('detail') if limiting == 'latest_sensors'
+                              and isinstance(self._last_diagnostic, dict) else None)
                     self._last_diagnostic = {"step": "intent_deadline", "limiting": limiting,
                                              "remaining_sec": valid_until - now}
+                    if detail is not None:
+                        self._last_diagnostic['detail'] = detail
                     if (first_sent_at is None and now < pre_motion_retry_until
                             and limiting not in ("relay", "trial", "model_color", "model_scan")):
                         self.clock.sleep(0.01)

@@ -36,6 +36,23 @@ for the accepted coverage expire. If snapshots cannot be produced and
 checked fast enough, the relay stops instead of continuing an expired intent;
 smooth real-robot operation has not yet been established.
 
+The longer supervised trial optionally refreshes observation history while
+the model request is pending; that worker cannot command motion and must exit
+before the trial resumes observation. A worker that fails to exit prevents
+motion. Expensive current-sensor checks use a captured view rather than holding
+the ROS callback lock. They recheck the latest odometry, state, transforms and
+sensor generations before returning, and cap any newer-scan verdict by the
+expiry of the historical rays on which it depended. Unchecked later scans or
+depth frames still reject the result.
+
+The optional Cython scan accelerator can be built for ROS Melodic Python 2
+with `/usr/bin/python2 standalone/build_scan_accel.py build_ext --build-lib
+standalone/build/py2 --build-temp standalone/build/temp-py2`. Start a new
+controller process after building. The binary is local and excluded from git;
+without it, the existing checked Python implementation is used. Geometric
+threshold ties and inputs outside the accelerated format also use that
+implementation. This optimization does not establish physical clearance.
+
 `continuous_policy.py` is an offline-only forward-intent prototype. It is not
 wired to the real relay. `sensor_ipc.py` and `depth_ray_coverage.py` are also
 offline prototypes, not a running sensor worker or permission to merge blind

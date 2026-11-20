@@ -18,7 +18,10 @@ import math
 import sys
 import threading
 
+from native_scan_loader import load_native_scan
 from policy import assess_front
+
+_native_scan = load_native_scan()
 
 try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - ROS Melodic Python 2
@@ -70,9 +73,11 @@ def _timestamps_fresh(sample, now):
         return False
 
 
-def _raw_scan(sample):
+def _raw_scan(sample, need_canonical=True):
     """Validate and classify raw sensor-frame rays; retain unknown encodings."""
     try:
+        if type(need_canonical) is not bool:
+            return "sensor_unavailable", None
         raw, extrinsics = sample["raw_scan"], sample["laser_extrinsics"]
         if (not isinstance(raw, dict) or not isinstance(raw.get("frame_id"), STRING_TYPES)
                 or raw["frame_id"].lstrip("/") != "laser_link" or not _finite(raw.get("stamp"))
@@ -97,6 +102,26 @@ def _raw_scan(sample):
         pose = sample["pose"]
         if not _pose(scan_pose) or not _pose(pose):
             return "sensor_unavailable", None
+        if not need_canonical and _native_scan is not None:
+            try:
+                accelerated = _native_scan.fast_raw_veto(
+                    ranges, angle_min, increment, range_min, range_max, extrinsics,
+                    scan_pose, pose, duration, MAX_SPEED_MPS, math.pi / 2)
+                if (isinstance(accelerated, tuple) and len(accelerated) == 3
+                        and type(accelerated[0]) is bool
+                        and all(not isinstance(value, bool) and isinstance(value, INTEGER_TYPES)
+                                for value in accelerated[1:])
+                        and 0 <= accelerated[2] <= accelerated[1] <= len(ranges)):
+                    blocked, front_count, valid_count = accelerated
+                    if blocked:
+                        return "front_blocked", None
+                    coverage = sample["scene"]["coverage"]
+                    if (front_count != coverage.get("front_samples")
+                            or valid_count != coverage.get("latest_valid_samples")):
+                        return "sensor_unavailable", None
+                    return None, None
+            except Exception:  # noqa: BLE001 - retain the existing checked fallback
+                pass
         sanitized = []
         front_count = valid_count = 0
         blocked = False
@@ -143,7 +168,7 @@ def _raw_scan(sample):
         canonical = {"stamp": raw["stamp"], "frame_id": raw["frame_id"], "angle_min": angle_min,
                      "angle_increment": increment, "range_min": range_min, "range_max": range_max,
                      "time_increment": time_increment, "ranges": sanitized}
-        return None, canonical
+        return None, canonical if need_canonical else None
     except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError, IndexError):
         return "sensor_unavailable", None
 

@@ -15,10 +15,14 @@ from __future__ import division
 
 import math
 
+from native_scan_loader import load_native_scan
+
 try:
     import numpy as _np
 except ImportError:  # scalar implementation remains available
     _np = None
+
+_native_scan = load_native_scan()
 
 try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - ROS Melodic Python 2
@@ -56,6 +60,26 @@ def _fast_assess_rays(rays, hits, scan_stamp, latest_valid, now, line_x, half_wi
     """
     if _np is None or len(rays) < 32:
         return None
+    if _native_scan is not None:
+        try:
+            accelerated = _native_scan.fast_assess_rays(
+                rays, hits, scan_stamp, latest_valid, now, line_x, half_width,
+                max_age, max_gap, history_age_limit, history_span_limit)
+            if isinstance(accelerated, dict) and accelerated.get('geometric_clearance_verified') is False:
+                candidate, reason = accelerated.get('candidate'), accelerated.get('reason')
+                if candidate is False and reason in ('invalid_evidence', 'forward_obstacle',
+                                                      'forward_coverage_incomplete'):
+                    return accelerated
+                samples = accelerated.get('samples')
+                if (candidate is True and reason == 'sampled_forward_corridor'
+                        and not isinstance(samples, bool) and isinstance(samples, INTEGER_TYPES) and samples > 0
+                        and _finite(accelerated.get('max_sample_gap_m'))
+                        and 0 <= accelerated['max_sample_gap_m'] <= max_gap
+                        and _finite(accelerated.get('latest_max_sample_gap_m'))
+                        and 0 <= accelerated['latest_max_sample_gap_m'] <= 2 * max_gap):
+                    return accelerated
+        except Exception:  # noqa: BLE001 - retain the existing checked fallback
+            pass
     rows = []
     for ray, hit in zip(rays, hits):
         if type(ray) is not dict or type(hit) is not dict:

@@ -478,6 +478,68 @@ def test_longer_trial_requests_decision_after_relay_is_ready_at_zero():
     assert all(json.loads(line)['linear'] == 0.0 for line in observed[0][1])
 
 
+def test_decision_warmup_refreshes_observation_only_while_model_is_pending():
+    import threading
+    import time
+
+    from relay import _monotonic
+    mod = module()
+    class RealClock(object):
+        def now(self):
+            return _monotonic()
+        def sleep(self, seconds):
+            time.sleep(seconds)
+    class SynchronousLongTrial(mod.LongerForwardTrial):
+        ASYNC_SAMPLING = False
+    clock = RealClock()
+    adapter, _ = source(clock)
+    adapter.predecision_warmup = True
+    in_model, refreshed = threading.Event(), threading.Event()
+    original_snapshot = adapter.snapshot
+    def snapshot():
+        if in_model.is_set():
+            refreshed.set()
+        return original_snapshot()
+    adapter.snapshot = snapshot
+    def decide(payload, _timeout):
+        in_model.set()
+        refreshed.wait(.8)
+        in_model.clear()
+        return {'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']}
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock,
+                             motion_limit_sec=2.0)
+    result = SynchronousLongTrial(adapter, mod.DecisionsAdapter(decide), relay,
+                                  FakeArbiter(), clock, duration_sec=.3, enable_motion=True,
+                                  serial_guard=FakeSerialGuard()).run()
+    assert refreshed.is_set()
+    assert result['model_choice'] == 'forward'
+
+
+def test_busy_decision_warmup_prevents_motion(monkeypatch):
+    import async_safety_sampler
+    mod = module()
+    class BusyWarmup(object):
+        def __init__(self, _source):
+            pass
+        def start(self):
+            pass
+        def close(self, _timeout):
+            return False
+    monkeypatch.setattr(async_safety_sampler, 'DecisionWarmup', BusyWarmup)
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.predecision_warmup = True
+    transport = Transport(ready=b'READY motion_limit_sec=2.000000\n')
+    relay = mod.RelayAdapter(transport, clock, motion_limit_sec=2.0)
+    model = mod.DecisionsAdapter(lambda payload, _timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LongerForwardTrial(adapter, model, relay, FakeArbiter(), clock,
+                                    duration_sec=.3, enable_motion=True,
+                                    serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'predecision_warmup_busy'
+    assert not any(json.loads(line)['linear'] > 0 for line in transport.lines)
+
+
 def test_longer_trial_stops_when_background_sensing_fails():
     import time
 
@@ -994,12 +1056,12 @@ def test_motion_loop_prepares_next_sample_during_the_frame_interval():
             mod.LiveTrial.__init__(self, *args, **kwargs)
             self.motion_samples = self.motion_validations = 0
 
-        def _sample(self):
+        def _sample(self, defer_current_check=False):
             if relay.had_motion:
                 self.motion_samples += 1
                 # Sampling takes 40 ms of the 50 ms command period.
                 clock.sleep(0.04)
-            return mod.LiveTrial._sample(self)
+            return mod.LiveTrial._sample(self, defer_current_check=defer_current_check)
 
         def _validate(self, sample, now):
             if relay.had_motion:
@@ -1062,6 +1124,21 @@ def test_motion_never_submits_an_intent_with_too_little_time_to_reach_the_relay(
     assert all(json.loads(line)['linear'] == 0.0 for line in relay.transport.lines)
 
 
+def test_unavailable_latest_sensor_preserves_its_failure_reason():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.current_valid_until = lambda _sample: None
+    adapter.current_issue = lambda: 'depth_generation_changed'
+    relay = mod.RelayAdapter(Transport(), clock)
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['reason'] == 'expiry_unavailable' and not result['motion_requested']
+    assert result['diagnostic']['detail'] == 'depth_generation_changed'
+
+
 def test_trial_refreshes_once_before_motion_if_initial_sample_is_nearly_expired():
     mod = module()
     clock = Clock()
@@ -1077,6 +1154,26 @@ def test_trial_refreshes_once_before_motion_if_initial_sample_is_nearly_expired(
     result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
                            enable_motion=True, serial_guard=FakeSerialGuard()).run()
     assert len(calls) > 1 and result['motion_requested'] is True
+
+
+def test_stationary_retry_can_outlast_two_seconds_without_sending_motion():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    relay = mod.RelayAdapter(Transport(), clock)
+    started = clock.now()
+    def validity(_sample):
+        if clock.now() - started < 2.4:
+            assert not relay.had_motion
+            clock.sleep(.4)
+            return None
+        return clock.now() + .1
+    adapter.current_valid_until = validity
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.LiveTrial(adapter, model, relay, FakeArbiter(), clock,
+                           enable_motion=True, serial_guard=FakeSerialGuard()).run()
+    assert result['motion_requested'] is True
 
 
 def test_trial_refreshes_stale_initial_snapshot_while_still_stopped():
@@ -1326,6 +1423,38 @@ def test_new_sample_is_captured_after_the_long_stationary_history_is_checked():
                            enable_motion=True, serial_guard=FakeSerialGuard()).run()
     assert result['reason'] == 'motion_limit'
     assert observation.source.calls >= 3
+
+
+def test_stationary_alignment_checks_current_sensors_once_after_history():
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.recheck_snapshot = False
+    before = adapter.snapshot()
+    relay = mod.RelayAdapter(Transport(), clock)
+    trial = mod.LiveTrial(adapter, None, relay, None, clock)
+    trial._stationary_with_retry = lambda _before: clock.now()
+    trial._model_fresh = lambda _sample, _now: None
+    checks = []
+    adapter.is_current_sample = lambda _sample: checks.append(True) or True
+    sample, _ = trial._aligned_stationary_sample(before)
+    assert sample is not None and len(checks) == 1
+
+
+def test_stationary_alignment_cannot_accept_a_failed_final_sensor_recheck():
+    import forward_trial
+    mod = module()
+    clock = Clock()
+    adapter, _ = source(clock)
+    adapter.recheck_snapshot = False
+    before = adapter.snapshot()
+    relay = mod.RelayAdapter(Transport(), clock)
+    trial = mod.LiveTrial(adapter, None, relay, None, clock)
+    trial._stationary_with_retry = lambda _before: clock.now()
+    trial._model_fresh = lambda _sample, _now: None
+    adapter.is_current_sample = lambda _sample: False
+    with pytest.raises(forward_trial._StopError):
+        trial._aligned_stationary_sample(before)
 
 
 def test_first_command_reuses_fresh_post_relay_sample_then_handles_later_sensor_loss():

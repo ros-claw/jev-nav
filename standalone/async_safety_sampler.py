@@ -12,6 +12,38 @@ from __future__ import division
 import threading
 
 
+class DecisionWarmup(object):  # noqa: UP004 - Python 2.7 ROS
+    """Refresh observation history while a decision is pending; never command motion."""
+    def __init__(self, source):
+        if not callable(getattr(source, 'snapshot', None)):
+            raise ValueError('invalid observation source')
+        self.source = source
+        self._stop = threading.Event()
+        self._thread = None
+        self._fault = False
+
+    def start(self):
+        if self._thread is not None or self._stop.is_set():
+            raise ValueError('warmup is single-use')
+        self._thread = threading.Thread(target=self._run, name='limo-decision-warmup')
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                self.source.snapshot()
+                self._stop.wait(.02)
+        except BaseException:
+            self._fault = True
+
+    def close(self, timeout=.2):
+        self._stop.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout)
+        return (self._thread is None or not self._thread.is_alive()) and not self._fault
+
+
 class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
     def __init__(self, source, validate, clock, transient_unavailable=None):
         if not callable(getattr(source, 'snapshot', None)) or not callable(validate) or not callable(clock.now):

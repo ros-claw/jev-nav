@@ -92,3 +92,48 @@ def test_blocked_sampler_does_not_block_poll_or_bounded_close():
     assert _monotonic() - started < .2
     release.set()
     assert sampler.close(.5)
+
+
+def test_decision_warmup_repeatedly_refreshes_only_until_closed():
+    from async_safety_sampler import DecisionWarmup
+    class Source(object):
+        count = 0
+        def snapshot(self):
+            self.count += 1
+            return None
+    source = Source()
+    warmup = DecisionWarmup(source)
+    warmup.start()
+    wait_for(lambda: source.count >= 2)
+    assert warmup.close(.5)
+    stopped = source.count
+    time.sleep(.04)
+    assert source.count == stopped
+
+
+def test_decision_warmup_refuses_to_close_while_snapshot_is_blocked():
+    from async_safety_sampler import DecisionWarmup
+    entered, release = threading.Event(), threading.Event()
+    class Source(object):
+        def snapshot(self):
+            entered.set()
+            release.wait(1.)
+    warmup = DecisionWarmup(Source())
+    warmup.start()
+    assert entered.wait(.5)
+    assert warmup.close(.01) is False
+    release.set()
+    assert warmup.close(.5)
+
+
+def test_decision_warmup_reports_snapshot_exceptions():
+    from async_safety_sampler import DecisionWarmup
+    failed = threading.Event()
+    class Source(object):
+        def snapshot(self):
+            failed.set()
+            raise RuntimeError('observation failed')
+    warmup = DecisionWarmup(Source())
+    warmup.start()
+    assert failed.wait(.5)
+    assert warmup.close(.5) is False

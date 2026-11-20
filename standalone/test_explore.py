@@ -154,7 +154,7 @@ def test_current_sample_rejects_evidence_that_expires_during_check(monkeypatch):
         pass
     class Guard(object):
         faulted = False
-    clock = iter((100.0, 100.2))
+    clock = iter((100.0, 100.2, 100.2))
     monkeypatch.setattr(explore, '_monotonic', lambda: next(clock))
     odom, status = Value(), Value()
     odom.twist = Value()
