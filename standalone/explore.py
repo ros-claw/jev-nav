@@ -548,7 +548,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.depth_projection_config = (dict(depth_projection_config)
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
-        self._depth_veto_cache = None
+        self._depth_projections = collections.deque(maxlen=4)
         self._scan_veto_cache = []
         self.projection_only = False
         self.epoch = 0
@@ -713,7 +713,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 if not self.fusion.add_scan(packet, aligned["pose"], aligned["stamp"], now):
                     return reject("fusion_add")
                 self.scan_stamp = current["scan"]["stamp"]
-            depth_array = self.bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
+            depth_array = (None if projection_only else
+                           self.bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough"))
             depth_summary = depth_summary_for_snapshot(
                 depth_array, depth.encoding, current["depth"]["stamp"], projection_only)
             if depth_summary is None:
@@ -730,15 +731,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self.depth_extrinsics = depth_signature
                 elif not transform_matches(self.depth_extrinsics, depth_signature):
                     return reject("depth_transform_changed")
-                matrix = self.tf.transformations.quaternion_matrix(depth_rot)
-                matrix[:3, 3] = depth_trans
-                k = info.K
-                intrinsics = {"width": depth.width, "height": depth.height,
-                              "fx": k[0], "fy": k[4], "cx": k[2], "cy": k[5],
-                              "rectified": True}
-                depth_summary["corridor"] = project_depth_frame(
-                    depth_array, depth.encoding, intrinsics, matrix, current["depth"]["stamp"],
-                    self.depth_projection_config)
+                depth_summary["corridor"] = self._depth_projection(
+                    depth, info, current["depth"]["stamp"], epoch, depth_trans, depth_rot, depth_array)
             image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
             depth_pose = nearest_odometry(odom_history, current["depth"]["stamp"])
             if (image_pose is None or image_pose.get("epoch") != epoch
@@ -802,6 +796,32 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             return (_valid_epoch(epoch) and epoch == self.epoch and not self.clock_guard.faulted
                     and not self.odom_guard.faulted)
 
+    def _depth_projection(self, image, info, stamp, epoch, trans, rotation, array=None):
+        """Reuse geometry only; callers still check age, TF and aligned pose."""
+        k = info.K
+        key = (epoch, stamp, image.encoding, image.width, image.height, image.header.frame_id,
+               image.step, image.is_bigendian,
+               tuple(k), tuple(trans), tuple(rotation), tuple(sorted(self.depth_projection_config.items())))
+        cache = getattr(self, '_depth_projections', None)
+        data = image.data
+        if type(data) is not bytes:
+            cache = None
+        if cache is not None:
+            for old_image, old_data, old_key, projection in list(cache):
+                if old_image is image and old_data is data and old_key == key:
+                    return copy.deepcopy(projection)
+        matrix = self.tf.transformations.quaternion_matrix(rotation)
+        matrix[:3, 3] = trans
+        intrinsics = {'width': image.width, 'height': image.height, 'fx': k[0], 'fy': k[4],
+                      'cx': k[2], 'cy': k[5], 'rectified': True}
+        if array is None:
+            array = self.bridge.imgmsg_to_cv2(image, desired_encoding='passthrough')
+        projection = project_depth_frame(array, image.encoding, intrinsics, matrix, stamp,
+                                         self.depth_projection_config)
+        if cache is not None:
+            cache.appendleft((image, data, key, copy.deepcopy(projection)))
+        return projection
+
     def _newest_depth_safe_locked(self, sample, depth, odom, now):
         """Project a newer depth frame before using an older fused snapshot.
 
@@ -829,26 +849,11 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 distance, angle = _pose_delta(aligned['pose'], pose)
                 if not _finite(distance) or not _finite(angle) or distance > 0.01 or angle > 0.02:
                     return False
-            key = (stamp, id(image), id(getattr(image, 'data', None)), info_entry['stamp'], id(info),
-                   tuple(info.K), tuple(self.depth_extrinsics),
-                   tuple(sorted(self.depth_projection_config.items())))
-            cached = getattr(self, '_depth_veto_cache', None)
-            if cached is not None and cached[0] == key:
-                return cached[1]
             trans = self.depth_extrinsics[:3]
             rotation = self.tf.transformations.quaternion_from_euler(*self.depth_extrinsics[3:])
-            matrix = self.tf.transformations.quaternion_matrix(rotation)
-            matrix[:3, 3] = trans
-            k = info.K
-            intrinsics = {'width': image.width, 'height': image.height, 'fx': k[0], 'fy': k[4],
-                          'cx': k[2], 'cy': k[5], 'rectified': True}
-            array = self.bridge.imgmsg_to_cv2(image, desired_encoding='passthrough')
-            corridor = project_depth_frame(array, image.encoding, intrinsics, matrix, stamp,
-                                           self.depth_projection_config)
+            corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation)
             candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': corridor}}
-            accepted = ProjectedDepthGate().assess(candidate, now).get('candidate') is True
-            self._depth_veto_cache = (key, accepted)
-            return accepted
+            return ProjectedDepthGate().assess(candidate, now).get('candidate') is True
         except Exception:  # noqa: BLE001 - an unprocessed depth frame must veto
             return False
 
@@ -1067,9 +1072,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 # Only reuse caches from a view which survived the generation,
                 # pose and state rechecks above; their keys and expiries are
                 # still checked again on every later lookup.
-                for name in ('_scan_veto_cache', '_depth_veto_cache'):
-                    if hasattr(probe, name):
-                        setattr(self, name, getattr(probe, name))
+                self._scan_veto_cache = getattr(probe, '_scan_veto_cache', [])
                 self.current_last_issue = None
                 return result
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):

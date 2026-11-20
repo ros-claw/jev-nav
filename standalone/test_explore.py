@@ -419,8 +419,11 @@ def test_newer_depth_frame_requires_projection_and_rejects_obstacles(monkeypatch
     depth.header.frame_id = info.header.frame_id = 'camera_depth_optical_frame'
     depth.width = info.width = depth.height = info.height = 6
     depth.encoding = '16UC1'
+    depth.step, depth.is_bigendian, depth.data = 12, 0, b'\x01\x00' * 36
     info.K = [1.0, 0, 2.0, 0, 1.0, 2.0, 0, 0, 1.0]
     observer = RosObservation.__new__(RosObservation)
+    from collections import deque
+    observer._depth_projections = deque(maxlen=4)
     observer.bridge = Bridge()
     observer.tf = Value()
     observer.tf.transformations = Transformations()
@@ -673,3 +676,41 @@ def test_extrinsic_change_in_any_translation_or_rotation_invalidates_snapshot():
                     (0.105, 0.0, 0.08, 0.0, 0.01, 0.0),
                     (0.105, 0.0, 0.08, 0.0, 0.0, 0.01)]:
         assert not transform_matches(original, changed)
+def test_depth_projection_reuses_frame_with_equivalent_calibration(monkeypatch):
+    import collections
+    import copy
+    import numpy as np
+    import explore
+
+    class Obj(object):
+        pass
+
+    observer = explore.RosObservation.__new__(explore.RosObservation)
+    observer._depth_projections = collections.deque(maxlen=4)
+    observer.depth_projection_config = {'sample_stride': 4}
+    observer.tf, observer.bridge = Obj(), Obj()
+    observer.tf.transformations = Obj()
+    observer.tf.transformations.quaternion_matrix = lambda _: np.eye(4)
+    observer.bridge.imgmsg_to_cv2 = lambda *a, **k: None
+    image, info = Obj(), Obj()
+    image.data, image.encoding = b'\x00\x01', '16UC1'
+    image.width, image.height, image.step, image.is_bigendian = 1, 1, 2, 0
+    image.header = Obj()
+    image.header.frame_id = 'camera_depth_optical_frame'
+    info.K = (1., 0., .5, 0., 1., .5, 0., 0., 1.)
+    calls = []
+
+    def project(_array, _encoding, _intrinsics, _matrix, stamp, _config):
+        calls.append(stamp)
+        return {'stamp': stamp, 'nearest_obstacle': {'x': .5}}
+
+    monkeypatch.setattr(explore, 'project_depth_frame', project)
+    trans, rotation = (0., 0., 0.), (0., 0., 0., 1.)
+    first = observer._depth_projection(image, info, 10., 0, trans, rotation)
+    first['nearest_obstacle']['x'] = 1.
+    assert copy.copy(observer)._depth_projection(image, copy.copy(info), 10., 0, trans, rotation
+                                                 )['nearest_obstacle']['x'] == .5
+    assert calls == [10.]
+    observer._depth_projection(image, info, 10., 1, trans, rotation)
+    observer._depth_projection(image, info, 10., 1, (.01, 0., 0.), rotation)
+    assert calls == [10., 10., 10.]
