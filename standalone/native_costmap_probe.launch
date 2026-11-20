@@ -1,0 +1,63 @@
+<launch>
+  <!-- Diagnostic only: no node in this launch publishes velocity commands. -->
+  <arg name="namespace" />
+  <arg name="use_fresh" default="false" />
+  <group ns="$(arg namespace)">
+    <node pkg="topic_tools" type="throttle" name="depth_throttle"
+          args="messages /camera/depth/image_raw 5 /$(arg namespace)/depth_image" output="screen" />
+    <node pkg="nodelet" type="nodelet" name="depth_points"
+          args="standalone depth_image_proc/point_cloud_xyz" output="screen">
+      <remap from="image_rect" to="/$(arg namespace)/depth_image" />
+      <remap from="camera_info" to="/camera/depth/camera_info" />
+      <remap from="/$(arg namespace)/camera_info" to="/camera/depth/camera_info" />
+      <remap from="points" to="/$(arg namespace)/depth_points" />
+    </node>
+    <node pkg="costmap_2d" type="costmap_2d_node" name="rolling_costmap" output="screen" required="true">
+      <remap from="/tf" to="/$(arg namespace)/tf" />
+      <rosparam ns="costmap" subst_value="true">
+        global_frame: odom
+        robot_base_frame: base_link
+        update_frequency: 10.0
+        publish_frequency: 10.0
+        rolling_window: true
+        width: 3.0
+        height: 3.0
+        resolution: 0.05
+        transform_tolerance: 0.3
+        track_unknown_space: true
+        always_send_full_costmap: true
+        footprint: [[-0.16, -0.11], [-0.16, 0.11], [0.16, 0.11], [0.16, -0.11]]
+        laser:
+          enabled: true
+          track_unknown_space: true
+          footprint_clearing_enabled: false
+          max_scan_age: 0.3
+          obstacle_range: 3.0
+          raytrace_range: 3.5
+          observation_sources: forward_scan
+          forward_scan: {data_type: LaserScan, topic: /scan, marking: true, clearing: true,
+                         inf_is_valid: false, observation_persistence: 0.0, expected_update_rate: 0.2}
+        depth:
+          enabled: true
+          track_unknown_space: true
+          footprint_clearing_enabled: false
+          observation_sources: depth_points
+          depth_points: {data_type: PointCloud2, topic: /$(arg namespace)/depth_points,
+                         marking: true, clearing: false, min_obstacle_height: -0.05,
+                         max_obstacle_height: 0.4, expected_update_rate: 0.0}
+        inflation: {enabled: true, inflation_radius: 0.2, cost_scaling_factor: 10.0}
+      </rosparam>
+      <rosparam if="$(arg use_fresh)" ns="costmap" param="plugins">
+        - {name: laser, type: "limo_fresh_layer/FreshLaserLayer"}
+        - {name: depth, type: "costmap_2d::ObstacleLayer"}
+        - {name: inflation, type: "costmap_2d::InflationLayer"}
+        - {name: snapshot, type: "limo_fresh_layer/FreshGridSnapshotLayer"}
+      </rosparam>
+      <rosparam unless="$(arg use_fresh)" ns="costmap" param="plugins">
+        - {name: laser, type: "costmap_2d::ObstacleLayer"}
+        - {name: depth, type: "costmap_2d::ObstacleLayer"}
+        - {name: inflation, type: "costmap_2d::InflationLayer"}
+      </rosparam>
+    </node>
+  </group>
+</launch>

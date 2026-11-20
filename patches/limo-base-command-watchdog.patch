@@ -1,0 +1,1164 @@
+--- a/limo_base/CMakeLists.txt
++++ b/limo_base/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ 
+ find_package(catkin REQUIRED COMPONENTS
+   roscpp
++  std_msgs
+   geometry_msgs
+   tf
+   message_generation
+--- a/limo_base/package.xml
++++ b/limo_base/package.xml
+@@ -8,9 +8,11 @@
+ 
+   <buildtool_depend>catkin</buildtool_depend>
+   <build_depend>roscpp</build_depend>
++  <build_depend>std_msgs</build_depend>
+   <build_depend>geometry_msgs</build_depend>
+   <build_depend>tf</build_depend>
+   <exec_depend>roscpp</exec_depend>
++  <exec_depend>std_msgs</exec_depend>
+   <exec_depend>geometry_msgs</exec_depend>
+   <exec_depend>tf</exec_depend>
+ 
+--- a/limo_base/include/limo_driver.h
++++ b/limo_base/include/limo_driver.h
+@@ -33,15 +33,19 @@
+ 
+ #include <iostream>
+ #include <thread>
++#include <mutex>
++#include <atomic>
+ #include <memory.h>
+ #include <ros/ros.h>
+ #include <tf/transform_broadcaster.h>
+ #include <tf/tf.h>
+ #include <nav_msgs/Odometry.h>
+ #include <sensor_msgs/Imu.h>
++#include <std_msgs/String.h>
+ #include <limo_base/LimoStatus.h>
+ #include "serial_port.h"
+ #include "limo_protocol.h"
++#include "limo_command_watchdog.h"
+ 
+ namespace AgileX {
+ 
+@@ -51,12 +55,12 @@
+     ~LimoDriver();
+ 
+ private:
+-    void connect(std::string dev_name, uint32_t bouadrate);
++    void connect(std::string dev_name, uint32_t bouadrate, bool exclusive);
+     void readData();
+     void processRxData(uint8_t data);
+     void parseFrame(const LimoFrame& frame);
+-    void sendFrame(const LimoFrame& frame);
+-    void setMotionCommand(double linear_vel, double steer_angle,
++    bool sendFrame(const LimoFrame& frame);
++    bool setMotionCommand(double linear_vel, double steer_angle,
+                           double lateral_vel, double angular_vel);
+     void enableCommandedMode();
+     void publishOdometry(double stamp, double linear_velocity,
+@@ -66,7 +70,10 @@
+                           double battery_voltage, uint16_t error_code, int8_t motion_mode);
+     void publishIMUData(double stamp);
+     void processErrorCode(uint16_t error_code);
+-    void twistCmdCallback(const geometry_msgs::Twist::ConstPtr &msg);
++    void twistCmdCallback(const ros::MessageEvent<geometry_msgs::Twist const>& event);
++    void commandWatchdogCallback(const ros::SteadyTimerEvent& event);
++    bool commandWatchdogModeFresh(double now) const;
++    void publishCommandWatchdogStatus(double now);
+     double normalizeAngle(double angle);
+     double degToRad(double deg);
+     double convertInnerAngleToCentral(double inner_angle);
+@@ -85,6 +92,12 @@
+     ros::Publisher status_publisher_;
+     ros::Publisher imu_publisher_;
+     ros::Subscriber motion_cmd_sub_;
++    std::mutex motion_command_mutex_;
++    std::unique_ptr<LimoCommandWatchdog> command_watchdog_;
++    ros::SteadyTimer command_watchdog_timer_;
++    ros::Publisher command_watchdog_status_publisher_;
++    std::string command_watchdog_boot_id_;
++    double last_mode_report_at_ = 0.0;  // protected by motion_command_mutex_
+     tf::TransformBroadcaster tf_broadcaster_;
+ 
+     double position_x_ = 0.0;
+@@ -97,7 +110,7 @@
+     double rad = 0.0;    
+ 
+     ImuData imu_data_;
+-    uint8_t motion_mode_;  // current motion type
++    std::atomic<uint8_t> motion_mode_{MODE_UNKNOWN};  // updated by the serial reader
+     
+     static constexpr double steer_angle_tolerance = 0.005;
+     static constexpr double max_inner_angle_ = 28.0;  // degree
+--- a/limo_base/include/serial_port.h
++++ b/limo_base/include/serial_port.h
+@@ -40,7 +40,8 @@
+ 
+ class SerialPort {
+ public:
+-    SerialPort(std::string pathname, uint32_t rate = B38400): path_(pathname), baudrate_(rate) {}
++    SerialPort(std::string pathname, uint32_t rate = B38400)
++        : path_(pathname), baudrate_(rate), fd_(-1), exclusive_(false) {}
+ 
+     ~SerialPort() {
+         if (isOpen() != -1) {
+@@ -48,7 +49,9 @@
+         }
+     }
+ 
+-    int openPort();
++    // Linux TIOCEXCL prevents later unprivileged opens, but cannot revoke
++    // preexisting descriptors and can be bypassed with CAP_SYS_ADMIN.
++    int openPort(bool exclusive = false);
+     int closePort();
+ 
+     std::string getDevPath() { return path_; }
+@@ -61,6 +64,7 @@
+     std::string path_;
+     uint32_t baudrate_;
+     int fd_;
++    bool exclusive_;
+ };
+ 
+ }
+--- a/limo_base/src/serial_port.cpp
++++ b/limo_base/src/serial_port.cpp
+@@ -29,23 +29,46 @@
+  */
+ 
+ #include "serial_port.h"
++#include <cerrno>
+ #include <fcntl.h>
++#include <sys/ioctl.h>
+ 
+ namespace AgileX {
+ 
+-int SerialPort::openPort() {
++int SerialPort::openPort(bool exclusive) {
+     struct termios termios_opt;
+     const char* addr = path_.c_str();
+-    fd_ = open(addr, O_RDWR | O_NOCTTY| O_NDELAY);
++    if (fd_ >= 0) {
++        errno = EALREADY;
++        return -1;
++    }
++    int fd = open(addr, O_RDWR | O_NOCTTY| O_NDELAY);
+ 
+-    if (fd_ == -1)
++    if (fd == -1)
+         return -1;
+ 
+-    if ((fcntl(fd_, F_SETFL, 0)) < 0) {
++    bool acquired_exclusive = false;
++    const auto fail = [&](int error) {
++#ifdef __linux__
++        if (acquired_exclusive) ioctl(fd, TIOCNXCL);
++#endif
++        close(fd);
++        errno = error;
+         return -1;
++    };
++    if (exclusive) {
++#ifdef __linux__
++        if (ioctl(fd, TIOCEXCL) < 0) return fail(errno);
++        acquired_exclusive = true;
++#else
++        return fail(ENOTSUP);
++#endif
+     }
+-    if (tcgetattr(fd_, &termios_opt) != 0) {
+-        return -1;
++    if ((fcntl(fd, F_SETFL, 0)) < 0) {
++        return fail(errno);
++    }
++    if (tcgetattr(fd, &termios_opt) != 0) {
++        return fail(errno);
+     }
+ 
+     cfmakeraw(&termios_opt);
+@@ -66,22 +89,38 @@
+     termios_opt.c_cflag &= ~CSTOPB;
+     termios_opt.c_cc[VTIME] = 0;
+     termios_opt.c_cc[VMIN] = 1;
+-    tcflush(fd_,TCIFLUSH);
++    tcflush(fd,TCIFLUSH);
+ 
+-    if (tcsetattr(fd_, TCSANOW, &termios_opt) != 0) {
+-        return -1;
++    if (tcsetattr(fd, TCSANOW, &termios_opt) != 0) {
++        return fail(errno);
+     }
+ 
++    fd_ = fd;
++    exclusive_ = acquired_exclusive;
+     return 0;
+ }
+ 
+ int SerialPort::closePort() {
+-    if (close(fd_) < 0) {
++    if (fd_ < 0) {
++        errno = EBADF;
+         return -1;
+     }
+-    else {
+-        return 0;
++    const int fd = fd_;
++    const bool release_exclusive = exclusive_;
++    fd_ = -1;
++    exclusive_ = false;
++    int error = 0;
++#ifdef __linux__
++    if (release_exclusive && ioctl(fd, TIOCNXCL) < 0) error = errno;
++#else
++    (void)release_exclusive;
++#endif
++    if (close(fd) < 0 && !error) error = errno;
++    if (error) {
++        errno = error;
++        return -1;
+     }
++    return 0;
+ }
+ 
+ }
+--- a/limo_base/src/limo_driver.cpp
++++ b/limo_base/src/limo_driver.cpp
+@@ -29,9 +29,15 @@
+  */
+ 
+ #include "limo_driver.h"
++#include <chrono>
++#include <unistd.h>
+ int flag=0; 
+ 
+ namespace AgileX {
++
++static double monotonicSeconds() {
++    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
+ 
+ LimoDriver::LimoDriver()  {
+     ros::NodeHandle nh;
+@@ -42,6 +48,21 @@
+     private_nh.param<std::string>("base_frame", base_frame_, std::string("base_link"));
+     private_nh.param<bool>("pub_odom_tf", pub_odom_tf_, false);
+     private_nh.param<bool>("use_mcnamu", use_mcnamu_, false);
++    bool command_watchdog_enabled = false;
++    double command_watchdog_timeout_sec = 0.3;
++    double command_watchdog_mode_timeout_sec = 1.5;
++    private_nh.param<bool>("command_watchdog_enabled", command_watchdog_enabled, false);
++    private_nh.param<double>("command_watchdog_timeout_sec", command_watchdog_timeout_sec, 0.3);
++    private_nh.param<double>("command_watchdog_mode_timeout_sec", command_watchdog_mode_timeout_sec, 1.5);
++    if (command_watchdog_enabled) {
++        command_watchdog_.reset(new LimoCommandWatchdog(command_watchdog_timeout_sec,
++                                                        command_watchdog_mode_timeout_sec));
++        command_watchdog_boot_id_ = std::to_string(
++            std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
++            std::to_string(static_cast<long>(getpid()));
++        command_watchdog_status_publisher_ = nh.advertise<std_msgs::String>(
++            "/rosclaw_limo/command_watchdog", 1, false);
++    }
+ 
+     if(use_mcnamu_) {
+         motion_mode_ = MODE_MCNAMU;
+@@ -50,19 +71,25 @@
+     odom_publisher_ = nh.advertise<nav_msgs::Odometry>("/odom", 50, true);
+     status_publisher_ = nh.advertise<limo_base::LimoStatus>("/limo_status", 10, true);
+     imu_publisher_ = nh.advertise<sensor_msgs::Imu>("/imu", 10, true);
+-    motion_cmd_sub_ = nh.subscribe<geometry_msgs::Twist>("/cmd_vel", 5, &LimoDriver::twistCmdCallback, this);
++    motion_cmd_sub_ = nh.subscribe("/cmd_vel", command_watchdog_enabled ? 1 : 5,
++                                   &LimoDriver::twistCmdCallback, this);
+ 
+     // connect to the serial port
+     if (port_name.find("tty") != port_name.npos){
+         port_name= "/dev/" + port_name;
+-        connect(port_name, B460800);
++        connect(port_name, B460800, command_watchdog_enabled);
+         enableCommandedMode();
+         ROS_INFO("open the serial port: %s", port_name.c_str());
+     }
++    if (command_watchdog_enabled) {
++        if (!port_) throw std::runtime_error("command watchdog requires an open base connection");
++        command_watchdog_timer_ = nh.createSteadyTimer(ros::WallDuration(0.05),
++                                                       &LimoDriver::commandWatchdogCallback, this);
++    }
+ }
+ 
+ LimoDriver::~LimoDriver() {
+-
++    command_watchdog_timer_.stop();
+ }
+ 
+ double LimoDriver::degToRad(double deg) {
+@@ -79,9 +106,9 @@
+     return angle;
+ }
+ 
+-void LimoDriver::connect(std::string dev_name, uint32_t bouadrate) {
++void LimoDriver::connect(std::string dev_name, uint32_t bouadrate, bool exclusive) {
+     port_ = std::shared_ptr<SerialPort>(new SerialPort(dev_name, bouadrate));
+-    if (port_->openPort() == 0) {
++    if (port_->openPort(exclusive) == 0) {
+         read_data_thread_ = std::shared_ptr<std::thread>(
+             new std::thread(std::bind(&LimoDriver::readData, this)));
+     }
+@@ -189,13 +216,25 @@
+             double battervyoltage = ((frame.data[3] & 0xff) | (frame.data[2] << 8)) * 0.1;
+             uint16_t error_code = ((frame.data[5] & 0xff) | (frame.data[4] << 8));
+ 
+-            if (!use_mcnamu_) {
+-                motion_mode_ = frame.data[6];
++            uint8_t reported_motion_mode;
++            const double mode_received_at = monotonicSeconds();
++            {
++                std::lock_guard<std::mutex> lock(motion_command_mutex_);
++                const double now = monotonicSeconds();
++                reported_motion_mode = use_mcnamu_ ? MODE_MCNAMU : frame.data[6];
++                if (command_watchdog_ &&
++                    (motion_mode_.load() != reported_motion_mode || !commandWatchdogModeFresh(now)) &&
++                    command_watchdog_->mode_changed()) {
++                    if (!setMotionCommand(0, 0, 0, 0))
++                        command_watchdog_->record_write(false, monotonicSeconds());
++                }
++                motion_mode_.store(reported_motion_mode);
++                last_mode_report_at_ = mode_received_at;
+             }
+ 
+             processErrorCode(error_code);
+             publishLimoState(frame.stamp, vehicle_state, control_mode,
+-                             battervyoltage, error_code, motion_mode_);
++                             battervyoltage, error_code, reported_motion_mode);
+             break;
+         }
+         case MSG_ACTUATOR1_HS_STATE_ID: {
+@@ -299,7 +338,7 @@
+     sendFrame(frame);
+ }
+ 
+-void LimoDriver::setMotionCommand(double linear_vel, double angular_vel,
++bool LimoDriver::setMotionCommand(double linear_vel, double angular_vel,
+                                   double lateral_velocity, double steering_angle) {
+     LimoFrame frame;
+     frame.id = MSG_MOTION_COMMAND_ID;
+@@ -316,10 +355,10 @@
+     frame.data[5] = static_cast<uint8_t>(lateral_cmd & 0x00ff);
+     frame.data[6] = static_cast<uint8_t>(steering_cmd >> 8);
+     frame.data[7] = static_cast<uint8_t>(steering_cmd & 0x00ff);
+-    sendFrame(frame);
+-}
+-
+-void LimoDriver::sendFrame(const LimoFrame& frame) {
++    return sendFrame(frame);
++}
++
++bool LimoDriver::sendFrame(const LimoFrame& frame) {
+     uint32_t checksum = 0;
+     uint8_t frame_len = 0x0e;
+     uint8_t data[14] = {0x55, frame_len};
+@@ -347,12 +386,40 @@
+                           "LIMO serial motion frame written: linear=%d angular=%d bytes=%d",
+                           linear_cmd, angular_cmd, written);
+     }
+-}
+-
+-void LimoDriver::twistCmdCallback(const geometry_msgs::TwistConstPtr& msg) {
+-    switch (motion_mode_) {
++    return written == frame_len;
++}
++
++void LimoDriver::twistCmdCallback(const ros::MessageEvent<geometry_msgs::Twist const>& event) {
++    const geometry_msgs::TwistConstPtr msg = event.getMessage();
++    std::lock_guard<std::mutex> lock(motion_command_mutex_);
++    const double now = monotonicSeconds();
++    const uint8_t motion_mode = motion_mode_.load();
++    const bool zero = msg->linear.x == 0.0 && msg->linear.y == 0.0 && msg->angular.z == 0.0;
++    const std::string caller = event.getPublisherName();
++    const bool supported_mode = commandWatchdogModeFresh(now) &&
++        (motion_mode == MODE_FOUR_DIFF || motion_mode == MODE_ACKERMANN || motion_mode == MODE_MCNAMU);
++    if (command_watchdog_ && !command_watchdog_->accept_source(caller, zero)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        ROS_ERROR_THROTTLE(1.0, "LIMO command watchdog rejected another publisher; zero requested");
++        return;
++    }
++    if (command_watchdog_ && !command_watchdog_->accept(
++            msg->linear.x, msg->linear.y, msg->angular.z, now, supported_mode)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        ROS_WARN_THROTTLE(1.0, "LIMO command watchdog is unprimed or latched; command rejected");
++        return;
++    }
++    if (command_watchdog_ && zero) {
++        const bool written = setMotionCommand(0, 0, 0, 0);
++        command_watchdog_->record_write(written, monotonicSeconds());
++        command_watchdog_->record_zero_source(caller);
++        if (command_watchdog_->is_latched()) setMotionCommand(0, 0, 0, 0);
++        return;
++    }
++    bool written = false;
++    switch (motion_mode) {
+         case MODE_FOUR_DIFF: {
+-            setMotionCommand(msg->linear.x, msg->angular.z, 0, 0);
++            written = setMotionCommand(msg->linear.x, msg->angular.z, 0, 0);
+             break;
+         }
+         case MODE_ACKERMANN: {
+@@ -380,17 +447,54 @@
+                 steering_angle = inner_angle / right_angle_scale_;
+             }
+ 
+-            setMotionCommand(msg->linear.x, 0, 0, steering_angle);
++            written = setMotionCommand(msg->linear.x, 0, 0, steering_angle);
+             break;
+         }
+         case MODE_MCNAMU: {
+-            setMotionCommand(msg->linear.x, msg->angular.z, msg->linear.y, 0);
++            written = setMotionCommand(msg->linear.x, msg->angular.z, msg->linear.y, 0);
+             break;
+         }
+         default:
+             ROS_INFO("motion mode not supported in receive cmd_vel");
+             break;
+     }
++    if (command_watchdog_) {
++        command_watchdog_->record_write(written, monotonicSeconds());
++        if (command_watchdog_->is_latched()) setMotionCommand(0, 0, 0, 0);
++    }
++}
++
++void LimoDriver::commandWatchdogCallback(const ros::SteadyTimerEvent& event) {
++    (void)event;
++    std::lock_guard<std::mutex> lock(motion_command_mutex_);
++    if (!command_watchdog_) return;
++    const double now = monotonicSeconds();
++    if (!commandWatchdogModeFresh(now)) command_watchdog_->mode_changed();
++    if (command_watchdog_->should_stop(now)) {
++        if (!setMotionCommand(0, 0, 0, 0)) command_watchdog_->record_write(false, monotonicSeconds());
++        if (command_watchdog_->is_latched()) {
++            ROS_ERROR_THROTTLE(1.0, "LIMO command watchdog timed out; zero command requested");
++        }
++    }
++    publishCommandWatchdogStatus(monotonicSeconds());
++}
++
++bool LimoDriver::commandWatchdogModeFresh(double now) const {
++    return command_watchdog_ && command_watchdog_->mode_report_fresh(last_mode_report_at_, now);
++}
++
++void LimoDriver::publishCommandWatchdogStatus(double now) {
++    const uint8_t mode = commandWatchdogModeFresh(now) ? motion_mode_.load() : MODE_UNKNOWN;
++    std_msgs::String status;
++    status.data = "v2 " + command_watchdog_boot_id_ + " " +
++                  std::to_string(command_watchdog_->zero_writes()) + " " +
++                  std::to_string(static_cast<unsigned int>(mode)) + " " +
++                  (command_watchdog_->primed() ? "1" : "0") + " " +
++                  (command_watchdog_->is_latched() ? "1" : "0") + " " +
++                  (command_watchdog_->zero_source().empty() ? "none" : command_watchdog_->zero_source()) + " " +
++                  std::to_string(command_watchdog_->last_zero_write_at()) + " " +
++                  std::to_string(now);
++    command_watchdog_status_publisher_.publish(status);
+ }
+ 
+ void LimoDriver::publishIMUData(double stamp) {
+--- a/limo_base/launch/limo_base.launch
++++ b/limo_base/launch/limo_base.launch
+@@ -7,9 +7,15 @@
+     <arg name="base_frame" default="base_link" />
+     <arg name="use_mcnamu" default="false" />
+     <arg name="pub_odom_tf" default="" />
++    <arg name="command_watchdog_enabled" default="false" />
++    <arg name="command_watchdog_timeout_sec" default="0.3" />
++    <arg name="command_watchdog_mode_timeout_sec" default="1.5" />
+ 
+     <node name="limo_base_node" pkg="limo_base" type="limo_base_node" output="screen" >
+         <param name="port_name" value="$(arg port_name)" />
++        <param name="command_watchdog_enabled" value="$(arg command_watchdog_enabled)" />
++        <param name="command_watchdog_timeout_sec" value="$(arg command_watchdog_timeout_sec)" />
++        <param name="command_watchdog_mode_timeout_sec" value="$(arg command_watchdog_mode_timeout_sec)" />
+         <param name="odom_frame" value="$(arg odom_frame)" />
+         <param name="base_frame" value="$(arg base_frame)" />
+         <param name="use_mcnamu" value="$(arg use_mcnamu)" />
+--- a/limo_bringup/launch/limo_start.launch
++++ b/limo_bringup/launch/limo_start.launch
+@@ -5,11 +5,17 @@
+     <arg name="port_name" default="ttyTHS1" />
+     <arg name="use_mcnamu" default="false" />
+     <arg name="pub_odom_tf" default="" />
++    <arg name="command_watchdog_enabled" default="false" />
++    <arg name="command_watchdog_timeout_sec" default="0.3" />
++    <arg name="command_watchdog_mode_timeout_sec" default="1.5" />
+ 
+     <include file="$(find limo_base)/launch/limo_base.launch">
+         <arg name="port_name" default="$(arg port_name)" />
+         <arg name="use_mcnamu" default="$(arg use_mcnamu)" />
+         <arg name="pub_odom_tf" default="$(arg pub_odom_tf)" />
++        <arg name="command_watchdog_enabled" value="$(arg command_watchdog_enabled)" />
++        <arg name="command_watchdog_timeout_sec" value="$(arg command_watchdog_timeout_sec)" />
++        <arg name="command_watchdog_mode_timeout_sec" value="$(arg command_watchdog_mode_timeout_sec)" />
+     </include>
+ 
+     <include file="$(find ydlidar_ros)/launch/X2L.launch" />
+--- /dev/null
++++ b/limo_base/include/limo_command_watchdog.h
+@@ -0,0 +1,124 @@
++#ifndef ROSCLAW_LIMO_COMMAND_WATCHDOG_H
++#define ROSCLAW_LIMO_COMMAND_WATCHDOG_H
++
++// Candidate driver-side timeout policy. No ROS or hardware access. Calls must
++// be serialized with the driver's motion-command writes by the caller.
++
++#include <cmath>
++#include <cstdint>
++#include <limits>
++#include <stdexcept>
++#include <string>
++
++class LimoCommandWatchdog {
++ public:
++  explicit LimoCommandWatchdog(double timeout_seconds, double mode_timeout_seconds = 1.5)
++      : timeout_(timeout_seconds), mode_timeout_(mode_timeout_seconds), last_(0.0), seen_(false), active_(false),
++        primed_(false), pending_(false), pending_zero_(false), prior_deadline_(0.0),
++        prior_active_(false), latched_(false), zero_writes_(0), last_zero_write_at_(0.0) {
++    if (!std::isfinite(timeout_) || timeout_ < 0.1 || timeout_ > 1.0) {
++      throw std::invalid_argument("command timeout must be between 0.1 and 1.0 seconds");
++    }
++    if (!std::isfinite(mode_timeout_) || mode_timeout_ < 0.7 || mode_timeout_ > 5.0) {
++      throw std::invalid_argument("mode timeout must be between 0.7 and 5.0 seconds");
++    }
++  }
++
++  bool accept(double linear, double lateral, double angular, double now,
++              bool supported_mode = true) {
++    if (latched_) return false;
++    if (pending_ || !std::isfinite(linear) || !std::isfinite(lateral) || !std::isfinite(angular) ||
++        !std::isfinite(now) || (seen_ && (now < last_ || (active_ && now - last_ >= timeout_)))) {
++      latched_ = true;
++      return false;
++    }
++    const bool zero = linear == 0.0 && lateral == 0.0 && angular == 0.0;
++    if (!primed_ && !zero) return false;
++    if (!supported_mode && !zero) {
++      if (active_) latched_ = true;
++      return false;
++    }
++    prior_active_ = active_;
++    prior_deadline_ = last_ + timeout_;
++    last_ = now;
++    seen_ = true;
++    pending_ = true;
++    pending_zero_ = zero;
++    if (!zero) active_ = true;
++    return true;
++  }
++
++  void record_write(bool complete, double now) {
++    if (!complete || !pending_ || !std::isfinite(now) || now < last_ ||
++        now - last_ >= timeout_ || (prior_active_ && now >= prior_deadline_)) {
++      latched_ = true;
++    } else if (pending_zero_) {
++      if (zero_writes_ == std::numeric_limits<std::uint64_t>::max()) {
++        latched_ = true;
++      } else {
++        ++zero_writes_;
++        last_zero_write_at_ = now;
++        active_ = false;
++        primed_ = true;
++      }
++    }
++    pending_ = false;
++    pending_zero_ = false;
++  }
++
++  bool should_stop(double now) {
++    if (!std::isfinite(now) || (seen_ && (now < last_ || (active_ && now - last_ >= timeout_)))) {
++      latched_ = true;
++    }
++    return latched_ || !primed_;
++  }
++
++  bool is_latched() const { return latched_; }
++  bool primed() const { return primed_; }
++  std::uint64_t zero_writes() const { return zero_writes_; }
++  double last_zero_write_at() const { return last_zero_write_at_; }
++  const std::string& zero_source() const { return zero_source_; }
++
++  bool mode_report_fresh(double report_at, double now) const {
++    return std::isfinite(report_at) && std::isfinite(now) && report_at > 0.0 &&
++           now >= report_at && now - report_at < mode_timeout_;
++  }
++
++  bool accept_source(const std::string& source, bool zero) {
++    if (latched_) return false;
++    if (source.empty() || source[0] != '/' || source.size() > 80 ||
++        source.find_first_of(" \t\r\n") != std::string::npos ||
++        (primed_ && source != zero_source_ && (active_ || !zero))) {
++      latched_ = true;
++      return false;
++    }
++    return true;
++  }
++
++  void record_zero_source(const std::string& source) {
++    if (primed_ && !latched_) zero_source_ = source;
++  }
++
++  bool mode_changed() {
++    if (active_) latched_ = true;
++    return latched_;
++  }
++
++ private:
++  const double timeout_;
++  const double mode_timeout_;
++  double last_;
++  bool seen_;
++  bool active_;
++  bool primed_;
++  bool pending_;
++  bool pending_zero_;
++  double prior_deadline_;
++  bool prior_active_;
++  bool latched_;
++  std::uint64_t zero_writes_;
++  double last_zero_write_at_;
++  std::string zero_source_;
++};
++
++#endif
+--- /dev/null
++++ b/limo_base/test/test_serial_port_exclusive.cpp
+@@ -0,0 +1,212 @@
++// Offline PTY tests for SerialPort. Run only in a PID/network/device-isolated
++// bubblewrap namespace: no real serial or motor device is accessed.
++#include <cerrno>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <pty.h>
++#include <sys/ioctl.h>
++#include <sys/select.h>
++#include <unistd.h>
++
++#include "serial_port.h"
++
++static bool inject_exclusive_failure = false;
++static bool inject_release_failure = false;
++static bool inject_termios_failure = false;
++static int injected_fd = -1;
++static int exclusive_requests = 0;
++
++extern "C" int __real_ioctl(int fd, unsigned long request, ...);
++extern "C" int __wrap_ioctl(int fd, unsigned long request, ...) {
++    if (request == TIOCEXCL) {
++        ++exclusive_requests;
++        if (inject_exclusive_failure) {
++            injected_fd = fd;
++            errno = EIO;
++            return -1;
++        }
++        return __real_ioctl(fd, request);
++    }
++    if (request == TIOCNXCL) {
++        if (inject_release_failure) {
++            injected_fd = fd;
++            errno = EIO;
++            return -1;
++        }
++        return __real_ioctl(fd, request);
++    }
++    va_list args;
++    va_start(args, request);
++    void *arg = va_arg(args, void *);
++    va_end(args);
++    return __real_ioctl(fd, request, arg);
++}
++
++extern "C" int __real_tcgetattr(int fd, struct termios *attributes);
++extern "C" int __wrap_tcgetattr(int fd, struct termios *attributes) {
++    if (inject_termios_failure) {
++        injected_fd = fd;
++        errno = EIO;
++        return -1;
++    }
++    return __real_tcgetattr(fd, attributes);
++}
++
++// During the red phase, the old interface has no bool argument and the
++// fallback exercises its actual nonexclusive open. The bool overload is used
++// automatically once implemented, without adding test-only product code.
++template <typename T>
++auto open_watchdog(T &port, int) -> decltype(port.openPort(true)) {
++    return port.openPort(true);
++}
++template <typename T>
++int open_watchdog(T &port, ...) { return port.openPort(); }
++
++static void require(bool condition, const char *message) {
++    if (!condition) {
++        std::fprintf(stderr, "FAIL: %s (errno=%d)\n", message, errno);
++        std::exit(1);
++    }
++}
++
++struct Pty {
++    int master;
++    int slave;
++    char path[128];
++    Pty() : master(-1), slave(-1) {
++        require(openpty(&master, &slave, path, NULL, NULL) == 0, "open own PTY");
++        require(std::strncmp(path, "/dev/pts/", 9) == 0, "device must be a PTY");
++    }
++    ~Pty() { if (slave >= 0) close(slave); if (master >= 0) close(master); }
++};
++
++static void test_default_is_nonexclusive() {
++    Pty pty;
++    const int prior = exclusive_requests;
++    AgileX::SerialPort port(pty.path, B38400);
++    require(port.openPort() == 0, "legacy open");
++    int second = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    require(second >= 0, "legacy mode must permit a second open");
++    close(second);
++    require(exclusive_requests == prior, "legacy mode must not request TIOCEXCL");
++}
++
++static void test_watchdog_excludes_new_opens_and_releases() {
++    Pty pty;
++    AgileX::SerialPort port(pty.path, B38400);
++    require(open_watchdog(port, 0) == 0, "watchdog serial open");
++    errno = 0;
++    int second = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    const int open_errno = errno;
++    if (second >= 0) close(second);
++    require(second < 0 && open_errno == EBUSY, "watchdog mode must block later open");
++    require(fcntl(pty.slave, F_GETFD) >= 0, "preexisting PTY descriptor remains open");
++    require(write(pty.slave, "Z", 1) == 1, "preexisting PTY descriptor remains writable");
++    fd_set ready;
++    FD_ZERO(&ready);
++    FD_SET(pty.master, &ready);
++    struct timeval timeout = {1, 0};
++    require(select(pty.master + 1, &ready, NULL, NULL, &timeout) == 1,
++            "preexisting descriptor data reaches PTY master");
++    char byte = 0;
++    require(read(pty.master, &byte, 1) == 1 && byte == 'Z', "preexisting writer is not revoked");
++    require(open_watchdog(port, 0) != 0, "same SerialPort cannot open twice");
++    require(port.closePort() == 0, "close exclusive port");
++    require(port.isOpen() == -1, "closed port must report closed");
++    int reopened = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    require(reopened >= 0, "clean close must release exclusion while PTY master is open");
++    close(reopened);
++}
++
++static void test_failed_exclusive_ioctl_closes_new_descriptor() {
++    Pty pty;
++    AgileX::SerialPort port(pty.path, B38400);
++    inject_exclusive_failure = true;
++    injected_fd = -1;
++    const int result = open_watchdog(port, 0);
++    const int saved_errno = errno;
++    inject_exclusive_failure = false;
++    require(result != 0 && saved_errno == EIO, "TIOCEXCL error must reject startup");
++    require(port.isOpen() == -1 && injected_fd >= 0, "failed exclusive open is closed");
++    errno = 0;
++    require(fcntl(injected_fd, F_GETFD) < 0 && errno == EBADF, "failed fd must be closed");
++    int retry = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    require(retry >= 0, "TIOCEXCL failure must leave PTY openable");
++    close(retry);
++}
++
++static void test_later_setup_failure_releases_and_closes() {
++    Pty pty;
++    AgileX::SerialPort port(pty.path, B38400);
++    inject_termios_failure = true;
++    injected_fd = -1;
++    const int result = open_watchdog(port, 0);
++    const int saved_errno = errno;
++    inject_termios_failure = false;
++    require(result != 0 && saved_errno == EIO && injected_fd >= 0, "termios error must fail");
++    require(port.isOpen() == -1, "termios error must reset fd state");
++    errno = 0;
++    require(fcntl(injected_fd, F_GETFD) < 0 && errno == EBADF, "termios failure fd closed");
++    int retry = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    require(retry >= 0, "setup failure must release exclusion");
++    close(retry);
++}
++
++static void test_explicit_close_never_closes_a_reused_descriptor() {
++    Pty pty;
++    int reused = -1;
++    {
++        AgileX::SerialPort port(pty.path, B38400);
++        require(port.openPort() == 0 && port.closePort() == 0, "explicit legacy close");
++        reused = open("/dev/null", O_RDONLY);
++        require(reused >= 0, "open a benign sentinel descriptor");
++    }
++    require(fcntl(reused, F_GETFD) >= 0, "destructor must not close a reused descriptor");
++    close(reused);
++}
++
++static void test_exclusive_destructor_releases() {
++    Pty pty;
++    {
++        AgileX::SerialPort port(pty.path, B38400);
++        require(open_watchdog(port, 0) == 0, "open for destructor release");
++    }
++    int retry = open(pty.path, O_RDWR | O_NOCTTY | O_NONBLOCK);
++    require(retry >= 0, "exclusive destructor must release a live PTY");
++    close(retry);
++}
++
++static void test_release_failure_still_closes_descriptor() {
++    Pty pty;
++    AgileX::SerialPort port(pty.path, B38400);
++    require(open_watchdog(port, 0) == 0, "open for release-failure test");
++    inject_release_failure = true;
++    injected_fd = -1;
++    const int result = port.closePort();
++    const int saved_errno = errno;
++    inject_release_failure = false;
++    require(result != 0 && saved_errno == EIO && injected_fd >= 0, "release failure is reported");
++    require(port.isOpen() == -1, "release failure resets fd state");
++    errno = 0;
++    require(fcntl(injected_fd, F_GETFD) < 0 && errno == EBADF, "release failure still closes fd");
++}
++
++int main() {
++    char hostname[64] = {0};
++    require(gethostname(hostname, sizeof(hostname)) == 0 &&
++            std::strcmp(hostname, "limo-exclusive-pty-isolated") == 0 &&
++            getpid() == 2 && getppid() == 1 && access("/dev/ttyTHS1", F_OK) != 0,
++            "refusing to run outside isolated PTY namespace");
++    test_default_is_nonexclusive();
++    test_watchdog_excludes_new_opens_and_releases();
++    test_failed_exclusive_ioctl_closes_new_descriptor();
++    test_later_setup_failure_releases_and_closes();
++    test_explicit_close_never_closes_a_reused_descriptor();
++    test_exclusive_destructor_releases();
++    test_release_failure_still_closes_descriptor();
++    std::puts("exclusive serial PTY checks passed");
++    return 0;
++}
+--- /dev/null
++++ b/limo_base/test/test_driver_exclusive_pty.py
+@@ -0,0 +1,212 @@
++#!/usr/bin/env python3
++"""Exercise only the candidate ROS driver against fresh namespace-local PTYs.
++
++Start under bwrap with isolated PID, network, and /dev. No real ROS master or
++serial device is used. The pseudo chassis only reads the initialization frame.
++"""
++
++import errno
++import os
++import pty
++import select
++import signal
++import socket
++import subprocess
++import tempfile
++import time
++import tty
++import xmlrpc.client
++from pathlib import Path
++
++
++CANDIDATE = '/tmp/rosclaw-limo-exclusive-candidate/devel/lib/limo_base/limo_base_node'
++
++
++def check_isolation():
++    allowed = {'core', 'fd', 'full', 'null', 'ptmx', 'pts', 'random', 'shm',
++               'stderr', 'stdin', 'stdout', 'tty', 'urandom', 'zero'}
++    if (socket.gethostname() != 'limo-exclusive-pty-isolated' or os.getpid() != 2
++            or os.getppid() != 1 or os.path.lexists('/dev/ttyTHS1')
++            or set(name for _, name in socket.if_nameindex()) != {'lo'}
++            or set(os.listdir('/dev')) - allowed or set(os.listdir('/dev/pts')) != {'ptmx'}):
++        raise RuntimeError('refusing to run outside isolated network/device/PTTY namespace')
++
++
++def stop(process):
++    if process is None or process.poll() is not None:
++        return
++    try:
++        os.killpg(process.pid, signal.SIGTERM)
++        process.wait(timeout=3)
++    except (OSError, subprocess.TimeoutExpired):
++        try:
++            os.killpg(process.pid, signal.SIGKILL)
++        except OSError:
++            pass
++        process.wait(timeout=3)
++
++
++def wait_master(uri, process):
++    deadline = time.monotonic() + 12
++    while time.monotonic() < deadline:
++        if process.poll() is not None:
++            raise RuntimeError('isolated ROS master exited')
++        try:
++            if xmlrpc.client.ServerProxy(uri).getSystemState('/exclusive_pty_test')[0] == 1:
++                return
++        except (OSError, xmlrpc.client.Error):
++            time.sleep(0.1)
++    raise RuntimeError('isolated ROS master did not start')
++
++
++def wait_configuration(master_fd, process):
++    pending = b''
++    deadline = time.monotonic() + 8
++    while time.monotonic() < deadline:
++        if process.poll() is not None:
++            raise RuntimeError('candidate exited before fake PTY initialization')
++        ready, _, _ = select.select([master_fd], [], [], 0.05)
++        if ready:
++            pending += os.read(master_fd, 4096)
++            if b'\x55\x0e\x04\x21' in pending:
++                return
++    raise RuntimeError('candidate did not initialize fake PTY')
++
++
++def run_case(enabled, env, run_dir):
++    master_fd, slave_fd = pty.openpty()
++    tty.setraw(slave_fd)
++    name = os.ttyname(slave_fd)
++    if not name.startswith('/dev/pts/'):
++        raise RuntimeError('serial target is not the test PTY')
++    link = run_dir / ('ttyWatchdog' if enabled else 'ttyDefault')
++    link.symlink_to(name)
++    if os.stat(str(link)).st_rdev != os.fstat(slave_fd).st_rdev:
++        raise RuntimeError('PTY target mismatch')
++    fake_port = os.path.relpath(str(link), '/dev')
++    owner = contender = None
++    log_path = run_dir / ('enabled.log' if enabled else 'default.log')
++    contender_path = run_dir / 'contender.log'
++    try:
++        with open(str(log_path), 'wb') as driver_log, open(str(contender_path), 'wb') as other_log:
++            args = [CANDIDATE, '__name:=' + ('exclusive_on' if enabled else 'exclusive_default'),
++                    '_port_name:=' + fake_port, '_pub_odom_tf:=false']
++            if enabled:
++                args.append('_command_watchdog_enabled:=true')
++            owner = subprocess.Popen(args, env=env, stdout=driver_log, stderr=driver_log,
++                                     start_new_session=True)
++            wait_configuration(master_fd, owner)
++            try:
++                second = os.open(name, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
++            except OSError as exc:
++                if not enabled or exc.errno != errno.EBUSY:
++                    raise
++                second = None
++            if enabled and second is not None:
++                os.close(second)
++                raise RuntimeError('watchdog enabled but a later PTY open succeeded')
++            if not enabled and second is None:
++                raise RuntimeError('default mode unexpectedly blocked a later PTY open')
++            if second is not None:
++                os.close(second)
++            if enabled:
++                contender = subprocess.Popen([
++                    CANDIDATE, '__name:=exclusive_contender', '_port_name:=' + fake_port,
++                    '_command_watchdog_enabled:=true', '_pub_odom_tf:=false',
++                ], env=env, stdout=other_log, stderr=other_log, start_new_session=True)
++                contender.wait(timeout=8)
++                other_log.flush()
++                if contender.returncode == 0 or b'Failed to open' not in contender_path.read_bytes():
++                    raise RuntimeError('second watchdog driver did not fail at serial open')
++                if owner.poll() is not None:
++                    raise RuntimeError('first candidate stopped during contender test')
++                # An already-open PTY slave remains usable; TIOCEXCL is not revocation.
++                if os.write(slave_fd, b'X') != 1:
++                    raise RuntimeError('preexisting descriptor unexpectedly stopped working')
++            return {'watchdog': enabled, 'later_open': 'EBUSY' if enabled else 'allowed',
++                    'second_driver_exit_nonzero': enabled}
++    finally:
++        stop(contender)
++        stop(owner)
++        os.close(slave_fd)
++        os.close(master_fd)
++
++
++def run_ioctl_failure(env, run_dir):
++    injector = '/tmp/fail_tiocexcl.so'
++    if not Path(injector).is_file():
++        raise RuntimeError('test-only TIOCEXCL failure injector missing')
++    master_fd, slave_fd = pty.openpty()
++    tty.setraw(slave_fd)
++    name = os.ttyname(slave_fd)
++    if not name.startswith('/dev/pts/'):
++        raise RuntimeError('serial target is not the test PTY')
++    link = run_dir / 'ttyFailure'
++    link.symlink_to(name)
++    if os.stat(str(link)).st_rdev != os.fstat(slave_fd).st_rdev:
++        raise RuntimeError('failure-case PTY target mismatch')
++    failure_env = dict(env, LD_PRELOAD=injector)
++    process = None
++    log_path = run_dir / 'injected-failure.log'
++    try:
++        with open(str(log_path), 'wb') as log:
++            process = subprocess.Popen([
++                CANDIDATE, '__name:=exclusive_injected_failure',
++                '_port_name:=' + os.path.relpath(str(link), '/dev'),
++                '_command_watchdog_enabled:=true', '_pub_odom_tf:=false',
++            ], env=failure_env, stdout=log, stderr=log, start_new_session=True)
++            process.wait(timeout=8)
++            log.flush()
++            output = log_path.read_bytes()
++            if (process.returncode == 0 or b'FAKE_TIOCEXCL_INJECTED' not in output
++                    or b'Failed to open' not in output):
++                raise RuntimeError('injected TIOCEXCL failure did not abort serial startup')
++            ready, _, _ = select.select([master_fd], [], [], 0.2)
++            if ready and os.read(master_fd, 4096):
++                raise RuntimeError('driver emitted serial data despite failed TIOCEXCL')
++            retry = os.open(name, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
++            os.close(retry)
++            return {'injected_tiocexcl_failure': 'startup_rejected',
++                    'initialization_frames': 0, 'pty_reopen': 'allowed'}
++    finally:
++        stop(process)
++        os.close(slave_fd)
++        os.close(master_fd)
++
++
++def main():
++    check_isolation()
++    if not Path(CANDIDATE).is_file():
++        raise RuntimeError('isolated candidate has not been built')
++    sock = socket.socket()
++    sock.bind(('127.0.0.1', 0))
++    port = sock.getsockname()[1]
++    sock.close()
++    uri = 'http://127.0.0.1:{}'.format(port)
++    with tempfile.TemporaryDirectory(prefix='limo-exclusive-') as temporary:
++        run_dir = Path(temporary)
++        env = {'PATH': '/opt/ros/melodic/bin:/usr/bin:/bin', 'ROS_MASTER_URI': uri,
++               'ROS_HOSTNAME': '127.0.0.1', 'ROS_IP': '127.0.0.1',
++               'ROS_HOME': str(run_dir / 'ros'), 'ROS_LOG_DIR': str(run_dir / 'logs'),
++               'ROS_ROOT': '/opt/ros/melodic/share/ros', 'ROS_DISTRO': 'melodic',
++               'ROS_PACKAGE_PATH': '/opt/ros/melodic/share',
++               'CMAKE_PREFIX_PATH': '/tmp/rosclaw-limo-exclusive-candidate/devel:/opt/ros/melodic',
++               'PYTHONPATH': '/tmp/rosclaw-limo-exclusive-candidate/devel/lib/python2.7/dist-packages:'
++                             '/opt/ros/melodic/lib/python2.7/dist-packages',
++               'LD_LIBRARY_PATH': '/tmp/rosclaw-limo-exclusive-candidate/devel/lib:/opt/ros/melodic/lib',
++               'PYTHONDONTWRITEBYTECODE': '1'}
++        master = None
++        try:
++            with open(str(run_dir / 'master.log'), 'wb') as log:
++                master = subprocess.Popen(['/opt/ros/melodic/bin/roscore', '-p', str(port)], env=env,
++                                          stdout=log, stderr=log, start_new_session=True)
++                wait_master(uri, master)
++                results = [run_case(False, env, run_dir), run_case(True, env, run_dir),
++                           run_ioctl_failure(env, run_dir)]
++                print('candidate ROS driver PTY checks passed: {}'.format(results))
++        finally:
++            stop(master)
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/limo_base/test/fail_tiocexcl.c
+@@ -0,0 +1,26 @@
++// Test-only LD_PRELOAD injector. Never load into a process attached to hardware.
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <stdarg.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++int ioctl(int fd, unsigned long request, ...) {
++    if (request == TIOCEXCL) {
++        static const char marker[] = "FAKE_TIOCEXCL_INJECTED\n";
++        (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
++        errno = EIO;
++        return -1;
++    }
++    va_list args;
++    va_start(args, request);
++    void *argument = va_arg(args, void *);
++    va_end(args);
++    int (*next_ioctl)(int, unsigned long, ...) = dlsym(RTLD_NEXT, "ioctl");
++    if (!next_ioctl) {
++        errno = ENOSYS;
++        return -1;
++    }
++    return next_ioctl(fd, request, argument);
++}
+--- /dev/null
++++ b/limo_base/test/README.md
+@@ -0,0 +1,73 @@
++# Offline exclusive-TTY candidate checks
++
++These checks use fresh PTYs under bubblewrap with private PID, network and
++device namespaces. They do not use a physical serial device or the running ROS
++master. The test-only `LD_PRELOAD` injector must never be loaded into a real
++driver process.
++
++From `/home/agilex/rosclaw/jev/worktrees/limo-driver`, build the isolated
++candidate in a new workspace (do not overwrite an existing path):
++
++```bash
++(
++set -e
++test ! -e /tmp/rosclaw-limo-exclusive-candidate
++mkdir -p /tmp/rosclaw-limo-exclusive-candidate/src
++ln -s "$PWD/limo_base" /tmp/rosclaw-limo-exclusive-candidate/src/limo_base
++source /opt/ros/melodic/setup.bash
++PATH=/usr/bin:/bin:/opt/ros/melodic/bin:$PATH catkin_make \
++  -C /tmp/rosclaw-limo-exclusive-candidate --pkg limo_base \
++  -DPYTHON_EXECUTABLE=/usr/bin/python2 -j2
++)
++```
++
++Compile and run the serial class regression using only a fresh PTY:
++
++```bash
++mkdir -p /tmp/rosclaw-limo-exclusive-tests
++g++ -std=c++11 -Wall -Wextra -Werror -Ilimo_base/include \
++  limo_base/test/test_serial_port_exclusive.cpp limo_base/src/serial_port.cpp \
++  -Wl,--wrap=ioctl -Wl,--wrap=tcgetattr -lutil \
++  -o /tmp/rosclaw-limo-exclusive-tests/serial_test
++env -i PATH=/usr/bin:/bin:/sbin bwrap --unshare-all \
++  --hostname limo-exclusive-pty-isolated --die-with-parent \
++  --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /sbin /sbin \
++  --proc /proc --dev /dev --tmpfs /tmp \
++  --ro-bind /tmp/rosclaw-limo-exclusive-tests/serial_test /tmp/serial_test \
++  --chdir /tmp /tmp/serial_test
++```
++
++Compile the test-only failure injector and run the real candidate against a
++private ROS master and two fresh PTYs:
++
++```bash
++gcc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
++  limo_base/test/fail_tiocexcl.c -ldl \
++  -o /tmp/rosclaw-limo-exclusive-tests/fail_tiocexcl.so
++env -i PATH=/usr/bin:/bin:/sbin bwrap --unshare-all \
++  --hostname limo-exclusive-pty-isolated --die-with-parent \
++  --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /sbin /sbin \
++  --ro-bind /opt/ros/melodic /opt/ros/melodic --proc /proc --dev /dev --tmpfs /tmp \
++  --ro-bind /tmp/rosclaw-limo-exclusive-candidate /tmp/rosclaw-limo-exclusive-candidate \
++  --ro-bind /tmp/rosclaw-limo-exclusive-tests/fail_tiocexcl.so /tmp/fail_tiocexcl.so \
++  --ro-bind "$PWD/limo_base/test" /sandbox --dir /etc \
++  --ro-bind /etc/hosts /etc/hosts --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
++  --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \
++  --chdir /tmp --setenv ROS_HOME /tmp/ros-home --setenv PYTHONDONTWRITEBYTECODE 1 \
++  /usr/bin/python3 /sandbox/test_driver_exclusive_pty.py
++```
++
++The class tests cover default nonexclusive opens, exclusion of later opens,
++continued use of a previously opened descriptor, normal and destructor release,
++duplicate opens, error handling, and fd closure on injected ioctl/termios
++failure. The driver test checks the default watchdog-off behavior, watchdog-on
++second-open denial and second-driver rejection, and verifies injected
++`TIOCEXCL` failure aborts before the candidate sends an initialization frame.
++
++`TIOCEXCL` does not revoke a descriptor opened before the ioctl, can be bypassed
++by a process with `CAP_SYS_ADMIN`, and has an open-to-ioctl race. A preexisting
++holder can also affect the terminal's global exclusive flag. Normal class close
++attempts `TIOCNXCL` before closing; abrupt termination cannot run that cleanup,
++and an existing PTY master/slave or other holder may keep the kernel flag alive
++until the last handle closes. Failure to clear the flag is reported on normal
++close; these checks do not establish absolute ownership or physical safety.

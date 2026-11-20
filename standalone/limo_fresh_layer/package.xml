@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>limo_fresh_layer</name>
+  <version>0.1.0</version>
+  <description>Experimental, diagnostic-only fresh-scan ROS costmap layer.</description>
+  <maintainer email="ai@rosclaw.io">ROSClaw Team</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <depend>costmap_2d</depend>
+  <depend>nav_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <export>
+    <costmap_2d plugin="${prefix}/plugins.xml" />
+  </export>
+</package>
