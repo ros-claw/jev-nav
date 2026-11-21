@@ -3,6 +3,10 @@
          base_class_type="costmap_2d::Layer">
     <description>Experimental fresh-laser-only layer for isolated sensing tests.</description>
   </class>
+  <class name="limo_fresh_layer/FreshDepthLayer" type="limo_fresh_layer::FreshDepthLayer"
+         base_class_type="costmap_2d::Layer">
+    <description>Depth obstacle marks with the acquisition stamp used by the current grid.</description>
+  </class>
   <class name="limo_fresh_layer/FreshGridSnapshotLayer" type="limo_fresh_layer::FreshGridSnapshotLayer"
          base_class_type="costmap_2d::Layer">
     <description>Experimental atomic grid and scan-timestamp snapshot for isolated tests.</description>

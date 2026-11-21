@@ -32,10 +32,10 @@ def main():
 
     def publish(message):
         try:
-            if not rospy.is_shutdown():
+            if not rospy.core.is_shutdown_requested():
                 publisher.publish(message)
         except rospy.ROSException:
-            if not rospy.is_shutdown():
+            if not rospy.core.is_shutdown_requested():
                 raise
 
     def receive(message):

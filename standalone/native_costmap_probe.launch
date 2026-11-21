@@ -2,14 +2,29 @@
   <!-- Diagnostic only: no node in this launch publishes velocity commands. -->
   <arg name="namespace" />
   <arg name="use_fresh" default="false" />
+  <arg name="depth_rate" default="5" />
+  <arg name="grid_rate" default="10.0" />
+  <arg name="decimate_depth" default="false" />
+  <arg name="project_image" default="depth_image" />
+  <arg name="project_info" default="/camera/depth/camera_info" />
+  <arg name="depth_layer_type" default="costmap_2d::ObstacleLayer" />
+  <arg name="inflate" default="true" />
   <group ns="$(arg namespace)">
-    <node pkg="topic_tools" type="throttle" name="depth_throttle"
-          args="messages /camera/depth/image_raw 5 /$(arg namespace)/depth_image" output="screen" />
+    <node unless="$(arg decimate_depth)" pkg="topic_tools" type="throttle" name="depth_throttle"
+          args="messages /camera/depth/image_raw $(arg depth_rate) /$(arg namespace)/depth_image"
+          output="screen" />
+    <node if="$(arg decimate_depth)" pkg="nodelet" type="nodelet" name="depth_decimate"
+          args="standalone image_proc/crop_decimate" output="screen">
+      <remap from="camera/image_raw" to="/camera/depth/image_raw" />
+      <remap from="camera/camera_info" to="/camera/depth/camera_info" />
+      <param name="decimation_x" value="2" />
+      <param name="decimation_y" value="2" />
+      <param name="queue_size" value="2" />
+    </node>
     <node pkg="nodelet" type="nodelet" name="depth_points"
           args="standalone depth_image_proc/point_cloud_xyz" output="screen">
-      <remap from="image_rect" to="/$(arg namespace)/depth_image" />
-      <remap from="camera_info" to="/camera/depth/camera_info" />
-      <remap from="/$(arg namespace)/camera_info" to="/camera/depth/camera_info" />
+      <remap from="image_rect" to="$(arg project_image)" />
+      <remap from="camera_info" to="$(arg project_info)" />
       <remap from="points" to="/$(arg namespace)/depth_points" />
     </node>
     <node pkg="costmap_2d" type="costmap_2d_node" name="rolling_costmap" output="screen" required="true">
@@ -17,7 +32,7 @@
       <rosparam ns="costmap" subst_value="true">
         global_frame: odom
         robot_base_frame: base_link
-        update_frequency: 10.0
+        update_frequency: $(arg grid_rate)
         publish_frequency: 10.0
         rolling_window: true
         width: 3.0
@@ -45,11 +60,11 @@
           depth_points: {data_type: PointCloud2, topic: /$(arg namespace)/depth_points,
                          marking: true, clearing: false, min_obstacle_height: -0.05,
                          max_obstacle_height: 0.4, expected_update_rate: 0.0}
-        inflation: {enabled: true, inflation_radius: 0.2, cost_scaling_factor: 10.0}
+        inflation: {enabled: $(arg inflate), inflation_radius: 0.2, cost_scaling_factor: 10.0}
       </rosparam>
-      <rosparam if="$(arg use_fresh)" ns="costmap" param="plugins">
+      <rosparam if="$(arg use_fresh)" ns="costmap" param="plugins" subst_value="true">
         - {name: laser, type: "limo_fresh_layer/FreshLaserLayer"}
-        - {name: depth, type: "costmap_2d::ObstacleLayer"}
+        - {name: depth, type: "$(arg depth_layer_type)"}
         - {name: inflation, type: "costmap_2d::InflationLayer"}
         - {name: snapshot, type: "limo_fresh_layer/FreshGridSnapshotLayer"}
       </rosparam>

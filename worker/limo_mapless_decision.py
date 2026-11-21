@@ -61,6 +61,17 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         choices = ("forward", "stop") if forward_only else CHOICES
         context = {"laser": observation["laser"], "base": observation["base"]}
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
+        if "navigation_choices" in observation:
+            available = observation["navigation_choices"]
+            if (forward_only or not isinstance(available, list) or not 2 <= len(available) <= len(CHOICES)
+                    or available[-1] != "stop"
+                    or any(not isinstance(value, str) or value not in CHOICES for value in available)
+                    or len(set(available)) != len(available)):
+                return rejected
+            choices = available
+            task = ("A differential-drive robot is exploring indoors. Choose a short segment from the choices "
+                    "checked by its local planner, using the camera and current sensor data. A left or right "
+                    "segment is a shallow forward arc. Choose stop when waiting is appropriate.")
         if forward_only:
             task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
                     "choose forward if there is room for the bounded forward segment. Otherwise choose stop.")

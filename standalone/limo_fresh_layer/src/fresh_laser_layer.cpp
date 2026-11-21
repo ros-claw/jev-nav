@@ -153,7 +153,52 @@ class FreshLaserLayer : public costmap_2d::ObstacleLayer {
   ros::Publisher evidence_publisher_;
 };
 
-// Must be the last layer: publishes the complete grid and the scan stamp
+class FreshDepthLayer : public costmap_2d::ObstacleLayer {
+ public:
+  void onInitialize() override {
+    costmap_2d::ObstacleLayer::onInitialize();
+    setDefaultValue(costmap_2d::NO_INFORMATION);
+  }
+
+  void updateBounds(double robot_x, double robot_y, double robot_yaw, double* min_x, double* min_y,
+                    double* max_x, double* max_y) override {
+    resetMaps();
+    current_ = false;
+    if (rolling_window_) updateOrigin(robot_x - getSizeInMetersX()/2, robot_y - getSizeInMetersY()/2);
+    if (!enabled_ || !layered_costmap_->isTrackingUnknown() || footprint_clearing_enabled_
+        || marking_buffers_.size() != 1 || !clearing_buffers_.empty()
+        || !static_marking_observations_.empty()) return;
+    BufferLock guard(marking_buffers_.front().get());
+    std::vector<costmap_2d::Observation> observations;
+    if (!getMarkingObservations(observations) || observations.size() != 1) return;
+    const ros::Time stamp = observations[0].cloud_->header.stamp;
+    const double age = (ros::Time::now() - stamp).toSec();
+    if (stamp.isZero() || stamp < accepted_depth_stamp_ || !(age >= 0. && age < max_age_)) return;
+    accepted_depth_stamp_ = stamp;
+    costmap_2d::ObstacleLayer::updateBounds(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
+  }
+
+  void updateCosts(costmap_2d::Costmap2D& master, int min_i, int min_j, int max_i, int max_j) override {
+    ros::Time stamp;
+    if (depthFreshAt(ros::Time::now(), &stamp)) {
+      costmap_2d::ObstacleLayer::updateCosts(master, min_i, min_j, max_i, max_j);
+    }
+  }
+
+  bool depthFreshAt(const ros::Time& now, ros::Time* stamp) const {
+    const double age = (now - accepted_depth_stamp_).toSec();
+    const bool fresh = enabled_ && current_ && !accepted_depth_stamp_.isZero()
+                       && age >= 0. && age < max_age_;
+    *stamp = fresh ? accepted_depth_stamp_ : ros::Time(0);
+    return fresh;
+  }
+
+ private:
+  const double max_age_ = 0.20;
+  ros::Time accepted_depth_stamp_;
+};
+
+// Must be the last layer: publishes the complete grid and sensor stamps
 // together while LayeredCostmap holds the master-grid lock.
 class FreshGridSnapshotLayer : public costmap_2d::Layer {
  public:
@@ -171,16 +216,20 @@ class FreshGridSnapshotLayer : public costmap_2d::Layer {
     const ros::Time now = ros::Time::now();
     const std::vector<boost::shared_ptr<costmap_2d::Layer> >* plugins = layered_costmap_->getPlugins();
     FreshLaserLayer* laser = nullptr;
-    size_t count = 0;
+    FreshDepthLayer* depth = nullptr;
+    size_t count = 0, depth_count = 0;
     for (const auto& plugin : *plugins) {
       FreshLaserLayer* candidate = dynamic_cast<FreshLaserLayer*>(plugin.get());
       if (candidate) { laser = candidate; ++count; }
+      FreshDepthLayer* depth_candidate = dynamic_cast<FreshDepthLayer*>(plugin.get());
+      if (depth_candidate) { depth = depth_candidate; ++depth_count; }
     }
     const bool last = !plugins->empty() && plugins->back().get() == this;
     limo_fresh_layer::FreshGrid snapshot;
     snapshot.header.stamp = now;
     snapshot.header.frame_id = layered_costmap_->getGlobalFrameID();
     snapshot.scan_fresh = last && count == 1 && laser && laser->scanFreshAt(now, &snapshot.scan_stamp);
+    snapshot.depth_fresh = last && depth_count == 1 && depth && depth->depthFreshAt(now, &snapshot.depth_stamp);
     if (!snapshot.scan_fresh) snapshot.scan_stamp = ros::Time(0);
     snapshot.grid.header = snapshot.header;
     snapshot.grid.info.map_load_time = now;
@@ -208,4 +257,5 @@ class FreshGridSnapshotLayer : public costmap_2d::Layer {
 }  // namespace limo_fresh_layer
 
 PLUGINLIB_EXPORT_CLASS(limo_fresh_layer::FreshLaserLayer, costmap_2d::Layer)
+PLUGINLIB_EXPORT_CLASS(limo_fresh_layer::FreshDepthLayer, costmap_2d::Layer)
 PLUGINLIB_EXPORT_CLASS(limo_fresh_layer::FreshGridSnapshotLayer, costmap_2d::Layer)

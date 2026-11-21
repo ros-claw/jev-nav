@@ -92,6 +92,27 @@ def test_forward_trial_only_offers_forward_or_stop_and_preserves_stop():
     assert not reply("left")["ok"]
 
 
+def test_navigation_offers_only_locally_checked_segments():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+        "navigation_choices": ["left", "stop"],
+    }
+
+    def reply(choice):
+        def transport(payload, key, timeout):
+            assert [item["value"] for item in payload["questions"][0]["choices"]] == ["left", "stop"]
+            return {"answers": [{"name": "next_action", "type": "choice", "choice": choice}]}
+        return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
+
+    assert reply("left")["ok"]
+    assert not reply("forward")["ok"]
+    request['navigation_choices'] = ['left']
+    assert not reply("left")["ok"]
+
+
 def test_transport_failures_return_only_sanitized_classification():
     request = {
         "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),

@@ -1,4 +1,18 @@
-# Standalone LIMO forward trial
+# Standalone LIMO navigation
+
+`run_navigation.py` evaluates short forward segments and shallow left and right arcs against a rolling grid in `odom`. Decisions receives the image and the available choices. The 20 Hz local controller follows the accepted segment, checks its next swept area, and can start a prepared successor without stopping. A delayed or failed request leaves the active segment in place. If sensing drops out, the controller sends zero and can resume on a fresh check of the same segment. A measured obstruction cancels that segment.
+
+The current ROS entry point sends velocity to an isolated `navigation_command_preview` topic. It reads the actual laser, depth, RGB and odometry streams. The rolling grid publishes the laser and depth acquisition stamps used for that grid. In this entry point the depth image is decimated by two on each axis using the ROS image pipeline before converting it to a point cloud. [ROS image decimation source](https://github.com/ros-perception/image_pipeline/blob/melodic/image_proc/src/nodelets/crop_decimate.cpp)
+
+Build the repository version of [`limo_fresh_layer`](limo_fresh_layer) in a Catkin workspace and source both that workspace and the LIMO driver workspace. A recorded live preview uses:
+
+```sh
+/usr/bin/python2 standalone/run_navigation.py --decisions --seconds 48 --timeline /tmp/jev-navigation.jsonl
+```
+
+The timeline path must be new. Omitting `--seconds` runs the controller until shutdown. The test `test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices` runs 31 simulated seconds of odometry feedback through three decisions and tests stopping on missing input. Physical execution requires validated coverage of the robot's swept area and a connection to the independent base watchdog.
+
+## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;
 it does not require the `rosclawd` service. `supervised_trial.py` defaults to
@@ -147,11 +161,11 @@ acquisition timestamp in a single `FreshGrid` message. It requires a recent
 scan and rejects unsafe laser and unknown-space configurations. A delayed scan
 older than the last accepted scan is rejected, including while it is within
 the age limit. After a clock or sensor timestamp reset, scans remain unavailable
-until their timestamps catch up or the layer is restarted. The separate
-depth layer retains marked obstacles, but its frame freshness and validity are
-not bound to the grid. The depth height thresholds and camera rectification
-remain unverified; unobserved space remains unknown. None of these grids is a
-motion permit, and no real controller consumes them yet.
+until their timestamps catch up or the layer is restarted. The probe uses a
+conventional marking-only depth layer. The navigation preview selects
+`FreshDepthLayer` to bind the depth acquisition time to the same grid as the
+scan. The depth height thresholds and camera rectification remain calibration
+assumptions. The preview preserves unknown cells in its footprint checks.
 
 To build the experimental layer, create a catkin workspace with
 `standalone/limo_fresh_layer` linked or copied into its `src` directory and

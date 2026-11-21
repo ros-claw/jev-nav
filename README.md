@@ -2,11 +2,11 @@
 
 Experimental mapless LIMO navigation driven by an OpenAI Decisions model. This repository contains the navigation controller and experiments, separate from [limo-ros-mcp](https://github.com/ros-claw/limo-ros-mcp).
 
-**Status:** autonomous exploration is not complete. The real robot has not demonstrated smooth continuous motion. The current supervised real-robot candidate can execute only a single bounded forward trial; turning, reverse and persistent exploration are not implemented. Laser coverage is front-facing, camera calibration and physical stopping are not independently verified. Do not interpret sensor coverage or simulated serial results as proof of physical clearance or braking.
+`standalone/run_navigation.py` runs persistent navigation with asynchronous Decisions and live ROS sensing. It publishes a private velocity preview. The separate `supervised_trial.py` entry point runs the existing bounded physical forward test. Continuous physical exploration is pending validation.
 
 ## Contents
 
-- `standalone/`: direct ROS 1 observation, decision integration, experimental bounded forward trial, relay, monitors and tests. See [standalone/README.md](standalone/README.md).
+- `standalone/`: persistent local trajectory tracking, ROS perception, Decisions integration, bounded physical diagnostics, relay, monitors and tests. See [standalone/README.md](standalone/README.md).
 - `worker/`: model, scan fusion, and experimental mapless controller/relay workers.
 - `patches/`: candidate patches for the upstream base and lidar drivers; these are not installed automatically.
 - `experiments/`: earlier observation, calibration, simulation scripts and tests. Some historical experiments refer to local ROSClaw or MCP checkouts and may need their original environment.
