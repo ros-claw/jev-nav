@@ -77,7 +77,10 @@ class AsyncSafetySampler(object):  # noqa: UP004 - Python 2.7 ROS
 
     def _run(self):
         try:
+            wait_for_slot = getattr(self.source, 'wait_for_stage_slot', None)
             while not self._stop.is_set():
+                if callable(wait_for_slot) and not wait_for_slot(.02):
+                    continue
                 validated = (getattr(self.source, 'serialize_processing', False) is True
                              and callable(getattr(self.source, 'validated_snapshot', None)))
                 if validated:

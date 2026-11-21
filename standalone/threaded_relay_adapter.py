@@ -21,6 +21,7 @@ import threading
 import forward_trial as checks
 from live_trial_adapter import RelayAdapter, relay_ready_line
 from relay import _monotonic
+from split_sensor_validation import SensorWakeup
 
 _PERIOD_SEC = 0.05
 _INTENT_TTL_SEC = 0.16
@@ -41,6 +42,7 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
         self.transport, self.clock = transport, clock
         self.motion_limit_sec = motion_limit_sec
         self._cv = threading.Condition(threading.Lock())
+        self._writer_wakeup = SensorWakeup()
         self._thread = None
         self._owner = None
         self._started = False
@@ -61,6 +63,8 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
         self._intent_version = 0
         self._written_version = 0
         self._had_intent = False
+        self._handoff_requested = False
+        self._handed_adapter = None
         self._evidence = {'zero_write_completed': False, 'stop_line': None,
                           'process_exited': False, 'physical_stop_verified': False,
                           'worker_fault': None, 'wire_heartbeats': 0, 'wire_nonzero': 0}
@@ -92,6 +96,7 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
             self._fault = reason
             self._evidence['worker_fault'] = reason
         self._cv.notifyAll()
+        self._writer_wakeup.set()
 
     def _usable_locked(self, now):
         try:
@@ -191,6 +196,7 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                             'expires_at': min(stamp + _INTENT_TTL_SEC, valid_until)}
             self._intent_version += 1
             self._cv.notifyAll()
+            self._writer_wakeup.set()
             return True
 
     def wait_for_frame_write(self, sequence):
@@ -208,8 +214,26 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                 return False
             return True
 
+    def handoff_before_motion(self):
+        """Transfer the live pipe after the heartbeat writer has stopped using it."""
+        with self._cv:
+            caller = threading.current_thread().ident
+            if (caller != self._owner or self._had_intent or self._handoff_requested
+                    or not self._usable_locked(self.clock.now())):
+                return None
+            self._handoff_requested = True
+            self._writer_wakeup.set()
+            if not self._wait_locked(lambda: self._handed_adapter is not None or self._stopping, .08):
+                self._stop_locked('writer_handoff_timeout')
+            adapter = self._handed_adapter
+            if adapter is not None:
+                adapter.owner = caller
+            return adapter
+
     def stop_and_latch(self):
         with self._cv:
+            if self._handed_adapter is not None:
+                return False
             self._stop_locked('requested_stop')
             if self._thread is None:
                 return False
@@ -218,14 +242,19 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def close(self):
         with self._cv:
+            if self._handed_adapter is not None:
+                return False
             if self._thread is None:
                 self._stop_locked('closed')
+                self._writer_wakeup.close()
                 return True
             self._stop_locked('closed')
             thread = self._thread
         if thread is not threading.current_thread():
             thread.join(_STOP_TIMEOUT_SEC)
         with self._cv:
+            if not thread.is_alive():
+                self._writer_wakeup.close()
             return not thread.is_alive() and self._evidence['process_exited'] is True
 
     def _run(self):
@@ -262,6 +291,8 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
             last_clock = self.clock.now()
             sent_version = 0
             while True:
+                self._writer_wakeup.clear()
+                delay = None
                 with self._cv:
                     now = self.clock.now()
                     if not checks._finite(now) or now < last_clock:
@@ -274,6 +305,12 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                         self._stop_locked('worker_stalled')
                     if self._stopping:
                         break
+                    if self._handoff_requested:
+                        self._writer_wakeup.close()
+                        self._armed = False
+                        self._handed_adapter = adapter
+                        self._cv.notifyAll()
+                        break
                     if self._intent is not None and now >= self._intent['expires_at']:
                         self._stop_locked('setpoint_expired')
                         break
@@ -282,18 +319,18 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                         delay = next_deadline - now
                         if self._intent is not None:
                             delay = min(delay, self._intent['expires_at'] - now)
-                        self._cv.wait(max(0.0, delay))
-                        continue
-                    if changed:
+                    elif changed:
                         next_deadline = min(next_deadline, now)
                     # Motion writes are capped at 10 ms; the child relay also
                     # independently enforces the same absolute deadline.
-                    if self._intent is not None and self._intent['expires_at'] - now <= _MOTION_WRITE_MARGIN_SEC:
+                    if delay is None and self._intent is not None and self._intent['expires_at'] - now <= _MOTION_WRITE_MARGIN_SEC:
                         next_deadline = self._intent['expires_at']
-                        self._cv.wait(max(0.0, next_deadline - now))
-                        continue
+                        delay = next_deadline - now
                     version = self._intent_version
                     intent = dict(self._intent) if self._intent is not None else None
+                if delay is not None:
+                    self._writer_wakeup.wait(delay)
+                    continue
                 if not adapter.healthy():
                     with self._cv:
                         self._stop_locked('relay_unhealthy')
@@ -339,25 +376,29 @@ class ThreadedRelayAdapter(object):  # noqa: UP004 - ROS Melodic Python 2
                 self._startup_done = True
                 self._cv.notifyAll()
         finally:
-            prior_stop = adapter.evidence.get('stop_line')
-            try:
-                if adapter.armed:
-                    adapter.stop_and_latch()
-            except BaseException:
-                pass
-            with self._cv:
-                self._armed = False
-                self._evidence.update(adapter.evidence)
-                if prior_stop is not None and self._evidence.get('stop_line') is None:
-                    self._evidence['stop_line'] = prior_stop
-                self._stop_complete = True
-                self._cv.notifyAll()
-            try:
-                closed = adapter.close()
-            except BaseException:
-                closed = False
-            with self._cv:
-                self._evidence['process_exited'] = closed is True
-                self._exited = True
-                self._startup_done = True
-                self._cv.notifyAll()
+            if self._handed_adapter is None:
+                self._finish_worker(adapter)
+
+    def _finish_worker(self, adapter):
+        prior_stop = adapter.evidence.get('stop_line')
+        try:
+            if adapter.armed:
+                adapter.stop_and_latch()
+        except BaseException:
+            pass
+        with self._cv:
+            self._armed = False
+            self._evidence.update(adapter.evidence)
+            if prior_stop is not None and self._evidence.get('stop_line') is None:
+                self._evidence['stop_line'] = prior_stop
+            self._stop_complete = True
+            self._cv.notifyAll()
+        try:
+            closed = adapter.close()
+        except BaseException:
+            closed = False
+        with self._cv:
+            self._evidence['process_exited'] = closed is True
+            self._exited = True
+            self._startup_done = True
+            self._cv.notifyAll()

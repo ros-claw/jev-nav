@@ -252,6 +252,7 @@ def test_native_newest_raw_matches_scalar_scan_veto(monkeypatch):
         assert explore.newest_scan_veto(*args) is expected
     assert sum(calls) > 100
     accepted = rejected = 0
+    verified_future = 0
     for case in range(100):
         scan.ranges = [2. if random.random() > .1 else 0. for _ in range(181)]
         shifted = (random.uniform(-.002, .002), random.uniform(-.002, .002),
@@ -261,11 +262,18 @@ def test_native_newest_raw_matches_scalar_scan_veto(monkeypatch):
         args = (scan, extrinsics, scene, 10.2, 10.1, pose, shifted, pose)
         monkeypatch.setattr(explore, '_native_scan', None)
         expected = explore.newest_scan_veto(*args)
+        future = 10.399999
+        expected_at_future = explore.newest_scan_veto(*(args[:3] + (future,) + args[4:]))
         accepted += int(expected)
         rejected += int(not expected)
         monkeypatch.setattr(explore, '_native_scan', Meter())
-        assert explore.newest_scan_veto(*args) is expected
+        diagnostic = {}
+        assert explore.newest_scan_veto(*args, **{'diagnostic': diagnostic, 'future_at': future}) is expected
+        if 'future_covered' in diagnostic:
+            assert diagnostic['future_covered'] is expected_at_future
+            verified_future += 1
     assert accepted > 0 and rejected > 0
+    assert verified_future > 0
 
 
 def test_native_newest_raw_falls_back_for_geometry_boundaries_and_malformed_ranges():

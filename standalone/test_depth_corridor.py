@@ -54,6 +54,25 @@ def test_optical_projection_applies_rotation_translation_and_lateral_sign():
     assert point["planar_distance_m"] == pytest.approx(math.hypot(1.25, 1.0))
 
 
+def test_native_depth_preserves_projected_counts_and_nearest_measurements(monkeypatch):
+    import depth_corridor
+    native = depth_corridor._native_scan
+    if native is None or not hasattr(native, 'fast_depth_corridor'):
+        pytest.skip('optional native depth kernel is unavailable')
+    image = np.random.RandomState(971).randint(0, 3600, (400, 640)).astype(np.uint16)
+    camera = intrinsics(640, 400, fx=360., fy=360., cx=320., cy=200.)
+    limits = dict(config(), sample_stride=4, min_depth_m=.3, max_depth_m=3.)
+    actual = run(image, camera=camera, limits=limits, encoding='16UC1')
+    monkeypatch.setattr(depth_corridor, '_native_scan', None)
+    expected = run(image, camera=camera, limits=limits, encoding='16UC1')
+    for key in ('nearest_ground', 'nearest_obstacle'):
+        actual_point, expected_point = actual.pop(key), expected.pop(key)
+        assert actual_point['pixel_u'] == expected_point['pixel_u']
+        assert actual_point['pixel_v'] == expected_point['pixel_v']
+        assert actual_point['planar_distance_m'] == pytest.approx(expected_point['planar_distance_m'])
+    assert actual == expected
+
+
 def test_nearest_obstacle_uses_planar_distance_not_optical_axis_depth():
     image = np.array([[float("nan"), float("nan"), 0.6, float("nan"), 0.5]], dtype=np.float32)
     point = run(image, intrinsics(5, 1, cx=2.0))["nearest_obstacle"]

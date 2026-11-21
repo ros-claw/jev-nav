@@ -210,7 +210,7 @@ class ObservationAdapter(object):
                 issue = getattr(self.observation, "snapshot_last_issue", None)
                 self._set_snapshot_issue("source_" + issue if isinstance(issue, str) else "source_unavailable")
                 return None
-            scan, color = sample["scan"], sample["color"]
+            scan, color = sample["scan"], sample.get("color")
             result = {key: (value if self.take_scene_ownership else _copy_scene(value))
                       if key == "scene" else copy.deepcopy(value)
                       for key, value in sample.items() if key not in ("scan", "color", "_scan_capture")}
@@ -276,6 +276,10 @@ class ObservationAdapter(object):
 
     def updates_prepared_evidence(self):
         return getattr(self.observation, '_split_validation', None) is not None
+
+    def wait_for_stage_slot(self, timeout):
+        split = getattr(self.observation, '_split_validation', None)
+        return split is None or split.wait_for_stage_slot(timeout)
 
     def prepare_initial_command_evidence(self, sample):
         return self.observation.prepare_initial_command_evidence(sample)
@@ -363,11 +367,16 @@ class DecisionsAdapter(object):
     """Bind a single helper call's matching response to its local evidence ID."""
     simulation_only = False
 
-    def __init__(self, invoke, timeout_sec=6.0, forward_only=False):
+    def __init__(self, invoke, timeout_sec=6.0, forward_only=False, forward_limit_m=None,
+                 forward_speed_mps=checks.MAX_SPEED_MPS):
         if not callable(invoke) or not checks._finite(timeout_sec) or not 0 < timeout_sec <= 6.0:
             raise ValueError("bounded Decisions invoker required")
         self.invoke, self.timeout_sec = invoke, timeout_sec
         self.forward_only = forward_only
+        self.forward_limit_m = forward_limit_m
+        if not checks._finite(forward_speed_mps) or not 0 < forward_speed_mps <= checks.MAX_SPEED_MPS:
+            raise ValueError('invalid forward speed limit')
+        self.forward_speed_mps = forward_speed_mps
 
     def decide(self, evidence):
         rejected = {"ok": False, "choice": "stop"}
@@ -385,6 +394,9 @@ class DecisionsAdapter(object):
             choices = ("forward", "stop") if self.forward_only else ("forward", "left", "right", "stop")
             if self.forward_only:
                 payload["forward_only"] = True
+                if self.forward_limit_m is not None:
+                    payload["forward_segment"] = {"max_distance_m": self.forward_limit_m,
+                                                  "max_speed_mps": self.forward_speed_mps}
             result = self.invoke(payload, self.timeout_sec)
             if (not isinstance(result, dict) or result.get("ok") is not True
                     or result.get("captured_at") != payload["captured_at"]
@@ -469,11 +481,21 @@ class RelayProcessTransport(object):
                 or not data.endswith(b"\n") or not checks._finite(timeout) or not 0 <= timeout <= 0.1):
             return False
         fd = self.process.stdin.fileno()
-        _, writable, _ = select.select([], [fd], [], timeout)
-        if not writable:
+        deadline = self.clock.now() + timeout
+        try:
+            # Small nonblocking pipe writes are atomic. The common case needs
+            # no writable poll, so it also avoids a second scheduler handoff.
+            return os.write(fd, data) == len(data)
+        except (OSError, IOError) as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+        remaining = deadline - self.clock.now()
+        if remaining <= 0:
+            return False
+        _, writable, _ = select.select([], [fd], [], remaining)
+        if not writable or self.clock.now() >= deadline:
             return False
         try:
-            # One nonblocking PIPE_BUF-sized write; any short write fails closed.
             return os.write(fd, data) == len(data)
         except (OSError, IOError):
             return False
@@ -677,6 +699,8 @@ def _live_timestamps_fresh(sample, now, latest_odom_rechecked=False):
                 "odom_at": 0.25, "status_at": 1.0, "depth_at": 0.5}
         if latest_odom_rechecked:
             del ages["odom_at"]
+        if sample.get("motion_sensors_only") is True:
+            del ages["color_at"]
         return isinstance(sample, dict) and all(checks._fresh(sample[name], now, age)
                                                 for name, age in ages.items())
     except (AttributeError, KeyError, TypeError, ValueError):
@@ -712,27 +736,33 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None, require_image=Tru
         epoch = sample["epoch"]
         if isinstance(epoch, bool) or not isinstance(epoch, checks.INTEGER_TYPES) or epoch < 0:
             return reject("epoch")
+        full_camera = sample.get("motion_sensors_only") is not True
         if require_image:
+            if not full_camera:
+                return reject("image")
             image = sample["image_jpeg"]
             if (not isinstance(image, bytes) or not image.startswith(b"\xff\xd8")
                     or not image.endswith(b"\xff\xd9") or not 4 < len(image) <= 2000000):
                 return reject("image")
-        pose, image_pose, depth_pose = sample["pose"], sample["image_pose"], sample["depth_pose"]
-        if not all(checks._pose(item) for item in (pose, image_pose, depth_pose)):
+        pose, depth_pose = sample["pose"], sample["depth_pose"]
+        camera_poses = (depth_pose, sample["image_pose"]) if full_camera else (depth_pose,)
+        if not all(checks._pose(item) for item in (pose,) + camera_poses):
             return reject("pose")
         scene = sample["scene"]
         if (not isinstance(scene, dict) or not isinstance(scene.get("coverage"), dict)
                 or scene["coverage"].get("scan_stamp") != sample["scan_at"]
                 or not checks._pose(scene["coverage"].get("scan_pose"))):
             return reject("scene_metadata")
-        for other in (image_pose, depth_pose, scene["coverage"]["scan_pose"]):
+        for other in camera_poses + (scene["coverage"]["scan_pose"],):
             distance, rotation = checks._delta(pose, other)
             if not checks._finite(distance) or not checks._finite(rotation) or distance > 0.01 or rotation > 0.02:
                 return reject("pose_alignment")
         # The pose is deliberately refreshed after sensor capture. Its age and
         # displacement are checked separately; comparing that newer odometry
         # stamp as if it were a camera/scan exposure creates false skew.
-        stamps = [sample[name] for name in ("color_at", "scan_at", "depth_at")]
+        stamps = [sample[name] for name in ("scan_at", "depth_at")]
+        if full_camera:
+            stamps.append(sample["color_at"])
         if max(stamps) - min(stamps) > 0.25:
             return reject("sensor_skew")
         reason, _ = checks._raw_scan(sample, need_canonical=False)
@@ -893,6 +923,9 @@ class LiveTrial(object):
     MAX_DISTANCE_M = 0.02
     ASYNC_SAMPLING = False
     ARM_BEFORE_MODEL = False
+    CALLER_ZERO_HEARTBEATS = False
+    RENEWAL_LEAD_SEC = .015
+    MIN_RENEWAL_WINDOW_SEC = .03
     IMMEDIATE_SYNC_SAMPLING = False
     DISTANCE_RESERVE_SEC = 0.0
     PREPARED_COMMANDS = False
@@ -969,8 +1002,12 @@ class LiveTrial(object):
     def _request_forward_decision(self, sample, result):
         result["stage"] = "decision"
         evidence = make_evidence(sample)
+        started = self._now()
         decision = self.model.decide(copy.deepcopy(evidence))
         now = self._now()
+        result['decision_timing'] = {'observation_id': evidence['observation_id'],
+                                     'started_at': started, 'completed_at': now,
+                                     'color_at': sample['color_at'], 'scan_at': sample['scan_at']}
         self._model_fresh(sample, now)
         if (not isinstance(decision, dict) or decision.get("ok") is not True
                 or decision.get("observation_id") != evidence["observation_id"]):
@@ -1023,10 +1060,14 @@ class LiveTrial(object):
             # sequence or epoch must not disappear on a later read.
             if self.source.is_current_epoch(before['epoch']) is True:
                 empty_history = isinstance(trace, (tuple, list)) and not trace
-                delayed_tail = (trace and 0.15 < now - trace[-1]['stamp'] <= 0.3
-                                and checks._stationary_trace_valid(trace, start, trace[-1]['stamp'],
-                                                                   before['epoch'], before['image_pose'],
-                                                                   max_gap_sec=0.15))
+                delayed_tail = False
+                if trace:
+                    last = trace[-1]['stamp']
+                    delayed_tail = (0.15 < now - last <= 0.3
+                                    and 0 <= start - trace[0]['stamp'] <= 0.15
+                                    and checks._stationary_trace_valid(trace, min(start, last), last,
+                                                                       before['epoch'], before['image_pose'],
+                                                                       max_gap_sec=0.15))
                 if empty_history or delayed_tail:
                     self._last_diagnostic['retryable'] = True
         except (AttributeError, IndexError, KeyError, TypeError, ValueError):
@@ -1251,6 +1292,11 @@ class LiveTrial(object):
                         raise checks._StopError('predecision_warmup_busy')
                 self._image_required = False
                 result["stage"] = "post_decision_observation"
+                if self.CALLER_ZERO_HEARTBEATS:
+                    direct_relay = self.relay.handoff_before_motion()
+                    if direct_relay is None:
+                        raise checks._StopError('relay_writer_handoff')
+                    self.relay = direct_relay
                 current, now = self._aligned_stationary_sample(sample)
             if self.relay.send_zero_heartbeat() is not True:
                 raise checks._StopError("relay_failure")
@@ -1270,6 +1316,8 @@ class LiveTrial(object):
             last_valid_until = None
             short_window_rechecked = False
             refresh_prepared = self.PREPARED_COMMANDS and self.source.updates_prepared_evidence()
+            warm_split = refresh_prepared and getattr(self.source, 'warm_split_start', False) is True
+            warm_seed = None
             initial_sample_used = None
             path, sequence = 0.0, self.relay.sequence + 1
             result["stage"] = "motion_loop"
@@ -1321,7 +1369,17 @@ class LiveTrial(object):
                     return reason, assessment
                 sampler = AsyncSafetySampler(self.source, validate_background, self.clock,
                                              transient_unavailable=_transient_snapshot_gap)
-                if getattr(self.source, 'serialize_processing', False) is True and not refresh_prepared:
+                if warm_split:
+                    evidence = current.get('_initial_command_evidence')
+                    if evidence is None:
+                        raise checks._StopError('sensor_unavailable')
+                    current['_front_coverage_valid_until'] = self._last_depth_assessment['front_coverage_valid_until']
+                    self.source.seed_split_validation(current, evidence)
+                    warm_seed = current
+                    sampler.start(current, self._last_depth_assessment)
+                    sampler_started = True
+                    result['motion_timing']['warm_sampler_started_at'] = self._now()
+                elif getattr(self.source, 'serialize_processing', False) is True and not refresh_prepared:
                     # Prepare the next checked observation while the relay is
                     # still sending zeros, before any short-lived motion intent.
                     sampler.start()
@@ -1334,17 +1392,21 @@ class LiveTrial(object):
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 if first_sent_at is None:
+                    if self.CALLER_ZERO_HEARTBEATS and now - self.relay.last_stamp >= .05:
+                        if self.relay.send_zero_heartbeat() is not True:
+                            raise checks._StopError('relay_failure')
+                        sequence = self.relay.sequence + 1
                     if sampler is not None and sampler_started:
                         pending = sampler.poll()
                         if pending['state'] == 'fault':
                             self._last_diagnostic = {'step': 'background_sample', 'detail': pending['reason']}
                             raise checks._StopError(pending['reason'])
-                        if pending['state'] != 'ready':
+                        if pending['state'] != 'ready' or warm_seed is not None and pending['sample'] is warm_seed:
                             result['initial_preparation']['waiting'] += 1
                             if self.relay.send_zero_heartbeat() is not True:
                                 raise checks._StopError('relay_failure')
                             if self.PREPARED_COMMANDS:
-                                sampler.wait_next(None, .01)
+                                sampler.wait_next(warm_seed, .01)
                             else:
                                 self.clock.sleep(.01)
                             continue
@@ -1387,7 +1449,7 @@ class LiveTrial(object):
                     # to the publication slot so a valid sample does not
                     # spend most of its odometry lifetime waiting here.
                     next_slot = max(last_sent_at + 0.005,
-                                    min(last_sent_at + self.period_sec, last_valid_until - 0.015))
+                                    min(last_sent_at + self.period_sec, last_valid_until - self.RENEWAL_LEAD_SEC))
                     early_wait = max(0.0, next_slot - now - 0.005)
                     if early_wait:
                         if refresh_prepared:
@@ -1515,13 +1577,18 @@ class LiveTrial(object):
                     raise checks._StopError("clock_invalid")
                 ros_limit = getattr(self.arbiter, "valid_until", None)
                 serial_limit = local_serial_limit if cached_guard_check else getattr(self.serial_guard, "valid_until", None)
+                if cached_guard_check:
+                    ros_limit = getattr(self.arbiter, "cached_command_deadline", ros_limit)
+                    serial_limit = getattr(self.serial_guard, "cached_command_deadline", serial_limit)
                 limits = {"trial": deadline,
                           "relay": proposed_first + self.MOTION_LIMIT_SEC,
                           "model_color": sample["color_at"] + checks.MODEL_MAX_AGE_SEC,
                           "model_scan": sample["scan_at"] + checks.MODEL_MAX_AGE_SEC,
                           "snapshot": current["snapshot_at"] + 0.25,
                           "scan": current["scan_at"] + 0.5, "status": current["status_at"] + 1.0,
-                          "color": current["color_at"] + 0.5, "depth": current["depth_at"] + 0.5}
+                          "depth": current["depth_at"] + 0.5}
+                if current.get("motion_sensors_only") is not True:
+                    limits["color"] = current["color_at"] + 0.5
                 gate_limit = self._last_depth_assessment.get(
                     "depth_valid_until" if refresh_prepared and first_sent_at is not None else "valid_until")
                 if gate_limit is not None:
@@ -1550,7 +1617,7 @@ class LiveTrial(object):
                         raise checks._StopError('sensor_unavailable')
                 try:
                     check_started = self._now()
-                    initial_split = refresh_prepared and first_sent_at is None
+                    initial_split = refresh_prepared and first_sent_at is None and not warm_split
                     initial_evidence, prepared_issue = None, None
                     reused_initial_proof = False
                     if initial_split:
@@ -1571,8 +1638,11 @@ class LiveTrial(object):
                     # These calls revalidate the monitor caches. Use the
                     # current deadlines after sensor work, not those read
                     # before it while a new watchdog packet could arrive.
+                    monitors_started = self._now()
                     limits["ros_monitor"] = ros_limit() if callable(ros_limit) else None
+                    ros_monitor_checked = self._now()
                     limits["serial_monitor"] = serial_limit() if callable(serial_limit) else None
+                    monitors_checked = self._now()
                     if self.PREPARED_COMMANDS and not initial_split:
                         final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
                         if first_sent_at is None and final_sensor_until is not None:
@@ -1587,6 +1657,9 @@ class LiveTrial(object):
                     now = self._now()
                     check = {"sample_at": current["snapshot_at"], "sensor_check_started_at": check_started,
                              "sensor_checked_at": sensor_checked, "checked_at": now,
+                             "monitors_started_at": monitors_started,
+                             "ros_monitor_checked_at": ros_monitor_checked,
+                             "monitors_checked_at": monitors_checked,
                              "previous_valid_until": last_valid_until,
                              "limits": dict(limits, latest_sensors=final_sensor_until
                                             if checks._finite(final_sensor_until) else None),
@@ -1617,6 +1690,10 @@ class LiveTrial(object):
                             # Withhold a new command while waiting for a
                             # complete proof. The previous deadline stands.
                             if refresh_prepared:
+                                if warm_split and first_sent_at is None:
+                                    # While still at zero, allow a newer
+                                    # sample to replace this expired stage.
+                                    self.source.commit_split_validation(current)
                                 self.source.wait_for_prepared_evidence(.005)
                             else:
                                 sampler.wait_next(current, .005)
@@ -1631,7 +1708,15 @@ class LiveTrial(object):
                     # Starting with only one short frame leaves no time for
                     # the next observation. While stopped, wait for a longer
                     # *already valid* window; never extend an expiry.
-                    min_window = .08 if (guarded or self.PREPARED_COMMANDS) and first_sent_at is None else .03
+                    min_window = self.MIN_RENEWAL_WINDOW_SEC
+                    if (guarded or self.PREPARED_COMMANDS) and first_sent_at is None:
+                        min_window = .08
+                    if warm_split and first_sent_at is None:
+                        min_window = .045
+                        if now - current["snapshot_at"] >= .10:
+                            self.source.commit_split_validation(current)
+                            sampler.wait_next(current, .005)
+                            continue
                     if first_sent_at is None and 'initial_preparation' in result:
                         window = valid_until - now
                         largest = result['initial_preparation']['largest_window_sec']
@@ -1684,6 +1769,8 @@ class LiveTrial(object):
                                 and limiting not in ("relay", "trial", "model_color", "model_scan")):
                             if sampler is not None and sampler_started:
                                 if refresh_prepared:
+                                    if warm_split and first_sent_at is None:
+                                        self.source.commit_split_validation(current)
                                     sampler.wait_next(current, .005)
                                 continue
                             self.clock.sleep(0.01)
@@ -1839,6 +1926,17 @@ class PreparedLongerForwardTrial(LongerForwardTrial):
     """Overlap perception with renewal while retaining the relay's deadlines."""
     PREPARED_COMMANDS = True
     DISTANCE_RESERVE_SEC = 0.16
+
+
+class DirectPreparedLongerForwardTrial(PreparedLongerForwardTrial):
+    """Take ownership of the zero-primed relay pipe before local motion."""
+    CALLER_ZERO_HEARTBEATS = True
+    # Rechecks under live sensor load have taken over 30 ms. Start checking
+    # before the existing lease has that little time left to reach the relay.
+    RENEWAL_LEAD_SEC = .035
+    # A direct write is bounded at 10 ms and the child still rejects an
+    # expired frame. Use short, advancing proofs without altering expiry.
+    MIN_RENEWAL_WINDOW_SEC = .018
 
 
 if __name__ == "__main__":

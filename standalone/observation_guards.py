@@ -17,6 +17,7 @@ try:
 except NameError:
     INTEGER_TYPES = (int,)
 NUMBER_TYPES = INTEGER_TYPES + (float,)
+_INFINITY = float('inf')
 
 
 def _finite(value):
@@ -104,13 +105,18 @@ class OdomGuard(object):  # noqa: UP004 - ROS Melodic Python 2
         return False
 
     def _within_bounds(self, before, after):
+        # observe() has already verified finite nonnegative stamps, finite
+        # limits and normalized poses. A nonfinite calculated distance fails
+        # the comparison with the finite bound below.
         elapsed = after[1] - before[1]
-        distance, rotation = _pose_delta(before[2], after[2])
         translation_limit = self.max_linear_mps * elapsed + self.position_slack_m
         rotation_limit = self.max_angular_radps * elapsed + self.yaw_slack_rad
-        return (all(_finite(value) for value in (elapsed, distance, rotation,
-                                                 translation_limit, rotation_limit))
-                and elapsed > 0 and distance <= translation_limit and rotation <= rotation_limit)
+        if not (elapsed > 0 and translation_limit < _INFINITY and rotation_limit < _INFINITY):
+            return False
+        if before[2] == after[2]:
+            return True
+        distance, rotation = _pose_delta(before[2], after[2])
+        return distance <= translation_limit and rotation <= rotation_limit
 
     def observe(self, seq, stamp, pose):
         if self.faulted:
@@ -144,25 +150,26 @@ class OdomGuard(object):  # noqa: UP004 - ROS Melodic Python 2
 
 def sensors_aligned(stamps, odom_samples, now, max_sensor_age_sec, max_sensor_skew_sec,
                     max_odom_skew_sec, max_translation_m, max_rotation_rad,
-                    max_linear_mps, max_angular_radps):
+                    max_linear_mps, max_angular_radps, require_color=True):
     """Check each scan/color/depth time against its nearest odometry pose.
 
-    Stamps has exactly the monotonic keys scan, color and depth; each entry of
+    Stamps has scan and depth times, plus color for a model capture. Each entry of
     odom_samples has monotonic stamp and planar pose. For every sensor pair, the
     allowed pose difference includes worst-case uncertainty due to each nearest
     odometry time gap at the supplied speed limits. This does not calibrate
     sensors or deskew individual scan rays.
     """
     try:
+        sensors = ("scan", "color", "depth") if require_color else ("scan", "depth")
         limits = (max_sensor_age_sec, max_sensor_skew_sec, max_odom_skew_sec,
                   max_translation_m, max_rotation_rad, max_linear_mps, max_angular_radps)
         if (not _finite(now) or now < 0 or not all(_finite(value) for value in limits)
                 or max_sensor_age_sec <= 0 or any(value < 0 for value in limits[1:])
-                or not isinstance(stamps, dict) or set(stamps) != set(("scan", "color", "depth"))
+                or not isinstance(stamps, dict) or set(stamps) != set(sensors)
                 or not isinstance(odom_samples, (tuple, list))
                 or not 1 <= len(odom_samples) <= 8192):
             return False
-        times = [stamps[name] for name in ("scan", "color", "depth")]
+        times = [stamps[name] for name in sensors]
         if (not all(_finite(stamp) and stamp >= 0 and 0 <= now - stamp <= max_sensor_age_sec
                     for stamp in times)
                 or max(times) - min(times) > max_sensor_skew_sec):

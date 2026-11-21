@@ -12,6 +12,9 @@ from __future__ import division
 import math
 
 import numpy as np
+from native_scan_loader import load_native_scan
+
+_native_scan = load_native_scan()
 
 try:
     INTEGER_TYPES = (int, long)  # noqa: F821 - ROS Melodic Python 2
@@ -110,6 +113,14 @@ def diagnose_depth_corridor(depth_array, encoding, intrinsics, base_from_optical
         sampled = depth_array[::stride, ::stride]
         if not 1 <= sampled.size <= 2000000:
             return result
+        native = getattr(_native_scan, 'fast_depth_corridor', None)
+        if (native is not None and encoding == "16UC1" and depth_array.dtype.isnative
+                and depth_array.flags.c_contiguous and depth_array.flags.aligned):
+            accelerated = native(depth_array, np.ascontiguousarray(matrix), fx, fy, cx, cy, xmin, xmax,
+                                 half, floor, tolerance, zmin, zmax, dmin, dmax, stride)
+            if accelerated is not None:
+                result.update(accelerated)
+                return result
         values = sampled.astype(np.float64)
         if encoding == "16UC1":
             values *= 0.001

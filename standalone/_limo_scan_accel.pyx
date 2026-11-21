@@ -1,8 +1,96 @@
 # cython: language_level=2
-from libc.math cimport atan2, cos, fabs, sin, isnan, isinf
+from libc.math cimport atan2, cos, fabs, hypot, sin, isnan, isinf
+from libc.stdint cimport uint16_t
+cimport numpy as cnp
 
-cdef inline bint finite(double x):
+cnp.import_array()
+
+cdef inline bint finite(double x) nogil:
     return not isnan(x) and not isinf(x)
+
+
+cdef struct _DepthPoint:
+    double x, y, z, optical, distance
+    Py_ssize_t column, row
+    bint available
+
+
+cdef void _keep_nearest(_DepthPoint *point, double x, double y, double z, double optical,
+                        double distance, Py_ssize_t column, Py_ssize_t row) nogil:
+    if not point.available or distance < point.distance:
+        point.x, point.y, point.z = x, y, z
+        point.optical, point.distance = optical, distance
+        point.column, point.row = column, row
+        point.available = True
+
+
+cdef object _depth_point(_DepthPoint point):
+    if not point.available:
+        return None
+    return {'x_m': point.x, 'y_m': point.y, 'z_m': point.z, 'optical_depth_m': point.optical,
+            'planar_distance_m': point.distance, 'pixel_u': point.column, 'pixel_v': point.row}
+
+
+def fast_depth_corridor(cnp.ndarray image, cnp.ndarray transform, double fx, double fy, double cx, double cy,
+                        double xmin, double xmax, double half, double floor, double tolerance,
+                        double zmin, double zmax, double dmin, double dmax, Py_ssize_t stride):
+    """Sample the existing 16UC1 corridor once, with no Python calls per pixel."""
+    cdef uint16_t *pixels
+    cdef double *matrix
+    cdef Py_ssize_t height, width
+    cdef Py_ssize_t row, column
+    cdef Py_ssize_t total = 0, valid = 0, ground_count = 0, obstacle_count = 0, outside = 0
+    cdef double optical, ox, oy, x, y, z, height_above_floor, distance
+    cdef _DepthPoint nearest_ground, nearest_obstacle
+    cdef bint malformed = False
+    if (image.ndim != 2 or transform.ndim != 2 or transform.shape[0] != 4 or transform.shape[1] != 4
+            or image.dtype.num != cnp.NPY_UINT16 or not image.dtype.isnative
+            or transform.dtype.num != cnp.NPY_DOUBLE or not transform.dtype.isnative
+            or not image.flags.c_contiguous or not image.flags.aligned
+            or not transform.flags.c_contiguous or not transform.flags.aligned
+            or not 1 <= stride <= 1024):
+        return None
+    pixels = <uint16_t *>cnp.PyArray_DATA(image)
+    matrix = <double *>cnp.PyArray_DATA(transform)
+    height, width = image.shape[0], image.shape[1]
+    if not 1 <= height <= 8192 or not 1 <= width <= 8192:
+        return None
+    nearest_ground.available = nearest_obstacle.available = False
+    with nogil:
+        for row from 0 <= row < height by stride:
+            for column from 0 <= column < width by stride:
+                total += 1
+                optical = pixels[row * width + column] * .001
+                if not dmin <= optical < dmax:
+                    continue
+                valid += 1
+                ox = (column - cx) * optical / fx
+                oy = (row - cy) * optical / fy
+                x = matrix[0]*ox + matrix[1]*oy + matrix[2]*optical + matrix[3]
+                y = matrix[4]*ox + matrix[5]*oy + matrix[6]*optical + matrix[7]
+                z = matrix[8]*ox + matrix[9]*oy + matrix[10]*optical + matrix[11]
+                height_above_floor = z - floor
+                distance = hypot(x, y)
+                if not (finite(x) and finite(y) and finite(z) and finite(height_above_floor) and finite(distance)):
+                    malformed = True
+                    break
+                if not xmin <= x <= xmax or fabs(y) > half:
+                    outside += 1
+                elif fabs(height_above_floor) <= tolerance:
+                    ground_count += 1
+                    _keep_nearest(&nearest_ground, x, y, z, optical, distance, column, row)
+                elif zmin <= height_above_floor <= zmax:
+                    obstacle_count += 1
+                    _keep_nearest(&nearest_obstacle, x, y, z, optical, distance, column, row)
+            if malformed:
+                break
+    if malformed:
+        return None
+    return {'sample_count': total, 'valid_count': valid, 'invalid_count': total-valid, 'sample_stride': stride,
+            'ground_count': ground_count, 'obstacle_count': obstacle_count, 'outside_corridor_count': outside,
+            'unclassified_corridor_count': valid-outside-ground_count-obstacle_count,
+            'nearest_ground': _depth_point(nearest_ground), 'nearest_obstacle': _depth_point(nearest_obstacle),
+            'status': ('no_valid_depth' if not valid else 'observed' if valid > outside else 'no_corridor_samples')}
 
 
 def fast_transform_records(records, pose):
@@ -351,12 +439,28 @@ def fast_assess_rays(rays, hits, double scan_stamp, long latest_valid, double no
         return None
 
 
-def fast_newest_history(rays, hits, crossings, double now, double scan_at, scene_pose, current_pose):
+cdef double _crossing_gap(list values):
+    cdef double gap, current
+    cdef Py_ssize_t index
+    if not values:
+        return .3
+    values.sort()
+    gap = max(values[0] + .15, .15 - values[-1])
+    for index in range(1, len(values)):
+        current = values[index] - values[index - 1]
+        if current > gap:
+            gap = current
+    return gap
+
+
+def fast_newest_history(rays, hits, crossings, double now, double scan_at, scene_pose, current_pose,
+                        future_at=None):
     cdef double theta, c, s, cc, cs, dx, dy, tx, ty
-    cdef double sx, sy, hx, hy, stamp, ax, ay, bx, by, age, y, gap, current
+    cdef double sx, sy, hx, hy, stamp, ax, ay, bx, by, age, y, gap, future = 0.
     cdef Py_ssize_t index, count
     cdef bint blocked = False
-    cdef list values
+    cdef bint with_future = future_at is not None
+    cdef list values, later = []
     try:
         if len(rays) < 32 or len(rays) != len(hits):
             return None
@@ -366,6 +470,11 @@ def fast_newest_history(rays, hits, crossings, double now, double scan_at, scene
         dx, dy = scene_pose[0] - current_pose[0], scene_pose[1] - current_pose[1]
         tx, ty = cc * dx + cs * dy, -cs * dx + cc * dy
         values = list(crossings)
+        if with_future:
+            future = future_at
+            if not finite(future) or not now <= future <= scan_at + .3:
+                return None
+            later = list(crossings)
         for item in values:
             if type(item) is not float or not finite(item):
                 return None
@@ -407,18 +516,22 @@ def fast_newest_history(rays, hits, crossings, double now, double scan_at, scene
                     return None
                 if -0.15 <= y <= 0.15:
                     values.append(float(y))
+                    if with_future and future - stamp <= .65:
+                        later.append(float(y))
         if blocked:
+            if with_future:
+                return False, False, True
             return False
         if not values:
             return None
-        values.sort()
-        gap = max(values[0] + .15, .15 - values[-1])
-        for index in range(1, len(values)):
-            current = values[index] - values[index - 1]
-            if current > gap:
-                gap = current
+        gap = _crossing_gap(values)
         if fabs(gap - .035) <= 1e-12:
             return None
+        if with_future:
+            age = _crossing_gap(later)
+            if fabs(age - .035) <= 1e-12:
+                return None
+            return gap <= .035, age <= .035, False
         return gap <= .035
     except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
         return None

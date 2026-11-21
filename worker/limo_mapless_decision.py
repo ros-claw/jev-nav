@@ -57,10 +57,18 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         if not stamp <= started < stamp + MAX_AGE_SEC:
             return rejected
         choices = ("forward", "stop") if forward_only else CHOICES
+        context = {"laser": observation["laser"], "base": observation["base"]}
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
         if forward_only:
             task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
-                    "choose forward if the visible segment supports progress. Otherwise choose stop.")
+                    "choose forward if there is room for the bounded forward segment. Otherwise choose stop.")
+            segment = observation.get("forward_segment")
+            if segment is not None:
+                if (not isinstance(segment, dict) or set(segment) != {"max_distance_m", "max_speed_mps"}
+                        or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                               for value in segment.values())):
+                    return rejected
+                context["forward_segment"] = segment
         payload = {
             "model": "gpt-6-luna",
             "input": [
@@ -74,7 +82,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         {"type": "input_image", "image_url": "data:image/jpeg;base64," + image},
                         {
                             "type": "input_json",
-                            "data": {"laser": observation["laser"], "base": observation["base"]},
+                            "data": context,
                         },
                     ],
                 }

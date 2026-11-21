@@ -9,6 +9,7 @@ from explore import (
     DecisionGate,
     RosObservation,
     _monotonic,
+    _nearest_ordered_odometry,
     base_state,
     build_decision_evidence,
     depth_grid,
@@ -27,6 +28,14 @@ def test_nearest_odometry_requires_a_close_timestamp():
                {"stamp": 10.04, "pose": (0.01, 0.0, 0.0)}]
     assert nearest_odometry(samples, 10.035)["stamp"] == 10.04
     assert nearest_odometry(samples, 10.2) is None
+
+
+def test_ordered_odometry_matches_the_general_lookup_including_ties():
+    samples = tuple({'stamp': i / 64.0} for i in range(150))
+    for i in range(-100, 320):
+        stamp = i / 128.0
+        assert _nearest_ordered_odometry(samples, stamp) is nearest_odometry(samples, stamp)
+    assert _nearest_ordered_odometry((), 1.) is None
 
 
 def test_model_result_must_match_capture_and_remain_near_the_observation_pose():

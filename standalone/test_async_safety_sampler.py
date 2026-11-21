@@ -79,6 +79,30 @@ def test_unfinished_replacement_preserves_published_sample_without_changing_it()
         assert sampler.close(.5)
 
 
+def test_sampler_waits_for_staging_capacity_before_building_a_scene():
+    from async_safety_sampler import AsyncSafetySampler
+    waiting, available, captured = threading.Event(), threading.Event(), threading.Event()
+
+    class Source(object):
+        def wait_for_stage_slot(self, timeout):
+            waiting.set()
+            return available.wait(timeout)
+
+        def snapshot(self):
+            captured.set()
+            return {'index': 1}
+
+    sampler = AsyncSafetySampler(Source(), lambda sample, now: (None, {}), Clock())
+    try:
+        sampler.start()
+        assert waiting.wait(.5)
+        assert not captured.wait(.04)
+        available.set()
+        assert captured.wait(.5)
+    finally:
+        assert sampler.close(.5)
+
+
 def test_explicitly_transient_source_gaps_can_recover_without_fabricating_a_sample():
     from async_safety_sampler import AsyncSafetySampler
     class Source(object):

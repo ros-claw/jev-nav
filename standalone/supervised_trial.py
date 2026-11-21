@@ -37,6 +37,16 @@ def parse_args(argv=None):
                         help='project depth in a child process with a private bounded socket')
     parser.add_argument('--split-sensor-checks', action='store_true',
                         help='prepare scan and depth proofs in separate workers')
+    parser.add_argument('--scan-validation-process', action='store_true',
+                        help='validate rolling laser coverage in a separate process')
+    parser.add_argument('--separate-model-camera', action='store_true',
+                        help='use color for model captures and pause it during local control')
+    parser.add_argument('--warm-split-start', action='store_true',
+                        help='prepare a new split sensor proof at rest before the first nonzero intent')
+    parser.add_argument('--direct-relay-writes', action='store_true',
+                        help='submit checked commands directly to the independent relay process')
+    parser.add_argument('--speed-mps', type=float, default=.02,
+                        help='set the requested forward speed up to 0.02 m/s')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -55,6 +65,16 @@ def parse_args(argv=None):
         parser.error('--depth-projection-process requires split checks, preprojection and explicit depth assumptions')
     if args.split_sensor_checks and not args.prepared_forward:
         parser.error('--split-sensor-checks requires --prepared-forward')
+    if args.scan_validation_process and not args.split_sensor_checks:
+        parser.error('--scan-validation-process requires --split-sensor-checks')
+    if args.separate_model_camera and not args.split_sensor_checks:
+        parser.error('--separate-model-camera requires --split-sensor-checks')
+    if args.warm_split_start and not args.split_sensor_checks:
+        parser.error('--warm-split-start requires --split-sensor-checks')
+    if args.direct_relay_writes and not args.warm_split_start:
+        parser.error('--direct-relay-writes requires --warm-split-start')
+    if not 0 < args.speed_mps <= .02:
+        parser.error('--speed-mps must be between 0 and 0.02 m/s')
     if args.execute:
         digest = args.driver_sha256
         if (args.driver_pid is None or args.driver_pid <= 1
@@ -220,17 +240,36 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
         with self.lock:
             return summarize_trial_observations(list(self.odometry), list(self.commands), caller, started, ended)
 
+    def trial_trajectory(self, caller, started, ended):
+        with self.lock:
+            return {
+                'clock': 'host_monotonic_receipt',
+                'odom_columns': ['at', 'x_m', 'y_m', 'forward_mps'],
+                'odom': [item for item in self.odometry if started <= item[0] <= ended],
+                'command_columns': ['at', 'forward_mps', 'yaw_radps'],
+                'commands': [item[:3] for item in self.commands
+                             if caller is not None and caller == item[3] and started <= item[0] <= ended],
+            }
+
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.scan_validation_process:
+        from scan_validation_process import ScanValidationProcess
+        with ScanValidationProcess() as scan_validator:
+            return run_with_depth(args, scan_validator)
+    return run_with_depth(args)
+
+
+def run_with_depth(args, scan_validator=None):
     if args.depth_projection_process:
         from depth_projection_process import DepthProjectionProcess
         with DepthProjectionProcess() as projector:
-            return run(args, projector)
-    return run(args)
+            return run(args, projector, scan_validator)
+    return run(args, scan_validator=scan_validator)
 
 
-def run(args, projector=None):
+def run(args, projector=None, scan_validator=None):
     import rospy
     from explore import RosObservation
     from live_monitors import (
@@ -240,6 +279,7 @@ def run(args, projector=None):
     from live_trial_adapter import (
         CvJpegEncoder,
         DecisionsAdapter,
+        DirectPreparedLongerForwardTrial,
         ExistingDecisionHelper,
         LiveTrial,
         LongerForwardTrial,
@@ -260,11 +300,13 @@ def run(args, projector=None):
                       'ground_z_m': args.ground_z, 'ground_tolerance_m': 0.025,
                       'obstacle_min_height_m': 0.03, 'obstacle_max_height_m': 0.4,
                       'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': 4}
-    observation = RosObservation(depth_projection_config=projection, depth_projector=projector)
+    observation = RosObservation(depth_projection_config=projection, depth_projector=projector,
+                                 scan_validator=scan_validator, separate_model_camera=args.separate_model_camera)
     recorder = ObservationRecorder(clock)
     source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
                                 projection_only_after_model=True, recheck_snapshot=False,
                                 predecision_warmup=True, serialize_processing=args.longer_forward)
+    source.warm_split_start = args.warm_split_start
     # Populate subscriptions and scan fusion before the bounded session starts.
     warm_until = clock.now() + 2.0
     while clock.now() < warm_until and not rospy.is_shutdown():
@@ -282,15 +324,19 @@ def run(args, projector=None):
     serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                           args.driver_sha256, max_age=0.6, acquire_timeout=1.2,
                                           ros_monitor=ros_guard)
-    model = DecisionsAdapter(ExistingDecisionHelper(clock, cancelled=rospy.is_shutdown), forward_only=True)
+    model = DecisionsAdapter(ExistingDecisionHelper(clock, cancelled=rospy.is_shutdown), forward_only=True,
+                             forward_limit_m=.04 if args.longer_forward else .006,
+                             forward_speed_mps=args.speed_mps)
     relay = make_relay(clock, motion_limit_sec=2.0 if args.longer_forward else 0.3)
     report = {'clear_room': True, 'operator_present': True, 'emergency_stop_available': True,
               'source': 'operator_report', 'independently_verified': False}
-    trial_class = (PreparedLongerForwardTrial if args.prepared_forward else
+    trial_class = (DirectPreparedLongerForwardTrial if args.direct_relay_writes else
+                   PreparedLongerForwardTrial if args.prepared_forward else
                    SynchronousLongerForwardTrial if args.single_threaded else
                    LongerForwardTrial if args.longer_forward else LiveTrial)
     trial = trial_class(source, model, relay, ros_guard, clock, enable_motion=True,
                         duration_sec=2.0 if args.longer_forward else 0.6,
+                        speed_mps=args.speed_mps,
                         period_sec=trial_period(args),
                         serial_guard=serial_guard, depth_gate=ProjectedDepthGate(),
                         operator_site_report=report)
@@ -313,14 +359,17 @@ def run(args, projector=None):
         result['depth_preprojection_counts'] = dict(observation.depth_preprojection_counts)
     if projector is not None:
         result['depth_projection_process'] = projector.summary()
+    if scan_validator is not None:
+        result['scan_validation_process'] = scan_validator.summary()
     trial_ended = clock.now()
     # Continue read-only observation briefly after the relay has been closed.
     time.sleep(0.7)
     caller = result.get('ros_guard_evidence', {}).get('relay_node')
     observed = recorder.trial_summary(caller, trial_started, trial_ended)
+    trajectory = recorder.trial_trajectory(caller, trial_started, clock.now())
     exit_code = trial_exit_code(result, observed)
     print(json.dumps({'mode': 'supervised_single_trial', 'result': result,
-                      'observed': observed, 'exit_code': exit_code,
+                      'observed': observed, 'trajectory': trajectory, 'exit_code': exit_code,
                       'observation': observation.diagnostic_status()},
                      allow_nan=False))
     return exit_code

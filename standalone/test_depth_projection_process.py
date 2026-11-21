@@ -1,5 +1,6 @@
 import os
 import signal
+import time
 
 import numpy as np
 import pytest
@@ -77,3 +78,19 @@ def test_stalled_worker_cannot_return_previous_projection():
     finally:
         projector.close()
     assert projector.process.poll() is not None
+
+
+def test_timeout_restarts_worker_and_requires_a_new_exchange():
+    params, data = request(np.full((80, 100), 800, dtype='<u2'))
+    with DepthProjectionProcess() as projector:
+        previous = projector.process
+        os.kill(previous.pid, signal.SIGSTOP)
+        assert projector.project(params, data) is None
+        deadline = _monotonic() + 3.
+        result = None
+        while result is None and _monotonic() < deadline:
+            result = projector.project(dict(params, stamp=101.), data)
+            time.sleep(.01)
+        assert previous.poll() is not None
+        assert projector.process.pid != previous.pid
+        assert result['stamp'] == 101.

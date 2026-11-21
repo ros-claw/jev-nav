@@ -148,3 +148,11 @@ def test_sensor_alignment_rejects_bad_or_unordered_odom_history():
     assert not aligned(stamps, [pose_sample(10.0), pose_sample(10.08), pose_sample(10.04)])
     assert not aligned(stamps, [pose_sample(10.0), pose_sample(10.04, (float("nan"), 0.0, 0.0)),
                                 pose_sample(10.08)])
+
+
+def test_local_geometry_alignment_does_not_require_a_model_frame():
+    stamps = {'scan': 10., 'depth': 10.05}
+    odometry = [pose_sample(10.), pose_sample(10.05)]
+    assert not aligned(stamps, odometry)
+    assert aligned(stamps, odometry, require_color=False)
+    assert not aligned(stamps, [pose_sample(10.)], require_color=False)

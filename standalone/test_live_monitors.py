@@ -77,6 +77,40 @@ class Obj(object):
         self.__dict__.update(values)
 
 
+def test_confirmed_monitor_deadline_can_be_read_under_sampler_lock_and_expires(monkeypatch):
+    mod = module()
+    clock = Clock()
+    mono = [100.]
+    monkeypatch.setattr(mod, '_monotonic', lambda: mono[0])
+    backend = Backend(None)
+    generation = [1]
+    backend.graph_generation = lambda: generation[0]
+    monitor = mod.RosCallerMonitor(backend, clock, 11139)
+    monitor._relay = Relay(222)
+    monitor._relay_pid = 222
+    monitor._acquired = monitor._confirmed = True
+    monitor._sample = ros_sample(clock, publishers=['/relay'], caller='/relay', primed=1)
+    monitor._sample.update(graph_generation=1, graph_observed_at=100., graph_observed_mono_at=100.)
+    monitor._sample_at = monitor._sample_mono_at = 100.
+    assert monitor._read() is not None
+    monitor._publish_command_deadline(clock.now(), mono[0])
+    result = []
+    reader = threading.Thread(target=lambda: result.append(monitor.cached_command_deadline()))
+    with monitor._lock:
+        reader.start()
+        reader.join(.2)
+        assert not reader.is_alive()
+    assert result == [100.25]
+    generation[0] = 2
+    assert monitor.cached_command_deadline() is None
+    generation[0] = 1
+    mono[0] += .251
+    assert monitor.cached_command_deadline() is None
+    mono[0] = 100.
+    monitor._latch_fault('test_fault')
+    assert monitor.cached_command_deadline() is None
+
+
 def ros_guard(clock, backend):
     return module().RosCallerMonitor(backend, clock, driver_pid=11139,
                                      poll_interval=0.01, max_age=0.25,

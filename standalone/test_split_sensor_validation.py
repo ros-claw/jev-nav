@@ -18,6 +18,9 @@ def test_pending_successors_use_the_oldest_recorded_receipt():
     assert pending_sensor_deadline(second, checked, 10.09, .3, receipts) == 10.13
     assert pending_sensor_deadline(second, checked, 10.14, .3, receipts) is None
     assert pending_sensor_deadline(dict(second, generation=11), checked, 10.09, .3, receipts) is None
+    third = {'generation': 11, 'stamp': 10.075, 'received_at': 10.085}
+    assert pending_sensor_deadline(third, checked, 10.09, .3, receipts) == 10.13
+    assert pending_sensor_deadline(third, checked, 10.14, .3, receipts) is None
 
 
 def test_sensor_wakeup_clears_notifications_and_wakes_a_waiter():

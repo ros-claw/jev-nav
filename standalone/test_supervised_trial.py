@@ -39,6 +39,24 @@ def test_trial_uses_independent_heartbeat_without_starting_a_process_at_construc
     assert relay.transport.process is None
 
 
+def test_direct_writes_reuse_the_same_independent_relay_process():
+    from live_trial_adapter import DirectPreparedLongerForwardTrial
+    flags = ['--longer-forward', '--prepared-forward', '--split-sensor-checks', '--direct-relay-writes']
+    with pytest.raises(SystemExit):
+        parse_args(flags)
+    assert parse_args(flags + ['--warm-split-start']).direct_relay_writes
+    relay = make_relay(RealClock(), motion_limit_sec=2.0)
+    assert callable(relay.handoff_before_motion) and relay.transport.process is None
+    assert DirectPreparedLongerForwardTrial.ARM_BEFORE_MODEL is True
+
+
+@pytest.mark.parametrize('speed', ['0', '-0.01', '0.021', 'nan', 'inf'])
+def test_forward_speed_can_be_reduced_without_raising_the_ceiling(speed):
+    assert parse_args(['--speed-mps', '.016']).speed_mps == .016
+    with pytest.raises(SystemExit):
+        parse_args(['--speed-mps', speed])
+
+
 def test_prepared_mode_requires_explicit_longer_trial():
     with pytest.raises(SystemExit):
         parse_args(['--prepared-forward'])

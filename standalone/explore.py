@@ -44,7 +44,7 @@ from observation_guards import ClockGuard, OdomGuard, sensors_aligned
 from policy import ForwardPolicy, assess_front
 from projected_depth_gate import ProjectedDepthGate, project_depth_frame
 from relay import _monotonic
-from split_sensor_validation import pending_sensor_deadline
+from split_sensor_validation import SensorWakeup, pending_sensor_deadline
 
 # The worker may have been imported before the optional local accelerator was
 # discoverable. Reuse the loader's verified binary regardless of import order.
@@ -96,6 +96,25 @@ def nearest_odometry(samples, stamp, max_skew=0.05):
         return None
     closest = min(valid, key=lambda sample: abs(sample["stamp"] - stamp))
     return closest if abs(closest["stamp"] - stamp) <= max_skew else None
+
+
+def _nearest_ordered_odometry(samples, stamp, max_skew=.05):
+    """Look up a stamp in the callback's validated, strictly ordered tuple."""
+    low, high = 0, len(samples)
+    while low < high:
+        middle = (low + high) // 2
+        if samples[middle]['stamp'] < stamp:
+            low = middle + 1
+        else:
+            high = middle
+    closest = samples[low] if low < len(samples) else None
+    if low:
+        earlier = samples[low - 1]
+        if closest is None or abs(earlier['stamp'] - stamp) <= abs(closest['stamp'] - stamp):
+            closest = earlier
+    if closest is not None and abs(closest['stamp'] - stamp) <= max_skew:
+        return closest
+    return None
 
 
 def refreshed_odometry(original, latest, now):
@@ -255,15 +274,21 @@ def lookup_rigid_transform(listener, tf_module, rospy_module, frame, stamp, know
         return trans, rot
 
 
-def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose):
+def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose,
+                         future_at=None, diagnostic=None):
     """Vectorize the immutable ray/hit tuples created by the scan fusion."""
     if _np is None or len(rays) < 32:
         return None
     if _native_scan is not None:
         try:
-            accelerated = _native_scan.fast_newest_history(
-                rays, hits, crossings, now, scan_at, scene_pose, current_pose)
+            args = (rays, hits, crossings, now, scan_at, scene_pose, current_pose)
+            if future_at is not None:
+                args += (future_at,)
+            accelerated = _native_scan.fast_newest_history(*args)
             if type(accelerated) is bool:
+                return accelerated
+            if (isinstance(accelerated, tuple) and len(accelerated) == 3
+                    and all(type(value) is bool for value in accelerated)):
                 return accelerated
         except Exception:  # noqa: BLE001 - retain the existing checked fallback
             pass
@@ -295,6 +320,8 @@ def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, curren
         if not all(_np.all(_np.isfinite(values)) for values in (start_x, start_y, end_x, end_y)):
             return None
         if _np.any((end_x >= -0.20) & (end_x <= 0.65) & (_np.abs(end_y) <= 0.17)):
+            if diagnostic is not None:
+                diagnostic['reason'] = 'front_blocked'
             return False
         age = now - stamps
         recent = ((age >= 0) & (age <= 0.65) & (scan_at - stamps <= 0.4)
@@ -309,13 +336,16 @@ def _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, curren
         values.sort()
         gaps = [values[0] + 0.15, 0.15 - values[-1]]
         gaps.extend(values[index] - values[index - 1] for index in range(1, len(values)))
-        return max(gaps) <= 0.035
+        accepted = max(gaps) <= 0.035
+        if not accepted and diagnostic is not None:
+            diagnostic['reason'] = 'scan_coverage_pending'
+        return accepted
     except (ArithmeticError, AttributeError, IndexError, TypeError, ValueError, OverflowError):
         return None
 
 
 def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
-                     scene_pose=None, scan_pose=None, current_pose=None, diagnostic=None):
+                     scene_pose=None, scan_pose=None, current_pose=None, diagnostic=None, future_at=None):
     """Reject newly measured front hits; non-returns remain unknown.
 
     The latest scan must have bounded gaps and no measured hit in the padded
@@ -435,7 +465,14 @@ def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
         if (not isinstance(rays, list) or not isinstance(hits, list)
                 or len(rays) != len(hits) or len(rays) > 200000):
             return False
-        fast = _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose)
+        fast = _fast_newest_history(rays, hits, crossings, now, scan_at, scene_pose, current_pose,
+                                    future_at, diagnostic)
+        if isinstance(fast, tuple):
+            if diagnostic is not None:
+                diagnostic['future_covered'] = fast[1]
+                if not fast[0]:
+                    diagnostic['reason'] = 'front_blocked' if fast[2] else 'scan_coverage_pending'
+            return fast[0]
         if fast is not None:
             return fast
         for ray, hit in zip(rays, hits):
@@ -451,13 +488,18 @@ def newest_scan_veto(scan, extrinsics, scene=None, now=None, scan_at=None,
                 return False
             end = from_scene(end_old)
             if -0.20 <= end[0] <= 0.65 and abs(end[1]) <= 0.17:
+                if diagnostic is not None:
+                    diagnostic['reason'] = 'front_blocked'
                 return False
             if not 0 <= now - stamp <= 0.65 or scan_at - stamp > 0.4:
                 continue
             value = crossing(from_scene(start_old), end)
             if value is not None:
                 crossings.append(value)
-        return gap(crossings) <= 0.035
+        accepted = gap(crossings) <= 0.035
+        if not accepted and diagnostic is not None:
+            diagnostic['reason'] = 'scan_coverage_pending'
+        return accepted
     except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
         return False
 
@@ -538,7 +580,8 @@ class DecisionGate(object):  # noqa: UP004 - ROS Melodic Python 2
 class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     """Read ROS sensors directly; this object never creates a velocity publisher."""
 
-    def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None):
+    def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None, scan_validator=None,
+                 separate_model_camera=False):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -560,6 +603,10 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                         if depth_projection_config is not None else None)
         self.depth_extrinsics = None
         self._depth_projector = depth_projector
+        self._scan_validator = scan_validator
+        self._separate_model_camera = separate_model_camera
+        self._color_type = Image
+        self._color_subscription = None
         self._depth_projections = collections.deque(maxlen=4)
         self._completed_depth_frames = ()
         self._depth_event = None
@@ -594,8 +641,10 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 # The measured color and depth messages both fit in 1 MiB.
                 # Keep the single-frame receive queue used by the image topics.
                 options['buff_size'] = 1024 * 1024
-            self.subscriptions.append(rospy.Subscriber(
-                topic, typ, self._receive, callback_args=name, **options))
+            subscription = rospy.Subscriber(topic, typ, self._receive, callback_args=name, **options)
+            self.subscriptions.append(subscription)
+            if name == 'color':
+                self._color_subscription = subscription
 
     def _receive(self, message, name):
         try:
@@ -692,26 +741,36 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             if self.clock_guard.faulted or self.odom_guard.faulted:
                 return reject("guard_fault")
             current = dict(self.latest)
-            odom_history = list(self.odom_history)[-150:]
             epoch = self.epoch
             projection_only = getattr(self, "projection_only", False)
-        now = _monotonic()
+            motion_sensors_only = projection_only and getattr(self, '_separate_model_camera', False)
+            now = _monotonic()
+            newest_odom = itertools.islice(reversed(self.odom_history), 150)
+            if motion_sensors_only:
+                # Every eligible acquisition is at most .5 s old and may
+                # match odometry at most .05 s earlier. Older, already
+                # validated callback records cannot affect the alignment.
+                newest_odom = itertools.takewhile(lambda entry: now - entry['stamp'] <= .55, newest_odom)
+            odom_history = tuple(newest_odom)[::-1]
         completed_depth = None
-        if projection_only and self._depth_projector is not None and self._depth_worker is not None:
+        if projection_only and self._uses_completed_depth():
             completed_depth = self._fresh_completed_depth(current, epoch, now, odom_history)
             if completed_depth is None:
                 return reject("depth_projection_pending")
             current["depth"] = completed_depth.frame
         for name in self.limits:
+            if motion_sensors_only and name == 'color':
+                continue
             if name not in current:
                 return reject("missing_" + name)
             if not 0 <= now - current[name]["stamp"] <= self.limits[name]:
                 return reject("stale_" + name)
-        if not sensors_aligned({name: current[name]["stamp"] for name in ("scan", "color", "depth")},
+        geometry_sensors = ("scan", "depth") if motion_sensors_only else ("scan", "color", "depth")
+        if not sensors_aligned({name: current[name]["stamp"] for name in geometry_sensors},
                                odom_history, now, max_sensor_age_sec=0.5,
                                max_sensor_skew_sec=0.25, max_odom_skew_sec=0.05,
                                max_translation_m=0.02, max_rotation_rad=0.02,
-                               max_linear_mps=0.12, max_angular_radps=0.1):
+                               max_linear_mps=0.12, max_angular_radps=0.1, require_color=not motion_sensors_only):
             return reject("sensor_alignment")
         scan = current["scan"]["message"]
         if scan.header.frame_id.lstrip("/") != "laser_link":
@@ -719,9 +778,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         status = current["status"]["message"]
         depth = current["depth"]["message"]
         info = current["info"]["message"]
-        color = current["color"]["message"]
+        color = None if motion_sensors_only else current["color"]["message"]
         if (depth.header.frame_id.lstrip("/") != "camera_depth_optical_frame"
-                or color.header.frame_id.lstrip("/") != "camera_color_optical_frame"
+                or color is not None and color.header.frame_id.lstrip("/") != "camera_color_optical_frame"
                 or depth.header.frame_id != info.header.frame_id
                 or depth.width != info.width or depth.height != info.height
                 or abs(current["depth"]["stamp"] - current["info"]["stamp"]) > 0.2):
@@ -775,7 +834,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 prepared = None
                 if completed_depth is not None and depth_signature == completed_depth.extrinsics:
                     prepared = copy.deepcopy(completed_depth.projection)
-                elif (self._depth_projector is not None and self._depth_worker is not None
+                elif (self._uses_completed_depth()
                         and depth_signature == self.depth_extrinsics):
                     rotation = self.tf.transformations.quaternion_from_euler(*depth_signature[3:])
                     prepared = self._wait_for_depth_projection(
@@ -795,10 +854,13 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 if prepared is None:
                     return reject("depth_projection_pending")
                 depth_summary["corridor"] = prepared
-            image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
             depth_pose = nearest_odometry(odom_history, current["depth"]["stamp"])
-            if (image_pose is None or image_pose.get("epoch") != epoch
-                    or depth_pose is None or depth_pose.get("epoch") != epoch):
+            image_pose = None
+            if not motion_sensors_only:
+                image_pose = nearest_odometry(odom_history, current["color"]["stamp"])
+                if image_pose is None or image_pose.get("epoch") != epoch:
+                    return reject("camera_odom_alignment")
+            if depth_pose is None or depth_pose.get("epoch") != epoch:
                 return reject("camera_odom_alignment")
             with self.lock:
                 if self.epoch != epoch or self.clock_guard.faulted or self.odom_guard.faulted:
@@ -818,12 +880,14 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return reject("epoch_changed")
             self.snapshot_last_issue = None
             result = {"scene": scene, "state": state, "depth": depth_summary, "snapshot_at": snapshot_now, "epoch": epoch,
-                      "pose": pose, "image_pose": image_pose["pose"], "depth_pose": depth_pose["pose"],
-                      "color": current["color"]["message"], "scan": scan,
+                      "pose": pose, "depth_pose": depth_pose["pose"], "scan": scan,
                       "laser_extrinsics": extrinsics,
                       "scan_at": current["scan"]["stamp"], "odom_at": latest_odom["stamp"],
-                      "status_at": current["status"]["stamp"], "depth_at": current["depth"]["stamp"],
-                      "color_at": current["color"]["stamp"]}
+                      "status_at": current["status"]["stamp"], "depth_at": current["depth"]["stamp"]}
+            if motion_sensors_only:
+                result['motion_sensors_only'] = True
+            else:
+                result.update({"image_pose": image_pose["pose"], "color": color, "color_at": current["color"]["stamp"]})
             if getattr(self, '_split_validation', None) is not None:
                 result['_scan_capture'] = (current['scan'], self.extrinsics)
             return result
@@ -837,10 +901,22 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             if self.depth_projection_config is None:
                 raise ValueError("depth projection is not configured")
             self.projection_only = True
+            color = None
+            if getattr(self, '_separate_model_camera', False):
+                color, self._color_subscription = self._color_subscription, None
+        if color is not None:
+            color.unregister()
 
     def disable_projection_only(self):
         with self.lock:
             self.projection_only = False
+            restore_color = getattr(self, '_separate_model_camera', False) and self._color_subscription is None
+            if restore_color:
+                self.latest.pop('color', None)
+        if restore_color:
+            self._color_subscription = self.rospy.Subscriber(
+                '/camera/color/image_raw', self._color_type, self._receive, callback_args='color',
+                queue_size=1, buff_size=1024 * 1024)
 
     def current_pose(self):
         with self.lock:
@@ -865,7 +941,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         """Process incoming depth independently of scan and command work."""
         if self._depth_worker is not None:
             raise ValueError('depth projection worker already started')
-        self._depth_event = threading.Event()
+        self._depth_event = SensorWakeup()
         self._depth_ready = threading.Event()
         self._depth_stop = threading.Event()
         self.depth_preprojection_counts = collections.Counter()
@@ -880,7 +956,15 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self._depth_event.set()
         self._depth_ready.set()
         self._depth_worker.join(.3)
-        return not self._depth_worker.is_alive()
+        closed = not self._depth_worker.is_alive()
+        if closed:
+            self._depth_event.close()
+        return closed
+
+    def _uses_completed_depth(self):
+        return (getattr(self, '_depth_worker', None) is not None and
+                (getattr(self, '_depth_projector', None) is not None
+                 or getattr(self, '_split_validation', None) is not None))
 
     def _preproject_depth(self):
         # Read one latest frame per wake. If overloaded, intermediate frames
@@ -888,13 +972,10 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         previous = None
         while not self._depth_stop.is_set():
             self._depth_event.clear()
-            with self.lock:
-                depth = self.latest.get('depth')
-                info = self.latest.get('info')
-                epoch = self.epoch
-                extrinsics = self.depth_extrinsics
-                config = self.depth_projection_config
-                guarded = not self.clock_guard.faulted and not self.odom_guard.faulted
+            epoch, latest, _, _ = self._split_check_view()
+            depth, info = latest.get('depth'), latest.get('info')
+            extrinsics, config = self.depth_extrinsics, self.depth_projection_config
+            guarded = epoch == self.epoch and not self.clock_guard.faulted and not self.odom_guard.faulted
             try:
                 if guarded and depth and info and config is not None and transform_matches(extrinsics, extrinsics):
                     stamp, image = depth['stamp'], depth['message']
@@ -916,7 +997,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                             if prepared is not None:
                                 completed = CompletedDepth(epoch, depth, info, extrinsics, key[-1], prepared)
                                 split = getattr(self, '_split_validation', None)
-                                if split is not None and getattr(self, '_depth_projector', None) is not None:
+                                if split is not None:
                                     checked_at = _monotonic()
                                     if epoch == self.epoch and 0 <= checked_at - stamp < LATEST_INPUT_MAX_AGE_SEC:
                                         candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': prepared}}
@@ -926,6 +1007,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                 self._completed_depth_frames = (completed,) + prior[:2]
                                 self._depth_ready.set()
                                 if split is not None:
+                                    split.note_completed_depth()
                                     split.notify_input('depth')
                             previous = key
             except Exception:  # no result for failed calibration, TF or conversion
@@ -945,7 +1027,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     or completed.config != config or not _same_depth_intrinsics(current.get('info'), completed.info)):
                 continue
             if odom_history is not None:
-                aligned = nearest_odometry(odom_history, stamp)
+                lookup = _nearest_ordered_odometry if isinstance(odom_history, tuple) else nearest_odometry
+                aligned = lookup(odom_history, stamp)
                 if aligned is None or aligned.get('epoch') != epoch:
                     continue
             return completed
@@ -1017,7 +1100,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     or image.header.frame_id != info.header.frame_id
                     or image.width != info.width or image.height != info.height):
                 return False
-            aligned = nearest_odometry(self.odom_history, stamp)
+            history = self.odom_history
+            lookup = _nearest_ordered_odometry if isinstance(history, tuple) else nearest_odometry
+            aligned = lookup(history, stamp)
             if aligned is None and odom['stamp'] < stamp:
                 self._depth_alignment_pending = True
                 return False
@@ -1058,19 +1143,39 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         """Reuse a scan assessment only for the same owned scene and poses."""
         try:
             self._scan_veto_issue = None
+            worker = getattr(self, '_scan_validator', None)
+            if worker is not None:
+                verdict = worker.check(self.epoch, self.extrinsics, sample, scan, aligned, odom, now)
+                if verdict is None:
+                    self._scan_veto_issue = 'scan_validation_pending'
+                    return False
+                self._scan_veto_issue = verdict['reason']
+                expiry = verdict['valid_until']
+                if verdict['accepted'] is not True:
+                    return False
+                if not _finite(expiry) or not now < expiry <= scan['stamp'] + .3:
+                    return False
+                self._scan_veto_valid_until = expiry
+                return True
             scene = sample['scene']
             message = scan['message']
             rays, hits = scene['rays'], scene['occupied_hits']
             if (not isinstance(rays, list) or not isinstance(hits, list)
                     or len(rays) != len(hits) or len(rays) > 200000):
                 return False
-            scene_signature = tuple((tuple(ray['start_base']), tuple(ray['hit_base']), ray['stamp'],
-                                     tuple(hit['point_base']), hit['stamp']) for ray, hit in zip(rays, hits))
+            split_validation = getattr(self, '_split_validation', None) is not None
             key = (self.epoch, scan['stamp'], tuple(sample['pose']), tuple(aligned['pose']),
-                   tuple(odom['pose']), tuple(self.extrinsics), message.header.frame_id,
-                   message.angle_min, message.angle_increment,
-                   message.range_min, message.range_max, message.time_increment, tuple(message.ranges),
-                   scene.get('status'), scene.get('coverage', {}).get('sensor_fresh'), scene_signature)
+                   tuple(odom['pose']), tuple(self.extrinsics))
+            if split_validation and '_scan_capture' in sample:
+                # Both the ROS entry and fusion geometry are owned by this
+                # capture. The cache also retains the scene itself by identity.
+                key += (id(message),)
+            else:
+                scene_signature = tuple((tuple(ray['start_base']), tuple(ray['hit_base']), ray['stamp'],
+                                         tuple(hit['point_base']), hit['stamp']) for ray, hit in zip(rays, hits))
+                key += (message.header.frame_id, message.angle_min, message.angle_increment,
+                        message.range_min, message.range_max, message.time_increment, tuple(message.ranges),
+                        scene.get('status'), scene.get('coverage', {}).get('sensor_fresh'), scene_signature)
             entries = getattr(self, '_scan_veto_cache', [])
             for cached_scene, cached_key, expires, accepted, issue in entries:
                 if cached_scene is scene and cached_key == key and now < expires:
@@ -1080,19 +1185,21 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             diagnostic = {}
             args = (message, self.extrinsics, scene, now, scan['stamp'],
                     sample['pose'], aligned['pose'], odom['pose'])
-            split_validation = getattr(self, '_split_validation', None) is not None
+            expiry = scan['stamp'] + 0.3
+            future = expiry - 1e-6
             if split_validation:
-                accepted = newest_scan_veto(*args, **{'diagnostic': diagnostic})
+                accepted = newest_scan_veto(*args, **{'diagnostic': diagnostic, 'future_at': future})
             else:
                 accepted = newest_scan_veto(*args)
+                expiry = min(now + 0.1, expiry)
+                future = expiry - 1e-6
             self._scan_veto_issue = diagnostic.get('reason')
             # The split controller checks live odometry and pending receipts
             # on every renewal. Keep the acquisition deadline as the upper
             # bound, then prove coverage through that time below.
-            expiry = scan['stamp'] + 0.3
-            if not split_validation:
-                expiry = min(now + 0.1, expiry)
-            if accepted:
+            if accepted and diagnostic.get('future_covered') is True:
+                expiry = future
+            elif accepted:
                 stamps = [ray['stamp'] for ray in scene['rays'] if _finite(ray.get('stamp'))
                           and 0 <= now - ray['stamp'] <= 0.65 and 0 <= scan['stamp'] - ray['stamp'] <= 0.4]
                 if stamps:
@@ -1100,8 +1207,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     # Some old rays do not contribute to coverage. Only use a
                     # longer lifetime if the same checker still passes after
                     # all rays expiring before that time have been removed.
-                    future = expiry - 1e-6
-                    if (future > conservative_expiry + .015
+                    if ('future_covered' not in diagnostic and future > conservative_expiry + .015
                             and newest_scan_veto(message, self.extrinsics, scene, future, scan['stamp'],
                                                 sample['pose'], aligned['pose'], odom['pose'])):
                         expiry = future
@@ -1180,7 +1286,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         with self.lock:
             self._publish_split_inputs()
             self._split_validation = SplitSensorValidation(self._capture_split_input, self._check_split_input,
-                                                            self._combine_split_proof)
+                                                            self._combine_split_proof,
+                                                            completed_depth_on_read=self._depth_worker is not None)
 
     def _publish_split_inputs(self):
         """Publish a bounded input view after a callback has finished updating it."""
@@ -1198,8 +1305,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         if view is not None:
             return view
         with self.lock:
+            history = getattr(self, 'odom_history', ())
             return (self.epoch, dict(self.latest), {},
-                    tuple(itertools.islice(reversed(self.odom_history), 150))[::-1])
+                    tuple(itertools.islice(reversed(history), 150))[::-1])
 
     def close_split_validation(self):
         return self._split_validation.close()
@@ -1209,8 +1317,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         entry = latest.get(stream)
         info = latest.get('info') if stream == 'depth' else None
         completed, pending = None, None
-        if (stream == 'depth' and getattr(self, '_depth_projector', None) is not None
-                and getattr(self, '_depth_worker', None) is not None):
+        if stream == 'depth' and self._uses_completed_depth():
             now = _monotonic()
             completed = self._fresh_completed_depth(latest, epoch, now, history)
             if completed is not None:
@@ -1261,11 +1368,11 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 return None, 'prepared_pending'
             expires = min(expires, original)
         elif stream == 'scan':
-            aligned = nearest_odometry(probe.odom_history, stamp)
+            aligned = _nearest_ordered_odometry(history, stamp)
             if aligned is None or aligned.get('epoch') != epoch:
                 return None, 'scan_alignment_pending'
             if not probe._cached_newest_scan_safe_locked(sample, entry, aligned, odom, now):
-                if probe._scan_veto_issue in ('front_blocked', 'scan_coverage_pending'):
+                if probe._scan_veto_issue in ('front_blocked', 'scan_coverage_pending', 'scan_validation_pending'):
                     return None, probe._scan_veto_issue
                 from forward_trial import _raw_scan
                 raw = {key: getattr(entry['message'], key) for key in
@@ -1293,6 +1400,21 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 'depth_extrinsics': probe.depth_extrinsics, 'config': probe.depth_projection_config}, None
 
     def _combine_split_proof(self, sample, scan, depth, nonblocking=False):
+        if self._uses_completed_depth():
+            cached_depth = sample.get('_checked_completed_depth')
+            if cached_depth is not None and (depth is None or cached_depth['entry']['stamp'] > depth['entry']['stamp']):
+                depth = cached_depth
+            _, inputs = self._capture_split_input('depth', sample)
+            completed = inputs[3]
+            if completed is not None and (depth is None or completed.frame['stamp'] > depth['entry']['stamp']):
+                advanced, issue = self._check_split_input('depth', sample, inputs)
+                if advanced is not None:
+                    depth = advanced
+                    sample['_checked_completed_depth'] = advanced
+                elif issue in ('depth_obstacle', 'epoch_or_guard', 'new_depth_unchecked'):
+                    return None, issue
+        if depth is None:
+            return None, 'prepared_pending'
         view = getattr(self, '_split_inputs', None) if nonblocking else None
         if view is None:
             if not self.lock.acquire(not nonblocking):
@@ -1306,10 +1428,11 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         if not odom or not status:
             return None, 'prepared_pending'
         limits = {'scan': scan['expires'], 'depth': depth['expires'],
-                  'snapshot': min(sample['snapshot_at'] + .25, sample['scan_at'] + .5,
-                                  sample['depth_at'] + .5, sample['color_at'] + .5),
+                  'snapshot': min(sample['snapshot_at'] + .25, sample['scan_at'] + .5, sample['depth_at'] + .5),
                   'state': min(sample['status_at'] + 1., status['stamp'] + 1.,
                                odom['stamp'] + LATEST_INPUT_MAX_AGE_SEC)}
+        if sample.get('motion_sensors_only') is not True:
+            limits['snapshot'] = min(limits['snapshot'], sample['color_at'] + .5)
         limiting = min(limits, key=limits.get)
         deadline = limits[limiting]
         if (scan['epoch'] != depth['epoch'] or scan['extrinsics'] != depth['extrinsics']
@@ -1401,11 +1524,20 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 distance, turn = _pose_delta(pose, odom['pose'])
                 if not _finite(distance) or not _finite(turn) or distance > .005 or turn > .01:
                     return None, 'pose_changed'
-            state = base_state(odom['message'], status['message'], now)
-            if (state is None or state['motion_mode'] != 0 or state['error_code'] != 0
-                    or state['vehicle_state'] != 0 or state['control_mode'] != 1
-                    or state['battery_voltage'] < 10 or not 0 <= state['linear_x_mps'] <= .02
-                    or abs(state['linear_y_mps']) > .005 or abs(state['angular_z_radps']) > .02):
+            # ROS callbacks publish owned records. Reuse the decoded state
+            # only for this exact message pair, after time and pose checks.
+            cached = getattr(self, '_checked_split_base', None) if len(view) >= 4 else None
+            if cached is not None and cached[0] is odom and cached[1] is status:
+                base_ready = cached[2]
+            else:
+                state = base_state(odom['message'], status['message'], now)
+                base_ready = (state is not None and state['motion_mode'] == 0 and state['error_code'] == 0
+                              and state['vehicle_state'] == 0 and state['control_mode'] == 1
+                              and state['battery_voltage'] >= 10 and 0 <= state['linear_x_mps'] <= .02
+                              and abs(state['linear_y_mps']) <= .005 and abs(state['angular_z_radps']) <= .02)
+                if len(view) >= 4:
+                    self._checked_split_base = (odom, status, base_ready)
+            if not base_ready:
                 return None, 'base_state'
             return deadline, None
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
@@ -1600,16 +1732,19 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return reject("epoch_or_guard")
                 odom, status, scan, depth = (self.latest["odom"], self.latest["status"],
                                              self.latest["scan"], self.latest["depth"])
-                if not all(_finite(sample.get(name)) for name in
-                           ("snapshot_at", "scan_at", "status_at", "depth_at", "color_at")):
-                    return reject("invalid_sample_timestamps")
                 ages = (("latest_scan", scan.get("stamp"), 0.3),
                         ("latest_odom", odom.get("stamp"), LATEST_INPUT_MAX_AGE_SEC),
                         ("latest_status", status.get("stamp"), 1.0),
-                        ("snapshot", sample["snapshot_at"], 0.25),
-                        ("scan", sample["scan_at"], 0.5),
-                        ("depth", sample["depth_at"], 0.5),
-                        ("color", sample["color_at"], 0.5))
+                        ("snapshot", sample.get("snapshot_at"), 0.25),
+                        ("scan", sample.get("scan_at"), 0.5),
+                        ("depth", sample.get("depth_at"), 0.5))
+                requires_color = not (sample.get('motion_sensors_only') is True
+                                      and getattr(self, '_separate_model_camera', False))
+                if requires_color:
+                    ages += (("color", sample.get("color_at"), 0.5),)
+                if not _finite(sample.get('status_at')) or any(
+                        not _finite(stamp) for name, stamp, _ in ages if not name.startswith('latest_')):
+                    return reject("invalid_sample_timestamps")
                 for name, stamp, limit in ages:
                     if not _finite(stamp) or not 0 <= now - stamp <= limit:
                         return reject("stale_" + name)
@@ -1649,8 +1784,9 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                           "latest_depth": depth["stamp"] + LATEST_INPUT_MAX_AGE_SEC,
                           "latest_status": status["stamp"] + 1.0,
                           "snapshot": sample["snapshot_at"] + 0.25, "scan": sample["scan_at"] + 0.5,
-                          "status": sample["status_at"] + 1.0, "depth": sample["depth_at"] + 0.5,
-                          "color": sample["color_at"] + 0.5}
+                          "status": sample["status_at"] + 1.0, "depth": sample["depth_at"] + 0.5}
+                if requires_color:
+                    limits["color"] = sample["color_at"] + 0.5
                 if scan_veto_until is not None:
                     limits['new_scan_veto'] = scan_veto_until
                 # The live odometry is rechecked after this captured view is

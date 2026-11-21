@@ -72,6 +72,19 @@ def test_observation_adapter_owns_jpeg_and_scan_without_fabricating_fields():
     assert adapter.last_issue == 'current_after_copy'
 
 
+def test_local_geometry_sample_has_no_rgb_but_still_rejects_a_missing_depth_timestamp():
+    mod = module()
+    clock = Clock()
+    sample = source(clock)[0].snapshot()
+    for key in ('color_at', 'image_pose', 'image_jpeg'):
+        sample.pop(key)
+    sample['motion_sensors_only'] = True
+    assert mod._snapshot_without_depth_gate(sample, clock.now(), require_image=False) is None
+    assert mod._snapshot_without_depth_gate(sample, clock.now()) == 'sensor_unavailable'
+    sample.pop('depth_at')
+    assert mod._snapshot_without_depth_gate(sample, clock.now(), require_image=False) == 'sensor_unavailable'
+
+
 def test_deferred_adapter_check_still_cannot_authorize_motion_with_stale_source():
     mod = module()
     clock = Clock()
@@ -863,6 +876,50 @@ def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
                                    serial_guard=FakeSerialGuard()).run()
     assert result['motion_requested'] is True
     assert events == ['written', 'sampler']
+
+
+def test_warm_split_start_builds_a_replacement_before_any_motion_submission():
+    import time
+    from relay import _monotonic
+    mod = module()
+
+    class RealClock(object):
+        now = staticmethod(_monotonic)
+        sleep = staticmethod(time.sleep)
+
+    clock = RealClock()
+    adapter = mod.ObservationAdapter(Observation(clock), lambda _: b'\xff\xd8offline\xff\xd9',
+                                     serialize_processing=True)
+    relay = mod.RelayAdapter(Transport(ready=b'READY motion_limit_sec=2.000000\n'), clock, motion_limit_sec=2.)
+    seeded, prepared_while_stopped = [], []
+    adapter.warm_split_start = True
+    adapter.updates_prepared_evidence = lambda: True
+    adapter.prepare_initial_command_evidence = lambda _: ({'valid_until': clock.now() + .14}, None)
+
+    def seed(sample, _evidence):
+        assert not relay.had_motion
+        seeded.append(sample)
+
+    def prepare(sample):
+        if not relay.had_motion:
+            prepared_while_stopped.append(sample)
+        return {'valid_until': clock.now() + .065}, None
+
+    def read(sample):
+        assert sample is not seeded[0]
+        return sample['_command_evidence']['valid_until'], None
+
+    adapter.seed_split_validation = seed
+    adapter.prepare_command_evidence = prepare
+    adapter.read_command_evidence = read
+    model = mod.DecisionsAdapter(lambda payload, timeout: {
+        'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
+    result = mod.PreparedLongerForwardTrial(adapter, model, relay, FakeArbiter(), clock, enable_motion=True,
+                                           duration_sec=.5, period_sec=.02, serial_guard=FakeSerialGuard()).run()
+    moving = [item for item in result['renewal_checks'] if item['submitted']]
+    assert seeded and prepared_while_stopped and moving
+    assert moving[0]['sample_at'] in [item['snapshot_at'] for item in prepared_while_stopped]
+    assert moving[0]['valid_until'] <= moving[0]['limits']['latest_sensors']
 
 
 def test_guarded_trial_prepares_a_validated_sample_before_first_motion(monkeypatch):
@@ -2135,7 +2192,8 @@ def test_temporary_missing_stationary_history_is_retried_before_motion():
 
 
 @pytest.mark.parametrize('moving', [False, True])
-def test_only_a_stationary_history_prefix_can_wait_for_a_delayed_tail(moving):
+@pytest.mark.parametrize('tail_start', [99.8, 99.83])
+def test_only_a_stationary_history_prefix_can_wait_for_a_delayed_tail(moving, tail_start):
     mod = module()
     import forward_trial
     clock = Clock()
@@ -2146,7 +2204,7 @@ def test_only_a_stationary_history_prefix_can_wait_for_a_delayed_tail(moving):
         trace[-1]['linear_x_mps'] = .01
     trial = mod.LiveTrial(adapter, None, None, None, clock)
     with pytest.raises(forward_trial._StopError):
-        trial._trace_failed(trace, 99.8, 99.9733, 'stationary_trace_head', before)
+        trial._trace_failed(trace, tail_start, 99.9733, 'stationary_trace_head', before)
     assert trial._last_diagnostic['retryable'] is (not moving)
 
 

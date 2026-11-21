@@ -320,12 +320,16 @@ class _Timespec(ctypes.Structure):
     _fields_ = [('seconds', ctypes.c_long), ('nanoseconds', ctypes.c_long)]
 
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
+# clock_gettime is a short, nonblocking clock read. A CDLL call releases the
+# Python 2 GIL on every read and can make a time check wait behind sensor work.
+_CLOCK_GETTIME = ctypes.PyDLL(None, use_errno=True).clock_gettime
+_CLOCK_GETTIME.argtypes = (ctypes.c_int, ctypes.POINTER(_Timespec))
+_CLOCK_GETTIME.restype = ctypes.c_int
 
 
 def _monotonic():
     value = _Timespec()
-    if _LIBC.clock_gettime(1, ctypes.byref(value)) != 0:
+    if _CLOCK_GETTIME(1, ctypes.byref(value)) != 0:
         raise OSError(ctypes.get_errno(), 'clock_gettime failed')
     return value.seconds + value.nanoseconds / 1000000000.0
 

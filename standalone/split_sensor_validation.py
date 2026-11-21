@@ -18,20 +18,18 @@ PENDING_PROOF = ('prepared_pending', 'prepared_scan_advanced', 'prepared_depth_a
                  'prepared_snapshot_expired', 'prepared_state_expired', 'prepared_evidence_expired')
 
 def pending_sensor_deadline(latest, checked, now, max_age, history=()):
-    """Shorten a live proof to the oldest of at most two pending arrivals."""
+    """Shorten a live proof using the complete, bounded receipt history."""
     if not latest or not checked:
         return None
     generation, previous = latest.get('generation'), checked.get('generation')
-    if (generation is None or previous is None or not 1 <= generation - previous <= 2
+    if (generation is None or previous is None or not 1 <= generation - previous <= 4
             or not _number(checked.get('stamp'))):
         return None
-    pending = [(latest.get('stamp'), latest.get('received_at'))]
-    if generation == previous + 2:
-        intermediate = next(((stamp, receipt) for index, stamp, receipt in history
-                             if index == previous + 1), None)
-        if intermediate is None:
-            return None
-        pending.insert(0, intermediate)
+    retained = {index: (stamp, received) for index, stamp, received in history}
+    pending = [retained.get(index) for index in range(previous + 1, generation)]
+    if any(item is None for item in pending):
+        return None
+    pending.append((latest.get('stamp'), latest.get('received_at')))
     deadline, stamp_before, receipt_before = None, checked['stamp'], 0.
     for stamp, received in pending:
         if (not _number(stamp) or not _number(received) or not stamp_before < stamp <= received <= now
@@ -98,7 +96,7 @@ class SplitSensorValidation(object):
     STOPS = ('new_scan', 'new_depth_unchecked', 'epoch_or_guard', 'transform_changed')
     LATCH = ('front_blocked', 'depth_obstacle', 'epoch_or_guard', 'transform_changed')
 
-    def __init__(self, capture, check, combine):
+    def __init__(self, capture, check, combine, completed_depth_on_read=False):
         self.capture, self.check, self.combine = capture, check, combine
         self._cv = threading.Condition()
         self._anchors = (None, None)
@@ -108,12 +106,14 @@ class SplitSensorValidation(object):
         self._counts = collections.Counter()
         self._reads = collections.Counter()
         self._timeline = collections.deque(maxlen=192)
+        self._completed_depth_on_read = completed_depth_on_read
         self._changed = SensorWakeup()
         self._stage_changed = SensorWakeup()
         self.revision = 0
-        self._input_ready = {stream: SensorWakeup() for stream in self.STREAMS}
+        streams = ('scan',) if completed_depth_on_read else self.STREAMS
+        self._input_ready = {stream: SensorWakeup() for stream in streams}
         self._threads = []
-        for name in self.STREAMS:
+        for name in streams:
             thread = threading.Thread(target=self._run, args=(name,), name='limo-proof-' + name)
             thread.daemon = True
             self._threads.append(thread)
@@ -143,7 +143,7 @@ class SplitSensorValidation(object):
                     part, issue = self.check(stream, anchor.sample, inputs)
                     completed = _monotonic()
                     unprocessed = issue in ('depth_preprojection_pending', 'depth_alignment_pending',
-                                            'scan_alignment_pending',
+                                            'scan_alignment_pending', 'scan_validation_pending',
                                             'prepared_scan_advanced', 'prepared_depth_advanced')
                     retry = retry or unprocessed
                     anchor.generations[stream] = None if unprocessed else generation
@@ -238,7 +238,7 @@ class SplitSensorValidation(object):
         if anchor.issue is not None:
             return None, anchor.issue
         scan, depth = anchor.parts.get('scan'), anchor.parts.get('depth')
-        if scan is None or depth is None:
+        if scan is None or (depth is None and not self._completed_depth_on_read):
             if record:
                 if scan is None:
                     self._reads['missing_scan'] += 1
@@ -254,8 +254,7 @@ class SplitSensorValidation(object):
             return None, self._fault or 'split_worker_closed'
         if anchor.issue is not None:
             return None, anchor.issue
-        if (anchor not in self._anchors or _monotonic() >= anchor.expires
-                or any(anchor.parts.get(name) is None for name in self.STREAMS)):
+        if anchor not in self._anchors or self._parts(anchor)[0] is None:
             return None, 'prepared_pending'
         return proof, issue
 
@@ -303,6 +302,18 @@ class SplitSensorValidation(object):
         """Wait for either stream to complete a check, without taking its lock."""
         self._wait_for_revision(self._changed, revision, timeout)
 
+    def wait_for_stage_slot(self, timeout):
+        """Avoid assembling another scene while the current stage owns the slot."""
+        revision = self.revision
+        staged = self._anchors[1]
+        if self._fault is not None or self._closed or staged is None or staged is self._pending_commit:
+            return True
+        remaining = staged.expires - _monotonic()
+        if remaining <= 0:
+            return True
+        self._wait_for_revision(self._stage_changed, revision, min(remaining, timeout))
+        return False
+
     def _wait_for_revision(self, event, revision, timeout):
         if revision == self.revision:
             event.clear()
@@ -322,6 +333,12 @@ class SplitSensorValidation(object):
                 self._fault = 'depth_obstacle'
                 self._counts['depth:producer_obstacle'] += 1
                 self._wake_locked()
+
+    def note_completed_depth(self):
+        if self._completed_depth_on_read:
+            with self._cv:
+                if not self._closed:
+                    self._changed_locked()
 
     def close(self):
         with self._cv:

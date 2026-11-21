@@ -75,11 +75,13 @@ def test_forward_trial_only_offers_forward_or_stop_and_preserves_stop():
         "laser": {},
         "base": {},
         "forward_only": True,
+        "forward_segment": {"max_distance_m": 0.04, "max_speed_mps": 0.02},
     }
 
     def reply(choice):
         def transport(payload, key, timeout):
             assert [item["value"] for item in payload["questions"][0]["choices"]] == ["forward", "stop"]
+            assert payload["input"][0]["content"][2]["data"]["forward_segment"] == request["forward_segment"]
             return {"answers": [{"name": "next_action", "type": "choice", "choice": choice}]}
         return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
 

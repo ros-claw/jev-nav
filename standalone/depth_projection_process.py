@@ -70,22 +70,31 @@ def _project(params, data):
 class DepthProjectionProcess(object):
     """Exchange one frame at a time over a private socket with a fixed deadline."""
 
+    WORKER_SCRIPT = 'depth_projection_process.py'
+
     def __init__(self):
         self._lock = threading.Lock()
         self._durations = collections.deque(maxlen=512)
         self._counts = collections.Counter()
-        self._sock, peer = socket.socketpair()
-        self.process = None
+        self._closed = False
+        self._recovery = None
+        self._sock, self.process = self._spawn()
+
+    def _spawn(self):
+        sock, peer = socket.socketpair()
+        process = None
         try:
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'depth_projection_process.py')
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.WORKER_SCRIPT)
             # The worker imports only local projection code and NumPy. It
             # needs neither the ROS environment nor API credentials.
-            self.process = subprocess.Popen([sys.executable, '-u', script], stdin=peer,
-                                            close_fds=True, env={'PYTHONNOUSERSITE': '1'})
-            if _read(self._sock, 1, _monotonic() + 4.) != b'R':
+            process = subprocess.Popen([sys.executable, '-u', script], stdin=peer,
+                                       close_fds=True, env={'PYTHONNOUSERSITE': '1'})
+            if _read(sock, 1, _monotonic() + 4.) != b'R':
                 raise ValueError('depth projection failed to initialize')
+            return sock, process
         except BaseException:
-            self.close()
+            sock.close()
+            self._stop_process(process)
             raise
         finally:
             peer.close()
@@ -101,6 +110,7 @@ class DepthProjectionProcess(object):
             return None
         try:
             if self._sock is None:
+                self._start_recovery()
                 return None
             if type(data) is not bytes or not 1 <= len(data) <= MAX_IMAGE:
                 return None
@@ -148,6 +158,39 @@ class DepthProjectionProcess(object):
             self._sock.close()
             self._sock = None
 
+    def _start_recovery(self):
+        if self._closed or self._recovery is not None or self._counts['restarts'] >= 2:
+            return
+        self._counts['restarts'] += 1
+        self._recovery = threading.Thread(target=self._restart, args=(self.process,), name='projection-recovery')
+        self._recovery.daemon = True
+        self._recovery.start()
+
+    def _restart(self, previous):
+        replacement = None
+        try:
+            self._stop_process(previous)
+            time.sleep(.05)
+            with self._lock:
+                if self._closed:
+                    return
+            replacement = self._spawn()
+            with self._lock:
+                if not self._closed:
+                    self._sock, self.process = replacement
+                    replacement = None
+                    self._counts['restarted'] += 1
+        except Exception:
+            with self._lock:
+                self._counts['restart_failed'] += 1
+        finally:
+            if replacement is not None:
+                sock, process = replacement
+                sock.close()
+                self._stop_process(process)
+            with self._lock:
+                self._recovery = None
+
     def summary(self):
         with self._lock:
             return {'counts': dict(self._counts), 'durations_sec': list(self._durations),
@@ -155,22 +198,34 @@ class DepthProjectionProcess(object):
 
     def close(self):
         with self._lock:
+            self._closed = True
             self._disconnect()
-        if self.process is None:
+            recovery = self._recovery
+        if recovery is not None:
+            recovery.join(4.5)
+            if recovery.is_alive():
+                return
+        self._stop_process(self.process)
+
+    @staticmethod
+    def _stop_process(process):
+        if process is None:
             return
         deadline = _monotonic() + .1
-        while self.process.poll() is None and _monotonic() < deadline:
+        while process.poll() is None and _monotonic() < deadline:
             time.sleep(.005)
-        if self.process.poll() is None:
-            self.process.kill()
-        self.process.wait()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
 
 
-def _run():
+def _run(process=None):
     # The parent installs a private AF_UNIX socket on fd 0. No controller or
     # ROS objects are imported here.
-    import numpy  # noqa: F401
-    import projected_depth_gate  # noqa: F401
+    if process is None:
+        import numpy  # noqa: F401
+        import projected_depth_gate  # noqa: F401
+        process = _project
 
     peer = socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM)
     peer.sendall(b'R')
@@ -180,7 +235,7 @@ def _run():
             if not 1 <= metadata_size <= MAX_METADATA or not 1 <= size <= MAX_IMAGE:
                 return 2
             metadata = json.loads(_read(peer, metadata_size).decode('ascii'))
-            result = _json(_project(metadata, _read(peer, size)))
+            result = _json(process(metadata, _read(peer, size)))
             peer.sendall(HEADER.pack(len(result), 0) + result)
     except (IOError, OSError, EOFError, TypeError, ValueError):
         return 0

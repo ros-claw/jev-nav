@@ -82,6 +82,36 @@ def wait_for(predicate, timeout=2.0):
     raise AssertionError('timed out waiting for relay condition')
 
 
+def test_handoff_keeps_the_same_process_and_transfers_the_only_writer():
+    relay, transport, clock = make()
+    direct = None
+    try:
+        assert relay.arm(.3)
+        process = transport.process
+        direct = relay.handoff_before_motion()
+        assert direct is not None and not relay.armed
+        assert direct.armed and transport.process is process and process.running
+        assert relay.handoff_before_motion() is None
+        before = transport.snapshot()
+        assert before and all(frame['linear'] == 0. for _, _, frame in before)
+        assert direct.send_frame(direct.sequence + 1, clock.now(), .02, 0.)
+        assert transport.snapshot()[-1][1] == threading.current_thread().ident
+        assert all(writer != threading.current_thread().ident for _, writer, _ in before)
+        assert direct.stop_and_latch()
+    finally:
+        assert (relay if direct is None else direct).close()
+
+
+def test_motion_prevents_a_relay_writer_handoff():
+    relay, _, clock = make()
+    try:
+        assert relay.arm(.3)
+        assert relay.send_frame(0, clock.now(), .02, 0.)
+        assert relay.handoff_before_motion() is None
+    finally:
+        assert relay.close()
+
+
 def test_idle_heartbeats_continue_during_control_pause_and_have_one_writer():
     relay, transport, clock = make()
     try:

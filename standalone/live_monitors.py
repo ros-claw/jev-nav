@@ -70,6 +70,7 @@ class _AsyncMonitor(object):
         self._sample = None
         self._sample_at = None
         self._sample_mono_at = None
+        self._command_evidence = None
         self._last_clock = None
         self._clock_changed_mono_at = None
         self._faulted = False
@@ -91,6 +92,7 @@ class _AsyncMonitor(object):
     def _latch_fault(self, reason):
         if not self._faulted:
             self._faulted = True
+            self._command_evidence = None
             self._fault_reason = reason
             try:
                 self._fault_details = self._diagnostic_details(self._sample)
@@ -144,8 +146,11 @@ class _AsyncMonitor(object):
                         self._sample_at = now
                         self._sample_mono_at = mono_now
                         # Once confirmed, any observed violation is permanent.
-                        if self._confirmed and self._assess(value, now) is None:
-                            self._latch_fault(self._diagnose_assessment(value, now))
+                        if self._confirmed:
+                            if self._assess(value, now) is None:
+                                self._latch_fault(self._diagnose_assessment(value, now))
+                            else:
+                                self._publish_command_deadline(now, mono_now)
                     self._updated.set()
                 self._wake.wait(self.poll_interval)
                 self._wake.clear()
@@ -305,6 +310,39 @@ class _AsyncMonitor(object):
     def _additional_deadlines(self, sample, now, mono_now):
         return []
 
+    def _deadline_for_sample(self, now, mono_now):
+        deadlines = [self._sample_at + self.max_age,
+                     now + self.max_age - (mono_now - self._sample_mono_at)]
+        deadlines.extend(self._additional_deadlines(self._sample, now, mono_now))
+        if not all(_number(item) for item in deadlines):
+            return None
+        deadline = min(deadlines)
+        return deadline if now < deadline else None
+
+    def _publish_command_deadline(self, now, mono_now):
+        if self._faulted or self._stop.is_set():
+            return
+        deadline = self._deadline_for_sample(now, mono_now)
+        self._command_evidence = (self._sample, now, mono_now, deadline) if deadline is not None else None
+
+    def _command_sample_current(self, sample):
+        return True
+
+    def cached_command_deadline(self):
+        """Read already checked monitor data without its sampler lock."""
+        evidence = self._command_evidence
+        if evidence is None or self._faulted or self._stop.is_set():
+            return None
+        sample, checked, checked_mono, deadline = evidence
+        now, mono_now = self.clock.now(), _monotonic()
+        if (not _number(now) or now < checked or mono_now < checked_mono
+                or not self._command_sample_current(sample)):
+            return None
+        deadline = min(deadline, now + (deadline - checked) - (mono_now - checked_mono))
+        if self._faulted or self._stop.is_set() or not now < deadline:
+            return None
+        return deadline
+
     def valid_until(self):
         """Return the earliest cache/evidence expiry in the injected clock domain."""
         with self._lock:
@@ -312,13 +350,7 @@ class _AsyncMonitor(object):
                 return None
             try:
                 now, mono_now = self.clock.now(), _monotonic()
-                deadlines = [self._sample_at + self.max_age,
-                             now + self.max_age - (mono_now - self._sample_mono_at)]
-                deadlines.extend(self._additional_deadlines(self._sample, now, mono_now))
-                if not all(_number(item) for item in deadlines):
-                    return None
-                deadline = min(deadlines)
-                return deadline if now < deadline else None
+                return self._deadline_for_sample(now, mono_now)
             except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
                 return None
 
@@ -542,6 +574,11 @@ class RosCallerMonitor(_AsyncMonitor):
         except (AttributeError, TypeError, ValueError):
             return False
 
+    def _command_sample_current(self, sample):
+        generation = getattr(self.backend, 'graph_generation', None)
+        return (self._relay_alive() and
+                (not callable(generation) or sample.get('graph_generation') == generation()))
+
     def bind_relay(self, relay):
         try:
             process = relay.transport.process
@@ -563,6 +600,8 @@ class RosCallerMonitor(_AsyncMonitor):
                 self._terminal_reason = None
                 self._terminal_details = None
                 self._confirmed = True
+                if self._read() is not None:
+                    self._publish_command_deadline(self.clock.now(), _monotonic())
             return True
         except (AttributeError, TypeError, ValueError):
             return False
@@ -633,6 +672,8 @@ class SerialOwnershipMonitor(_AsyncMonitor):
             return False
         with self._lock:
             self._confirmed = True
+            if self._read() is not None:
+                self._publish_command_deadline(self.clock.now(), _monotonic())
         return True
 
     def verify(self):
