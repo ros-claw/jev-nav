@@ -1,0 +1,85 @@
+--- a/sdk/include/help_info.h
++++ b/sdk/include/help_info.h
+@@ -35,4 +35,5 @@
+ 
+ #include <ydlidar_protocol.h>
++#include <cstdio>
+ #include <map>
+ 
+@@ -678,5 +679,5 @@
+       isValidValue(info.W1F6GNoise_W1F5SNoise_W1F4MotorCtl_W4F0SnYear) &&
+       isValidValue(info.W7F0SnNumH) &&
+-      isValidValue(info.W7F0SnNumH)) {
++      isValidValue(info.W7F0SnNumL)) {
+     ret = true;
+   }
+@@ -709,12 +710,10 @@
+       value.hardware_version = hardwareVer;
+       value.model = lidarmodel;
+-      uint32_t year = Year + 2015;
+-      sprintf(reinterpret_cast<char *>(value.serialnum), "%04d", year);
+-      sprintf(reinterpret_cast<char *>(value.serialnum + 4), "%02d", Moth);
+-      sprintf(reinterpret_cast<char *>(value.serialnum + 6), "%02d", Date);
+-      sprintf(reinterpret_cast<char *>(value.serialnum + 8), "%08d", Number);
+-
+-      for (int i = 0; i < 16; i++) {
+-        value.serialnum[i] -= 48;
++      char serial[sizeof(value.serialnum) + 1];
++      const int length = std::snprintf(serial, sizeof(serial), "%04u%02u%02u%08u",
++          unsigned(Year + 2015), unsigned(Moth), unsigned(Date), unsigned(Number));
++      if (length != int(sizeof(value.serialnum))) return false;
++      for (size_t i = 0; i < sizeof(value.serialnum); ++i) {
++        value.serialnum[i] = serial[i] - '0';
+       }
+ 
+--- a/sdk/src/CYdLidar.cpp
++++ b/sdk/src/CYdLidar.cpp
+@@ -343,4 +343,5 @@
+ 
+   LaserDebug debug;
++  memset(&debug, 0xff, sizeof(debug));
+   debug.MaxDebugIndex = 0;
+ 
+@@ -352,4 +353,8 @@
+ 
+   if (ParseLaserDebugInfo(debug, info)) {
++    printf("[YDLIDAR] Single-channel debug capabilities: model %u, glass %u, sunlight %u\n",
++           unsigned(info.model),
++           unsigned((debug.W1F6GNoise_W1F5SNoise_W1F4MotorCtl_W4F0SnYear >> 6) & 1),
++           unsigned((debug.W1F6GNoise_W1F5SNoise_W1F4MotorCtl_W4F0SnYear >> 5) & 1));
+     if (info.firmware_version != 0 ||
+         info.hardware_version != 0) {
+--- a/tests/run_candidate_tests.sh
++++ b/tests/run_candidate_tests.sh
+@@ -22,5 +22,5 @@
+   -Wl,--wrap=_ZN7ydlidar13YDlidarDriver12grabScanDataEP9node_infoRmj \
+   -Wl,--wrap=_ZNK7ydlidar13YDlidarDriver10isscanningEv -pthread -lrt -o "$test_dir/sdk_points"
+-for scenario in under over boundaries empty; do "$test_dir/sdk_points" "$scenario"; done
++for scenario in under over boundaries empty metadata; do "$test_dir/sdk_points" "$scenario"; done
+ 
+ g++ -std=c++11 -I/opt/ros/melodic/include tests/test_laserscan_serialization.cpp \
+--- a/tests/test_sdk_points.cpp
++++ b/tests/test_sdk_points.cpp
+@@ -6,4 +6,5 @@
+ #include "CYdLidar.h"
+ #undef private
++#include "help_info.h"
+ 
+ static std::vector<node_info> synthetic_nodes;
+@@ -37,4 +38,16 @@
+ int main(int argc, char **argv) {
+   const std::string chosen = argc > 1 ? argv[1] : "under";
++  if (chosen == "metadata") {
++    LaserDebug debug = {0x12, 0x19, 0x22, 8, 23, 0x49, 1, 2, 9};
++    device_info info = {};
++    require(ydlidar::ParseLaserDebugInfo(debug, info), "complete firmware metadata was rejected");
++    std::string serial;
++    for (uint8_t digit : info.serialnum) serial += static_cast<char>('0' + digit);
++    require(serial == "2024082300000130", "decoded serial must retain all sixteen digits");
++    debug.W7F0SnNumL = 0xff;
++    require(!ydlidar::ParseLaserDebugInfo(debug, info), "missing serial fragment must not parse");
++    std::cout << "SDK point checks passed: " << chosen << std::endl;
++    return 0;
++  }
+   ydlidar::YDlidarDriver driver;
+   CYdLidar laser;
