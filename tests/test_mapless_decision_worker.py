@@ -1,5 +1,7 @@
 import base64
 import importlib.util
+import socket
+import urllib.error
 from pathlib import Path
 
 path = Path(__file__).resolve().parents[1] / "worker" / "limo_mapless_decision.py"
@@ -88,3 +90,22 @@ def test_forward_trial_only_offers_forward_or_stop_and_preserves_stop():
     assert reply("forward")["ok"]
     assert reply("stop") == {"choice": "stop", "captured_at": 100.0, "ok": True}
     assert not reply("left")["ok"]
+
+
+def test_transport_failures_return_only_sanitized_classification():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+    }
+    for error, label in (
+        (socket.timeout("secret socket message"), "DecisionsTimeout"),
+        (urllib.error.HTTPError("https://example.invalid/private", 429, "secret response", None, None),
+         "DecisionsHttp429"),
+    ):
+        def transport(*_):
+            raise error
+        assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0) == {
+            "choice": "stop", "ok": False, "error_class": label,
+        }

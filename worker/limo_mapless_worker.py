@@ -496,7 +496,7 @@ def relay_exit_reason(relay):
     return "controller_parent_or_relay_lost"
 
 
-def run_decision_process(command, evidence, cancelled, clock, timeout=6.0):
+def run_decision_process(command, evidence, cancelled, clock, timeout=6.0, diagnostics=False):
     """Bound helper wall time and reap it on shutdown or timeout."""
     payload = json.dumps(evidence, allow_nan=False).encode("utf-8")
     if len(payload) > 3 * 1024 * 1024 or cancelled():
@@ -518,14 +518,23 @@ def run_decision_process(command, evidence, cancelled, clock, timeout=6.0):
             if process.poll() is None:
                 process.kill()
             process.wait()
+            if diagnostics and not cancelled():
+                return {"ok": False, "error_class": "DecisionProcessTimeout"}
             return None
-        if cancelled() or clock() >= deadline or process.returncode != 0:
+        if cancelled():
+            return None
+        if clock() >= deadline:
+            return {"ok": False, "error_class": "DecisionProcessTimeout"} if diagnostics else None
+        if process.returncode != 0 and not (diagnostics and process.returncode == 1):
             return None
         sink.seek(0)
         output = sink.read(65537)
         if len(output) > 65536:
             return None
-        return json.loads(output)
+        answer = json.loads(output)
+        if process.returncode != 0 and (not isinstance(answer, dict) or answer.get("ok") is not False):
+            return None
+        return answer
 
 
 def _metadata(message):

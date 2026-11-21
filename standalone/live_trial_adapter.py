@@ -401,6 +401,9 @@ class DecisionsAdapter(object):
             if (not isinstance(result, dict) or result.get("ok") is not True
                     or result.get("captured_at") != payload["captured_at"]
                     or result.get("choice") not in choices):
+                error = result.get('error_class') if isinstance(result, dict) else None
+                if isinstance(error, checks.STRING_TYPES) and re.match(r'\A[A-Za-z_][A-Za-z0-9_]{0,63}\Z', error):
+                    rejected['error_class'] = str(error)
                 return rejected
             return {"ok": True, "choice": result["choice"], "observation_id": evidence["observation_id"]}
         except Exception as exc:
@@ -417,7 +420,7 @@ class ExistingDecisionHelper(object):
         from explore import WORKER, run_decision_process
         command = ["/usr/bin/python3", os.path.join(WORKER, "limo_mapless_decision.py")]
         return run_decision_process(command, payload, cancelled=self.cancelled,
-                                    clock=self.clock.now, timeout=timeout)
+                                    clock=self.clock.now, timeout=timeout, diagnostics=True)
 
 
 def relay_ready_line(motion_limit_sec):

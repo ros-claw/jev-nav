@@ -16,6 +16,17 @@ def module():
         pytest.fail("live adapter candidate is not implemented", pytrace=False)
 
 
+@pytest.mark.parametrize('label,recorded', [
+    (u'DecisionsHttp429', 'DecisionsHttp429'), (u'DecisionsTimeout\n', None),
+])
+def test_model_helper_failure_only_reports_safe_diagnostics(label, recorded):
+    mod = module()
+    bound = mod.make_evidence(source(Clock())[0].snapshot())
+    adapter = mod.DecisionsAdapter(lambda *_: {'ok': False, 'error_class': label})
+    decision = adapter.decide(bound)
+    assert decision['ok'] is False and decision.get('error_class') == recorded
+
+
 class Obj(object):
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)

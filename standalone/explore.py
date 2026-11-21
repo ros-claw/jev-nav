@@ -56,7 +56,7 @@ except NameError:
     INTEGER_TYPES = (int,)
 NUMBER_TYPES = INTEGER_TYPES + (float,)
 LATEST_INPUT_MAX_AGE_SEC = 0.15
-CompletedDepth = collections.namedtuple('CompletedDepth', 'epoch frame info extrinsics config projection')
+CompletedDepth = collections.namedtuple('CompletedDepth', 'epoch frame info extrinsics config projection verdict')
 
 
 def _valid_epoch(value):
@@ -995,14 +995,15 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                                                               extrinsics[:3], rotation)
                             self.depth_preprojection_counts['processed' if prepared is not None else 'unavailable'] += 1
                             if prepared is not None:
-                                completed = CompletedDepth(epoch, depth, info, extrinsics, key[-1], prepared)
+                                checked_at = _monotonic()
+                                candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': prepared}}
+                                verdict = ProjectedDepthGate().assess(candidate, checked_at)
+                                completed = CompletedDepth(epoch, depth, info, extrinsics, key[-1], prepared, verdict)
                                 split = getattr(self, '_split_validation', None)
-                                if split is not None:
-                                    checked_at = _monotonic()
-                                    if epoch == self.epoch and 0 <= checked_at - stamp < LATEST_INPUT_MAX_AGE_SEC:
-                                        candidate = {'depth_at': stamp, 'depth': {'stamp': stamp, 'corridor': prepared}}
-                                        if ProjectedDepthGate().assess(candidate, checked_at)['reason'] == 'depth_obstacle':
-                                            split.note_depth_obstacle()
+                                if (split is not None and epoch == self.epoch
+                                        and 0 <= checked_at - stamp < LATEST_INPUT_MAX_AGE_SEC
+                                        and verdict['reason'] == 'depth_obstacle'):
+                                    split.note_depth_obstacle()
                                 prior = getattr(self, '_completed_depth_frames', ())
                                 self._completed_depth_frames = (completed,) + prior[:2]
                                 self._depth_ready.set()
@@ -1112,16 +1113,17 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 distance, angle = _pose_delta(aligned['pose'], pose)
                 if not _finite(distance) or not _finite(angle) or distance > 0.01 or angle > 0.02:
                     return False
-            trans = self.depth_extrinsics[:3]
-            rotation = self.tf.transformations.quaternion_from_euler(*self.depth_extrinsics[3:])
             cached_only = getattr(self, '_prepared_depth_only', False)
             completed = getattr(self, '_split_completed_depth', None)
             if completed is not None and completed.frame is depth:
-                corridor = completed.projection
-            else:
-                corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation,
-                                                  cache_only=cached_only)
-            if cached_only and corridor is None and completed is None:
+                self.depth_preprojection_counts['cache_hit'] += 1
+                self._depth_obstacle_detected = completed.verdict['reason'] == 'depth_obstacle'
+                return completed.verdict['candidate'] is True
+            trans = self.depth_extrinsics[:3]
+            rotation = self.tf.transformations.quaternion_from_euler(*self.depth_extrinsics[3:])
+            corridor = self._depth_projection(image, info, stamp, self.epoch, trans, rotation,
+                                              cache_only=cached_only)
+            if cached_only and corridor is None:
                 # This is the perception worker, not the command thread. Let
                 # the depth producer finish this exact frame without throwing
                 # away the valid scan work. The final generation and deadline

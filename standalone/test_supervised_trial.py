@@ -1,5 +1,10 @@
+import collections
+import math
+import threading
+
 import pytest
 from supervised_trial import (
+    ObservationRecorder,
     RealClock,
     make_relay,
     make_ros_monitor,
@@ -14,6 +19,34 @@ from supervised_trial import (
 def test_default_is_observation_only():
     args = parse_args([])
     assert args.execute is False and args.longer_forward is False
+    assert args.depth_sample_stride == 4
+
+
+def test_trajectory_records_heading_and_ros_acquisition_time():
+    def fields(**values):
+        return type('MessageFields', (), values)()
+
+    recorder = ObservationRecorder.__new__(ObservationRecorder)
+    recorder.clock = fields(now=staticmethod(lambda: 30.0))
+    recorder.lock = threading.Lock()
+    recorder.odometry, recorder.commands = collections.deque(), collections.deque()
+    orientation = fields(x=0., y=0., z=math.sqrt(.5), w=math.sqrt(.5))
+    pose = fields(position=fields(x=2., y=3.), orientation=orientation)
+    twist = fields(linear=fields(x=.01), angular=fields(z=.02))
+    stamp = fields(to_sec=staticmethod(lambda: 120.0))
+    recorder._odom(fields(pose=fields(pose=pose), twist=fields(twist=twist),
+                          header=fields(stamp=stamp, seq=8)))
+    trace = recorder.trial_trajectory(None, 29., 31.)
+    row = dict(zip(trace['odom_columns'], trace['odom'][0]))
+    assert row['at'] == 30. and row['ros_source_stamp_sec'] == 120. and row['ros_source_seq'] == 8
+    assert row['yaw_rad'] == pytest.approx(math.pi / 2.) and row['yaw_radps'] == .02
+    assert recorder.summary()['last_odom_speed_mps'] == .01
+
+
+def test_halving_depth_dimensions_can_keep_the_same_angular_sample_density():
+    assert parse_args(['--depth-sample-stride', '2']).depth_sample_stride == 2
+    with pytest.raises(SystemExit):
+        parse_args(['--depth-sample-stride', '8'])
 
 
 def test_longer_forward_trial_is_explicitly_selected():

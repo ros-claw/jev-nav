@@ -6,8 +6,10 @@ import json
 import math
 import os
 import re
+import socket
 import sys
 import time
+import urllib.error
 import urllib.request
 
 MAX_IMAGE_BYTES = 2_000_000
@@ -122,6 +124,13 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         if choice not in choices:
             return rejected
         return {"choice": choice, "captured_at": stamp, "ok": True}
+    except urllib.error.HTTPError as error:
+        return dict(rejected, error_class="DecisionsHttp{}".format(error.code))
+    except (socket.timeout, TimeoutError):
+        return dict(rejected, error_class="DecisionsTimeout")
+    except urllib.error.URLError as error:
+        label = "DecisionsTimeout" if isinstance(error.reason, socket.timeout) else "DecisionsConnectionError"
+        return dict(rejected, error_class=label)
     except Exception:  # noqa: BLE001 - model/network failures return an unavailable result
         return rejected
 

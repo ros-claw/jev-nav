@@ -47,6 +47,8 @@ def parse_args(argv=None):
                         help='submit checked commands directly to the independent relay process')
     parser.add_argument('--speed-mps', type=float, default=.02,
                         help='set the requested forward speed up to 0.02 m/s')
+    parser.add_argument('--depth-sample-stride', type=int, choices=(2, 4), default=4,
+                        help='sample every second or fourth depth pixel in each dimension')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -216,8 +218,15 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def _odom(self, message):
         try:
-            point, twist = message.pose.pose.position, message.twist.twist
-            item = (self.clock.now(), float(point.x), float(point.y), float(twist.linear.x))
+            received = self.clock.now()
+            pose, twist = message.pose.pose, message.twist.twist
+            point, orientation = pose.position, pose.orientation
+            x, y, z, w = orientation.x, orientation.y, orientation.z, orientation.w
+            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+            item = (received, point.x, point.y, twist.linear.x, yaw, twist.angular.z,
+                    message.header.stamp.to_sec(), message.header.seq)
+            if any(math.isnan(value) or math.isinf(value) for value in item + (x, y, z, w)):
+                return
             with self.lock:
                 self.odometry.append(item)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -227,6 +236,8 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
         try:
             caller = getattr(message, '_connection_header', {}).get('callerid')
             item = (self.clock.now(), float(message.linear.x), float(message.angular.z), caller)
+            if any(math.isnan(value) or math.isinf(value) for value in item[:3]):
+                return
             with self.lock:
                 self.commands.append(item)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -234,17 +245,20 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def summary(self):
         with self.lock:
-            return summarize_observations(list(self.odometry), [item[:3] for item in self.commands])
+            return summarize_observations([item[:4] for item in self.odometry],
+                                          [item[:3] for item in self.commands])
 
     def trial_summary(self, caller, started, ended):
         with self.lock:
-            return summarize_trial_observations(list(self.odometry), list(self.commands), caller, started, ended)
+            return summarize_trial_observations([item[:4] for item in self.odometry], list(self.commands),
+                                                caller, started, ended)
 
     def trial_trajectory(self, caller, started, ended):
         with self.lock:
             return {
                 'clock': 'host_monotonic_receipt',
-                'odom_columns': ['at', 'x_m', 'y_m', 'forward_mps'],
+                'odom_columns': ['at', 'x_m', 'y_m', 'forward_mps', 'yaw_rad', 'yaw_radps',
+                                 'ros_source_stamp_sec', 'ros_source_seq'],
                 'odom': [item for item in self.odometry if started <= item[0] <= ended],
                 'command_columns': ['at', 'forward_mps', 'yaw_radps'],
                 'commands': [item[:3] for item in self.commands
@@ -299,7 +313,7 @@ def run(args, projector=None, scan_validator=None):
         projection = {'forward_min_m': 0.18, 'forward_max_m': 1.0, 'half_width_m': 0.15,
                       'ground_z_m': args.ground_z, 'ground_tolerance_m': 0.025,
                       'obstacle_min_height_m': 0.03, 'obstacle_max_height_m': 0.4,
-                      'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': 4}
+                      'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': args.depth_sample_stride}
     observation = RosObservation(depth_projection_config=projection, depth_projector=projector,
                                  scan_validator=scan_validator, separate_model_camera=args.separate_model_camera)
     recorder = ObservationRecorder(clock)

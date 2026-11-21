@@ -152,7 +152,7 @@ def test_snapshot_uses_completed_depth_with_its_original_timestamp_and_calibrati
     observer.depth_extrinsics = (.1, 0., .1, 0., 0., 0.)
     observer.depth_projection_config = {'sample_stride': 4}
     completed = CompletedDepth(2, depth, calibration, observer.depth_extrinsics,
-                               (('sample_stride', 4),), {'stamp': depth['stamp']})
+                               (('sample_stride', 4),), {'stamp': depth['stamp']}, None)
     observer._completed_depth_frames = (completed,)
     current = {'depth': {'stamp': now}, 'info': calibration}
     assert observer._fresh_completed_depth(current, 2, now) is completed
@@ -162,6 +162,35 @@ def test_snapshot_uses_completed_depth_with_its_original_timestamp_and_calibrati
     assert observer._fresh_completed_depth(dict(current, info=None), 2, now) is None
     observer.depth_projection_config['sample_stride'] = 8
     assert observer._fresh_completed_depth(current, 2, now) is None
+
+
+@pytest.mark.parametrize('obstacle', [False, True])
+def test_completed_depth_reuses_the_verdict_only_with_original_alignment(obstacle):
+    from collections import Counter
+    from explore import CompletedDepth
+
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.depth_extrinsics = (0.,) * 6
+    observer.depth_projection_config = {'sample_stride': 4}
+    observer.depth_preprojection_counts = Counter()
+    message, header = Value(), Value()
+    header.frame_id = 'camera_depth_optical_frame'
+    message.header, message.width, message.height = header, 640, 480
+    info = {'stamp': now, 'message': message}
+    depth = {'stamp': now, 'message': message}
+    observer.latest['info'] = info
+    verdict = {'candidate': not obstacle, 'reason': 'depth_obstacle' if obstacle else 'sampled_depth_corridor'}
+    observer._split_completed_depth = CompletedDepth(2, depth, info, observer.depth_extrinsics,
+                                                     (('sample_stride', 4),), {}, verdict)
+    odom = observer.latest['odom']
+    assert observer._newest_depth_safe_locked(sample, depth, odom, now) is not obstacle
+    assert observer._depth_obstacle_detected is obstacle
+    assert observer.depth_preprojection_counts['cache_hit'] == 1
+    assert not observer._newest_depth_safe_locked(sample, depth, odom, now + .16)
+    observer.epoch += 1
+    assert not observer._newest_depth_safe_locked(sample, depth, odom, now)
+    assert observer.depth_preprojection_counts['cache_hit'] == 1
 
 
 def test_split_capture_uses_aligned_completed_depth_while_newer_frame_waits(monkeypatch):
@@ -184,7 +213,7 @@ def test_split_capture_uses_aligned_completed_depth_while_newer_frame_waits(monk
     observer.latest['info'] = info_entry
     observer._completed_depth_frames = tuple(
         explore.CompletedDepth(2, frame, info_entry, observer.depth_extrinsics,
-                               (('sample_stride', 4),), {'stamp': frame['stamp']})
+                               (('sample_stride', 4),), {'stamp': frame['stamp']}, None)
         for frame in (newer, old))
     monkeypatch.setattr(explore, '_monotonic', lambda: now)
     _, captured = observer._capture_split_input('depth', sample)
