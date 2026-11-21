@@ -73,6 +73,12 @@ def _timestamps_fresh(sample, now):
         return False
 
 
+def raw_laser_packet(scan, stamp):
+    return {"stamp": stamp, "frame_id": scan.header.frame_id, "angle_min": scan.angle_min,
+            "angle_increment": scan.angle_increment, "range_min": scan.range_min,
+            "range_max": scan.range_max, "time_increment": scan.time_increment, "ranges": list(scan.ranges)}
+
+
 def _raw_scan(sample, need_canonical=True, return_counts=False):
     """Validate and classify raw sensor-frame rays; retain unknown encodings."""
     try:

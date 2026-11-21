@@ -213,7 +213,7 @@ class ObservationAdapter(object):
             scan, color = sample["scan"], sample.get("color")
             result = {key: (value if self.take_scene_ownership else _copy_scene(value))
                       if key == "scene" else copy.deepcopy(value)
-                      for key, value in sample.items() if key not in ("scan", "color", "_scan_capture")}
+                      for key, value in sample.items() if key not in ("scan", "color", "_scan_capture", "_unfiltered_scan")}
             if "_scan_capture" in sample:
                 result["_scan_capture"] = sample["_scan_capture"]
             # These fields must come from the actual observation, never defaults.
@@ -222,10 +222,9 @@ class ObservationAdapter(object):
             result["state"]["control_mode"] = sample["state"]["control_mode"]
             if self._encode_images:
                 result["image_jpeg"] = self.jpeg_encoder(color)
-            result["raw_scan"] = {"stamp": sample["scan_at"], "frame_id": scan.header.frame_id,
-                                  "angle_min": scan.angle_min, "angle_increment": scan.angle_increment,
-                                  "range_min": scan.range_min, "range_max": scan.range_max,
-                                  "time_increment": scan.time_increment, "ranges": list(scan.ranges)}
+            result["raw_scan"] = checks.raw_laser_packet(scan, sample["scan_at"])
+            if '_unfiltered_scan' in sample:
+                result['_raw_scan_unfiltered'] = checks.raw_laser_packet(sample['_unfiltered_scan'], sample['scan_at'])
             if self.recheck_snapshot and not self.observation.is_current_sample(result):
                 self._set_snapshot_issue("current_after_copy")
                 return None
@@ -768,6 +767,11 @@ def _snapshot_without_depth_gate(sample, now, diagnostic=None, require_image=Tru
             stamps.append(sample["color_at"])
         if max(stamps) - min(stamps) > 0.25:
             return reject("sensor_skew")
+        if '_raw_scan_unfiltered' in sample:
+            reason, _ = checks._raw_scan(dict(sample, raw_scan=sample['_raw_scan_unfiltered']),
+                                         need_canonical=False, return_counts=True)
+            if reason is not None:
+                return reject('unfiltered_raw_scan', reason)
         reason, _ = checks._raw_scan(sample, need_canonical=False)
         if reason:
             return reject("raw_scan", reason)

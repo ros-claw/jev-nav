@@ -257,6 +257,8 @@ def test_stale_nonzero_intent_requests_zero_and_latches_without_refresh():
         assert relay.send_frame(relay.sequence + 1, stamp, 0.02, 0.0)
         wait_for(lambda: any(frame['linear'] > 0 for _, _, frame in transport.snapshot()))
         wait_for(lambda: not relay.healthy())
+        # The unhealthy state is published before the worker has written zero.
+        wait_for(lambda: relay.evidence['zero_write_completed'])
         writes = transport.snapshot()
         nonzero = [(at, frame) for at, _, frame in writes if frame['linear'] > 0]
         assert nonzero and all(frame['stamp'] < stamp + 0.18 for _, frame in nonzero)

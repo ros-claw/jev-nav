@@ -49,6 +49,8 @@ def parse_args(argv=None):
                         help='set the requested forward speed up to 0.02 m/s')
     parser.add_argument('--depth-sample-stride', type=int, choices=(2, 4), default=4,
                         help='sample every second or fourth depth pixel in each dimension')
+    parser.add_argument('--lidar-margin-filter', action='store_true',
+                        help='mark isolated extra-margin lidar returns unknown in a forward trial')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -78,6 +80,8 @@ def parse_args(argv=None):
     if not 0 < args.speed_mps <= .02:
         parser.error('--speed-mps must be between 0 and 0.02 m/s')
     if args.execute:
+        if args.lidar_margin_filter and not args.split_sensor_checks:
+            parser.error('live lidar margin filtering requires split sensor checks')
         digest = args.driver_sha256
         if (args.driver_pid is None or args.driver_pid <= 1
                 or not args.driver_exe or not args.driver_exe.startswith('/')
@@ -315,7 +319,8 @@ def run(args, projector=None, scan_validator=None):
                       'obstacle_min_height_m': 0.03, 'obstacle_max_height_m': 0.4,
                       'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': args.depth_sample_stride}
     observation = RosObservation(depth_projection_config=projection, depth_projector=projector,
-                                 scan_validator=scan_validator, separate_model_camera=args.separate_model_camera)
+                                 scan_validator=scan_validator, separate_model_camera=args.separate_model_camera,
+                                 filter_lidar_margin=args.lidar_margin_filter)
     recorder = ObservationRecorder(clock)
     source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
                                 projection_only_after_model=True, recheck_snapshot=False,

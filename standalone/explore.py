@@ -40,6 +40,7 @@ if WORKER not in sys.path:
 from limo_mapless_worker import run_decision_process, summarize_forward_view
 import limo_scan_fusion as _fusion_module
 from limo_scan_fusion import RollingScanFusion
+from lidar_margin_filter import isolated_margin_bins
 from observation_guards import ClockGuard, OdomGuard, sensors_aligned
 from policy import ForwardPolicy, assess_front
 from projected_depth_gate import ProjectedDepthGate, project_depth_frame
@@ -581,7 +582,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     """Read ROS sensors directly; this object never creates a velocity publisher."""
 
     def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None, scan_validator=None,
-                 separate_model_camera=False):
+                 separate_model_camera=False, filter_lidar_margin=False):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -605,6 +606,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self._depth_projector = depth_projector
         self._scan_validator = scan_validator
         self._separate_model_camera = separate_model_camera
+        self._filter_lidar_margin = filter_lidar_margin
+        self._lidar_filtered_frames = self._lidar_filtered_bins = 0
         self._color_type = Image
         self._color_subscription = None
         self._depth_projections = collections.deque(maxlen=4)
@@ -707,6 +710,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self.epoch += 1
                     self.epoch_issue = {'reason': 'sensor_time_regression', 'sensor': name}
                     return
+                if name == 'scan' and getattr(self, '_filter_lidar_margin', False):
+                    self._filter_scan_entry(entry, previous)
                 generations = getattr(self, '_sensor_generations', None)
                 if generations is not None and name in generations:
                     generations[name] += 1
@@ -730,6 +735,57 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 self.epoch += 1
                 self.epoch_issue = {'reason': 'callback_invalid', 'sensor': name}
             return
+
+    def _filter_scan_entry(self, entry, previous):
+        scan = entry['message']
+        entry['epoch'] = self.epoch
+        aligned = nearest_odometry(itertools.islice(reversed(self.odom_history), 24), entry['stamp'])
+        if aligned is None or aligned.get('epoch') != self.epoch:
+            return
+        pose = aligned['pose']
+        entry['filter_pose'] = pose
+        if (previous is None or previous.get('epoch') != self.epoch or self.fusion_epoch != self.epoch
+                or self.extrinsics is None or not .04 <= entry['stamp'] - previous['stamp'] <= .18
+                or 'filter_pose' not in previous):
+            return
+        prior = previous.get('raw_message', previous['message'])
+        if (scan.header.frame_id != prior.header.frame_id or scan.header.frame_id.lstrip('/') != 'laser_link'
+                or (scan.header.seq - prior.header.seq) % 4294967296 != 1):
+            return
+        travel, turn = _pose_delta(previous['filter_pose'], pose)
+        if travel > .004 or turn > .005:
+            return
+        bins = isolated_margin_bins(scan, prior, self.extrinsics)
+        if bins:
+            filtered = copy.copy(scan)
+            filtered.ranges = list(scan.ranges)
+            stamp = entry['stamp']
+            retained = [hit for hit in getattr(self, '_lidar_margin_returns', ())
+                        if hit[0] == self.epoch and 0 <= stamp - hit[1] <= .65]
+            c, s = math.cos(pose[2]), math.sin(pose[2])
+            for index in bins:
+                filtered.ranges[index] = float('nan')
+                angle = scan.angle_min + index * scan.angle_increment + self.extrinsics[5]
+                distance = scan.ranges[index]
+                x = self.extrinsics[0] + distance * math.cos(angle)
+                y = self.extrinsics[1] + distance * math.sin(angle)
+                retained.append((self.epoch, stamp, pose[0] + c * x - s * y, pose[1] + s * x + c * y))
+            self._lidar_margin_returns = tuple(retained)
+            entry['message'], entry['raw_message'] = filtered, scan
+            self._lidar_filtered_frames += 1
+            self._lidar_filtered_bins += len(bins)
+
+    def _recent_margin_hit_in_core(self, pose, now):
+        # A tentative outlier can still veto if subsequent motion puts its
+        # position in the central corridor before the same raw history expires.
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        for epoch, stamp, x, y in getattr(self, '_lidar_margin_returns', ()):
+            if epoch != self.epoch or not 0 <= now - stamp <= .65:
+                continue
+            dx, dy = x - pose[0], y - pose[1]
+            if -.004 <= c * dx + s * dy <= .604 and abs(-s * dx + c * dy) <= .154:
+                return True
+        return False
 
     def snapshot(self):
         """Take aligned observations, independently of model/network activity."""
@@ -890,6 +946,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 result.update({"image_pose": image_pose["pose"], "color": color, "color_at": current["color"]["stamp"]})
             if getattr(self, '_split_validation', None) is not None:
                 result['_scan_capture'] = (current['scan'], self.extrinsics)
+            if 'raw_message' in current['scan']:
+                result['_unfiltered_scan'] = current['scan']['raw_message']
             return result
         except Exception as exc:  # noqa: BLE001 - missing/invalid observation cannot authorize motion
             # Record only the exception type, never sensor values or exception text.
@@ -1145,6 +1203,16 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         """Reuse a scan assessment only for the same owned scene and poses."""
         try:
             self._scan_veto_issue = None
+            if 'raw_message' in scan:
+                from forward_trial import _raw_scan, raw_laser_packet
+                reason, _ = _raw_scan({'raw_scan': raw_laser_packet(scan['raw_message'], scan['stamp']),
+                                       'scan_at': scan['stamp'], 'pose': odom['pose'],
+                                       'laser_extrinsics': self.extrinsics[:2] + (self.extrinsics[5],),
+                                       'scene': {'coverage': {'scan_pose': aligned['pose']}}},
+                                      need_canonical=False, return_counts=True)
+                if reason is not None:
+                    self._scan_veto_issue = reason
+                    return False
             worker = getattr(self, '_scan_validator', None)
             if worker is not None:
                 verdict = worker.check(self.epoch, self.extrinsics, sample, scan, aligned, odom, now)
@@ -1541,6 +1609,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     self._checked_split_base = (odom, status, base_ready)
             if not base_ready:
                 return None, 'base_state'
+            if getattr(self, '_lidar_margin_returns', ()) and self._recent_margin_hit_in_core(odom['pose'], now):
+                return None, 'front_blocked'
             return deadline, None
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return None, 'malformed'
@@ -1859,6 +1929,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             return {"epoch": self.epoch, "clock_fault": self.clock_guard.fault_reason,
                     "odom_fault": self.odom_guard.fault_reason, "sensor_ages_sec": ages,
                     "epoch_issue": getattr(self, 'epoch_issue', None),
+                    "lidar_filtered_frames": getattr(self, '_lidar_filtered_frames', 0),
+                    "lidar_filtered_bins": getattr(self, '_lidar_filtered_bins', 0),
                     "snapshot_issue": getattr(self, "snapshot_last_issue", None)}
 
 
