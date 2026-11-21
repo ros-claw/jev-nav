@@ -667,6 +667,18 @@ def test_relay_adapter_uses_one_writer_and_requests_zero_on_shutdown():
     assert relay.evidence["physical_stop_verified"] is False
 
 
+def test_shutdown_preserves_already_observed_child_fault():
+    mod = module()
+    clock = Clock()
+    transport = Transport()
+    relay = mod.RelayAdapter(transport, clock)
+    assert relay.arm(.3)
+    transport.ready = b'FAULT intent_deadline\n'
+    assert not relay.healthy()
+    assert relay.stop_and_latch()
+    assert relay.evidence['stop_line'] == b'FAULT intent_deadline\n'
+
+
 def test_longer_forward_relay_requires_explicit_matching_deadline():
     mod = module()
     clock = Clock()
@@ -889,7 +901,8 @@ def test_background_sampler_starts_after_first_relay_pipe_write(monkeypatch):
     assert events == ['written', 'sampler']
 
 
-def test_warm_split_start_builds_a_replacement_before_any_motion_submission():
+@pytest.mark.parametrize('short_window,fixed_monitor', [(None, False), (.04, False), (.012, False), (None, True)])
+def test_warm_split_start_builds_a_replacement_before_any_motion_submission(short_window, fixed_monitor):
     import time
     from relay import _monotonic
     mod = module()
@@ -914,10 +927,13 @@ def test_warm_split_start_builds_a_replacement_before_any_motion_submission():
     def prepare(sample):
         if not relay.had_motion:
             prepared_while_stopped.append(sample)
-        return {'valid_until': clock.now() + .065}, None
+        return {'valid_until': clock.now() + .13}, None
 
     def read(sample):
         assert sample is not seeded[0]
+        if short_window is not None and relay.had_motion:
+            reduced = clock.now() + short_window
+            return min(reduced, sample['_command_evidence']['valid_until']), None
         return sample['_command_evidence']['valid_until'], None
 
     adapter.seed_split_validation = seed
@@ -925,12 +941,38 @@ def test_warm_split_start_builds_a_replacement_before_any_motion_submission():
     adapter.read_command_evidence = read
     model = mod.DecisionsAdapter(lambda payload, timeout: {
         'ok': True, 'choice': 'forward', 'captured_at': payload['captured_at']})
-    result = mod.PreparedLongerForwardTrial(adapter, model, relay, FakeArbiter(), clock, enable_motion=True,
-                                           duration_sec=.5, period_sec=.02, serial_guard=FakeSerialGuard()).run()
+    class Trial(mod.DirectPreparedLongerForwardTrial):
+        CALLER_ZERO_HEARTBEATS = False
+        APPLY_SHORTER_DEADLINES = short_window is not None
+        SOURCE_ANCHOR_DEADLINE = fixed_monitor
+
+    arbiter = FakeArbiter()
+    if fixed_monitor:
+        deadline = [0.0]
+
+        def monitor_valid_until():
+            now = clock.now()
+            if deadline[0] < now + .02:
+                deadline[0] = now + .07
+            return deadline[0]
+
+        arbiter.valid_until = monitor_valid_until
+    result = Trial(adapter, model, relay, arbiter, clock, enable_motion=True,
+                   duration_sec=.5, period_sec=.02, serial_guard=FakeSerialGuard()).run()
     moving = [item for item in result['renewal_checks'] if item['submitted']]
     assert seeded and prepared_while_stopped and moving
     assert moving[0]['sample_at'] in [item['snapshot_at'] for item in prepared_while_stopped]
     assert moving[0]['valid_until'] <= moving[0]['limits']['latest_sensors']
+    assert moving[0]['limits']['trial'] == pytest.approx(moving[0]['checked_at'] + .5, abs=.005, rel=0)
+    assert moving[1]['limits']['trial'] == moving[0]['checked_at'] + .5
+    assert 'relay' not in moving[1]['limits']
+    if short_window is not None:
+        assert moving[1]['valid_until'] < moving[0]['valid_until']
+        assert moving[1]['valid_until'] <= moving[1]['checked_at'] + short_window
+    if fixed_monitor:
+        assert moving[0]['valid_until'] == moving[0]['limits']['ros_monitor']
+        deadlines = [item['valid_until'] for item in moving]
+        assert len(deadlines) == len(set(deadlines))
 
 
 def test_guarded_trial_prepares_a_validated_sample_before_first_motion(monkeypatch):
@@ -1641,16 +1683,25 @@ def test_relay_process_transport_uses_bounded_fake_pipes_and_exact_command():
         arguments.append(command)
         return process
     transport = mod.RelayProcessTransport(Clock(), popen=fake_popen)
+    writer_open = True
     try:
         transport.start(0.3)
         os.write(incoming_w, b"READY motion_limit_sec=0.300000\n")
         assert transport.read_line(0.1) == b"READY motion_limit_sec=0.300000\n"
+        assert transport.check_status() is None
+        os.write(incoming_w, b'FAULT intent_deadline\n')
+        assert transport.check_status() == b'FAULT intent_deadline\n'
         assert transport.write_line(b"synthetic\n", 0.1)
         assert os.read(outgoing_r, 20) == b"synthetic\n"
         assert arguments[0][-2:] == ["--max-motion-sec", "0.300000"]
+        os.close(incoming_w)
+        writer_open = False
+        with pytest.raises(IOError, match='status pipe closed'):
+            transport.check_status()
     finally:
         transport.close()
-        os.close(incoming_w)
+        if writer_open:
+            os.close(incoming_w)
         os.close(outgoing_r)
 
 

@@ -147,6 +147,35 @@ def test_staged_proof_validation_does_not_block_active_proof():
     assert outcome == [(('staged', 'staged'), None)]
 
 
+def test_staged_proof_can_wait_until_its_source_deadline():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def check(stream, _sample, value):
+        if stream == 'depth':
+            entered.set()
+            assert release.wait(.4)
+        return value, None
+
+    workers = SplitSensorValidation(
+        lambda stream, _: (1, stream), check,
+        lambda _sample, scan, depth, **_: ((scan, depth), None),
+        anchor_deadline=lambda sample: sample['expires'])
+    sample = {'snapshot_at': _monotonic(), 'expires': _monotonic() + .4}
+    outcome = []
+    preparation = threading.Thread(target=lambda: outcome.append(workers.prepare(sample, budget=None)))
+    try:
+        preparation.start()
+        assert entered.wait(.20)
+        preparation.join(.09)
+        assert preparation.is_alive()
+    finally:
+        release.set()
+        preparation.join(.5)
+        assert workers.close()
+    assert outcome == [(('scan', 'depth'), None)]
+
+
 def test_projected_obstacle_latches_before_a_newer_completed_frame_can_be_used():
     workers = SplitSensorValidation(
         lambda stream, _: (1, stream),

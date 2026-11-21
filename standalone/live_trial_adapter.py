@@ -12,6 +12,7 @@ from __future__ import division
 
 import collections
 import copy
+import ctypes
 import errno
 import fcntl
 import gc
@@ -32,6 +33,22 @@ from relay import _monotonic
 from split_sensor_validation import PENDING_PROOF
 
 _INITIAL_COVERAGE_PENDING = object()
+
+_PIPE_WRITE = ctypes.PyDLL(None, use_errno=True).write
+_PIPE_WRITE.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
+_PIPE_WRITE.restype = ctypes.c_ssize_t
+_PIPE_READ = ctypes.PyDLL(None, use_errno=True).read
+_PIPE_READ.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+_PIPE_READ.restype = ctypes.c_ssize_t
+
+
+def _write_nonblocking_pipe(fd, data):
+    """Keep the Python lock only across one bounded, nonblocking syscall."""
+    count = _PIPE_WRITE(fd, data, len(data))
+    if count < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return count
 
 
 def _copy_scene(scene):
@@ -436,6 +453,7 @@ class RelayProcessTransport(object):
         self.popen = popen if popen is not None else subprocess.Popen
         self.process = None
         self.buffer = b""
+        self._read_buffer = ctypes.create_string_buffer(513)
         self.exited = None
 
     def start(self, max_motion_sec):
@@ -458,25 +476,32 @@ class RelayProcessTransport(object):
         if self.process is None or not checks._finite(timeout) or not 0 <= timeout <= 3.5:
             raise ValueError("invalid relay read")
         deadline = self.clock.now() + timeout
+        fd = self.process.stdout.fileno()
         while True:
             if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
                 return line + b"\n"
             if len(self.buffer) > 512:
                 raise IOError("relay status line too long")
-            remaining = max(0.0, deadline - self.clock.now())
-            readable, _, _ = select.select([self.process.stdout.fileno()], [], [], remaining)
-            if not readable:
-                return None
-            try:
-                chunk = os.read(self.process.stdout.fileno(), 513)
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            if timeout:
+                remaining = max(0.0, deadline - self.clock.now())
+                readable, _, _ = select.select([fd], [], [], remaining)
+                if not readable:
                     return None
-                raise
-            if not chunk:
+            count = _PIPE_READ(fd, self._read_buffer, len(self._read_buffer))
+            if count < 0:
+                code = ctypes.get_errno()
+                if code in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return None
+                raise OSError(code, os.strerror(code))
+            if count == 0:
                 raise IOError("relay status pipe closed")
-            self.buffer += chunk
+            self.buffer += self._read_buffer[:count]
+
+    def check_status(self):
+        # The relay owns the only write end. EOF detects its exit without
+        # adding a second system call to each command renewal.
+        return self.read_line(0.0)
 
     def write_line(self, data, timeout):
         if (self.process is None or not isinstance(data, bytes) or len(data) > 512
@@ -487,7 +512,7 @@ class RelayProcessTransport(object):
         try:
             # Small nonblocking pipe writes are atomic. The common case needs
             # no writable poll, so it also avoids a second scheduler handoff.
-            return os.write(fd, data) == len(data)
+            return _write_nonblocking_pipe(fd, data) == len(data)
         except (OSError, IOError) as exc:
             if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 return False
@@ -498,7 +523,7 @@ class RelayProcessTransport(object):
         if not writable or self.clock.now() >= deadline:
             return False
         try:
-            return os.write(fd, data) == len(data)
+            return _write_nonblocking_pipe(fd, data) == len(data)
         except (OSError, IOError):
             return False
 
@@ -580,11 +605,12 @@ class RelayAdapter(object):
         if not self._owner() or not self.armed or self.faulted:
             return False
         try:
-            line = self.transport.read_line(0.0)
+            check_status = getattr(self.transport, 'check_status', None)
+            line = check_status() if callable(check_status) else self.transport.read_line(0.0)
             if line is not None:
                 self.evidence["stop_line"] = line
                 self.faulted = True
-            return not self.faulted and self.transport.alive() is True
+            return not self.faulted and (callable(check_status) or self.transport.alive() is True)
         except Exception:
             self.faulted = True
             return False
@@ -650,7 +676,7 @@ class RelayAdapter(object):
                 return False
             sent = self._write(self.sequence + 1, now, 0.0, 0.0, now + 0.19)
             self.evidence["zero_write_completed"] = sent
-            if sent:
+            if sent and self.evidence["stop_line"] is None:
                 try:
                     self.evidence["stop_line"] = self.transport.read_line(0.15)
                 except Exception:
@@ -694,13 +720,17 @@ def _depth_reason(sample):
     return None
 
 
-def _live_timestamps_fresh(sample, now, latest_odom_rechecked=False):
+def _live_timestamps_fresh(sample, now, latest_odom_rechecked=False, source_anchor=False):
     """Allow bounded processing latency; a waived odom age requires a live recheck before sending."""
     try:
         ages = {"snapshot_at": 0.25, "color_at": 0.5, "scan_at": 0.5,
                 "odom_at": 0.25, "status_at": 1.0, "depth_at": 0.5}
         if latest_odom_rechecked:
             del ages["odom_at"]
+        if source_anchor:
+            if not checks._finite(sample['snapshot_at']) or not sample['snapshot_at'] <= now:
+                return False
+            del ages['snapshot_at']
         if sample.get("motion_sensors_only") is True:
             del ages["color_at"]
         return isinstance(sample, dict) and all(checks._fresh(sample[name], now, age)
@@ -933,6 +963,9 @@ class LiveTrial(object):
     CALLER_ZERO_HEARTBEATS = False
     RENEWAL_LEAD_SEC = .015
     MIN_RENEWAL_WINDOW_SEC = .03
+    APPLY_SHORTER_DEADLINES = False
+    DURATION_AT_FIRST_MOTION = False
+    SOURCE_ANCHOR_DEADLINE = False
     IMMEDIATE_SYNC_SAMPLING = False
     DISTANCE_RESERVE_SEC = 0.0
     PREPARED_COMMANDS = False
@@ -1314,7 +1347,8 @@ class LiveTrial(object):
             # While still stationary, permit extra fresh-sample attempts.
             # Model freshness and every per-command expiry remain unchanged.
             pre_motion_retry_until = ready_at + 4.0
-            deadline = ready_at + self.duration_sec
+            deadline = (pre_motion_retry_until if self.DURATION_AT_FIRST_MOTION
+                        else ready_at + self.duration_sec)
             if not checks._finite(deadline) or deadline <= ready_at:
                 raise checks._StopError("clock_invalid")
             anchor = previous = current["pose"]
@@ -1323,6 +1357,7 @@ class LiveTrial(object):
             last_valid_until = None
             short_window_rechecked = False
             refresh_prepared = self.PREPARED_COMMANDS and self.source.updates_prepared_evidence()
+            source_anchor = refresh_prepared and self.SOURCE_ANCHOR_DEADLINE
             warm_split = refresh_prepared and getattr(self.source, 'warm_split_start', False) is True
             warm_seed = None
             initial_sample_used = None
@@ -1393,9 +1428,12 @@ class LiveTrial(object):
                     sampler_started = True
             while True:
                 now = self._now()
+                loop_started = now
+                staged_polled = None
                 if now >= deadline:
                     raise checks._StopError("time_limit")
-                if first_sent_at is not None and now >= first_sent_at + self.MOTION_LIMIT_SEC:
+                if (not self.DURATION_AT_FIRST_MOTION and first_sent_at is not None
+                        and now >= first_sent_at + self.MOTION_LIMIT_SEC):
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 if first_sent_at is None:
@@ -1457,11 +1495,15 @@ class LiveTrial(object):
                     # spend most of its odometry lifetime waiting here.
                     next_slot = max(last_sent_at + 0.005,
                                     min(last_sent_at + self.period_sec, last_valid_until - self.RENEWAL_LEAD_SEC))
-                    early_wait = max(0.0, next_slot - now - 0.005)
+                    wake_at = next_slot - .005
+                    if source_anchor:
+                        wake_at = max(last_sent_at + .005, wake_at)
+                    early_wait = max(0.0, wake_at - now)
                     if early_wait:
                         if refresh_prepared:
                             self.source.wait_for_prepared_evidence(early_wait)
-                            next_slot = min(next_slot, max(self._now(), last_sent_at + .012))
+                            if not source_anchor:
+                                next_slot = min(next_slot, max(self._now(), last_sent_at + .012))
                         else:
                             self.clock.sleep(early_wait)
                     pending = sampler.poll()
@@ -1484,6 +1526,7 @@ class LiveTrial(object):
                             current = candidate
                             self._last_depth_assessment = pending['assessment']
                     now = self._now()
+                    staged_polled = now
                 else:
                     # Do not capture the next sample immediately after a
                     # command: its short odometry lifetime would mostly be
@@ -1524,12 +1567,13 @@ class LiveTrial(object):
                 # Prepare the next checked observation while the previous
                 # command is active, then wait only for the remaining frame
                 # interval. Recheck the live inputs after any wait.
-                if last_sent_at is not None:
+                if last_sent_at is not None and not source_anchor:
                     now = self._now()
                     remaining = next_slot - now
                     if remaining > 0:
                         self.clock.sleep(remaining)
                 local_serial_limit = getattr(self.serial_guard, "local_command_deadline", None)
+                guards_started = self._now()
                 cached_guard_check = refresh_prepared and first_sent_at is not None and callable(local_serial_limit)
                 if not cached_guard_check:
                     if self.arbiter.verify() is not True:
@@ -1543,14 +1587,16 @@ class LiveTrial(object):
                 now = self._now()
                 if now >= deadline:
                     raise checks._StopError("time_limit")
-                if first_sent_at is not None and now >= first_sent_at + self.MOTION_LIMIT_SEC:
+                if (not self.DURATION_AT_FIRST_MOTION and first_sent_at is not None
+                        and now >= first_sent_at + self.MOTION_LIMIT_SEC):
                     raise checks._StopError("motion_limit")
                 self._model_fresh(sample, now)
                 # The final live-sensor check below is mandatory for every
                 # command, including the first. It validates the newer odom
                 # age and pose, so the older snapshot odom need not also be
                 # artificially capped while the full snapshot remains fresh.
-                if not _live_timestamps_fresh(current, now, latest_odom_rechecked=True):
+                if not _live_timestamps_fresh(current, now, latest_odom_rechecked=True,
+                                              source_anchor=source_anchor):
                     self._last_diagnostic = {"step": "motion_final_timestamps"}
                     if first_sent_at is None and now < pre_motion_retry_until:
                         self.clock.sleep(0.01)
@@ -1569,7 +1615,8 @@ class LiveTrial(object):
                 if last_sent_at is None and self.relay.last_stamp is not None and now == self.relay.last_stamp:
                     self.clock.sleep(0.001)
                     now = self._now()
-                    if now >= deadline or not _live_timestamps_fresh(current, now, latest_odom_rechecked=True):
+                    if now >= deadline or not _live_timestamps_fresh(
+                            current, now, latest_odom_rechecked=True, source_anchor=source_anchor):
                         raise checks._StopError("sensor_unavailable")
                     if (self.source.is_current_epoch(current["epoch"]) is not True
                             or self.source.is_current_sample(current) is not True):
@@ -1588,12 +1635,14 @@ class LiveTrial(object):
                     ros_limit = getattr(self.arbiter, "cached_command_deadline", ros_limit)
                     serial_limit = getattr(self.serial_guard, "cached_command_deadline", serial_limit)
                 limits = {"trial": deadline,
-                          "relay": proposed_first + self.MOTION_LIMIT_SEC,
                           "model_color": sample["color_at"] + checks.MODEL_MAX_AGE_SEC,
                           "model_scan": sample["scan_at"] + checks.MODEL_MAX_AGE_SEC,
-                          "snapshot": current["snapshot_at"] + 0.25,
                           "scan": current["scan_at"] + 0.5, "status": current["status_at"] + 1.0,
                           "depth": current["depth_at"] + 0.5}
+                if not source_anchor:
+                    limits['snapshot'] = current['snapshot_at'] + .25
+                if not self.DURATION_AT_FIRST_MOTION:
+                    limits['relay'] = proposed_first + self.MOTION_LIMIT_SEC
                 if current.get("motion_sensors_only") is not True:
                     limits["color"] = current["color_at"] + 0.5
                 gate_limit = self._last_depth_assessment.get(
@@ -1662,8 +1711,12 @@ class LiveTrial(object):
                             final_sensor_until, prepared_issue = self.source.read_command_evidence(current)
                         sensor_checked = self._now()
                     now = self._now()
+                    if self.DURATION_AT_FIRST_MOTION and first_sent_at is None:
+                        limits['trial'] = now + min(self.duration_sec, self.MOTION_LIMIT_SEC)
                     check = {"sample_at": current["snapshot_at"], "sensor_check_started_at": check_started,
                              "sensor_checked_at": sensor_checked, "checked_at": now,
+                             'loop_started_at': loop_started, 'staged_polled_at': staged_polled,
+                             'guards_started_at': guards_started,
                              "monitors_started_at": monitors_started,
                              "ros_monitor_checked_at": ros_monitor_checked,
                              "monitors_checked_at": monitors_checked,
@@ -1692,6 +1745,11 @@ class LiveTrial(object):
                             label = detail if isinstance(detail, str) and 0 < len(detail) <= 128 else 'unavailable'
                             reasons = result['initial_preparation']['sensor_rejections']
                             reasons[label] = reasons.get(label, 0) + 1
+                        if (self.APPLY_SHORTER_DEADLINES and last_valid_until is not None
+                                and detail in ('prepared_scan_advanced', 'prepared_depth_advanced')):
+                            # A new frame has no usable receipt-bound proof.
+                            # The previous lease can outlive this new cutoff.
+                            raise checks._StopError(detail)
                         if self.PREPARED_COMMANDS and not initial_split and (detail in PENDING_PROOF
                                 or first_sent_at is None and detail in ('new_scan', 'new_depth_unchecked')):
                             # Withhold a new command while waiting for a
@@ -1729,17 +1787,20 @@ class LiveTrial(object):
                         largest = result['initial_preparation']['largest_window_sec']
                         if checks._finite(window) and (largest is None or window > largest):
                             result['initial_preparation']['largest_window_sec'] = window
-                    if (refresh_prepared and last_valid_until is not None
+                    shorten = (self.APPLY_SHORTER_DEADLINES and last_valid_until is not None
+                               and valid_until < last_valid_until)
+                    unchanged = source_anchor and valid_until == last_valid_until
+                    if unchanged or (refresh_prepared and last_valid_until is not None
                             and now + .005 < last_valid_until
                             and valid_until <= last_valid_until
+                            and not shorten
                             and limiting in ("latest_sensors", "depth_gate", "snapshot",
                                              "scan", "depth", "color")):
-                        # A renewal with an earlier deadline would shorten
-                        # the live intent. Hold its original expiry while
-                        # waiting for genuinely newer checked evidence.
+                        # The relay already publishes this setpoint until its
+                        # deadline. Retry when an input can move that deadline.
                         timing = result["motion_timing"]
                         timing["nonadvancing_window_polls"] = timing.get("nonadvancing_window_polls", 0) + 1
-                        self.source.wait_for_prepared_evidence(.005)
+                        self.source.wait_for_prepared_evidence(min(.005, last_valid_until - now))
                         continue
                     if valid_until - now <= min_window:
                         if first_sent_at is None and 'initial_preparation' in result:
@@ -1750,6 +1811,8 @@ class LiveTrial(object):
                                                  "remaining_sec": valid_until - now}
                         if detail is not None:
                             self._last_diagnostic['detail'] = detail
+                        if shorten:
+                            raise checks._StopError('expiry_unavailable')
                         if (refresh_prepared and last_valid_until is not None
                                 and now + .005 < last_valid_until
                                 and limiting in ("latest_sensors", "depth_gate", "snapshot",
@@ -1808,6 +1871,8 @@ class LiveTrial(object):
                             raise checks._StopError(pending['reason'])
                     if first_sent_at is None:
                         first_sent_at = now
+                        if self.DURATION_AT_FIRST_MOTION:
+                            deadline = limits['trial']
                     result["motion_requested"] = True
                     if self.relay.send_frame(sequence, now, self.speed_mps, 0.0,
                                              valid_until=valid_until) is not True:
@@ -1938,12 +2003,15 @@ class PreparedLongerForwardTrial(LongerForwardTrial):
 class DirectPreparedLongerForwardTrial(PreparedLongerForwardTrial):
     """Take ownership of the zero-primed relay pipe before local motion."""
     CALLER_ZERO_HEARTBEATS = True
+    APPLY_SHORTER_DEADLINES = True
+    DURATION_AT_FIRST_MOTION = True
+    SOURCE_ANCHOR_DEADLINE = True
     # Rechecks under live sensor load have taken over 30 ms. Start checking
     # before the existing lease has that little time left to reach the relay.
     RENEWAL_LEAD_SEC = .035
-    # A direct write is bounded at 10 ms and the child still rejects an
-    # expired frame. Use short, advancing proofs without altering expiry.
-    MIN_RENEWAL_WINDOW_SEC = .018
+    # The pipe write is bounded by the remaining lease. The child rejects
+    # an expired frame, so no additional minimum is needed during motion.
+    MIN_RENEWAL_WINDOW_SEC = 0.0
 
 
 if __name__ == "__main__":

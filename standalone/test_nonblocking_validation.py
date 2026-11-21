@@ -111,6 +111,70 @@ def test_split_pending_frame_does_not_extend_prior_proof(monkeypatch):
     assert relay.command(deadline) == (0., 0.) and relay.reason == 'intent_deadline'
 
 
+def test_confirmed_depth_keeps_source_deadline_while_its_successor_is_pending(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    captured = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._use_source_deadlines = True
+    sample['scan_at'] = captured
+    sample['_front_coverage_valid_until'] = captured + .22
+    observer.latest['depth']['generation'] = 4
+    monkeypatch.setattr(explore, '_monotonic', lambda: captured)
+    monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', lambda *_: True)
+    _, scan_input = observer._capture_split_input('scan', sample)
+    _, depth_input = observer._capture_split_input('depth', sample)
+    scan, _ = observer._check_split_input('scan', sample, scan_input)
+    depth, _ = observer._check_split_input('depth', sample, depth_input)
+    # On the direct path the projected result can be read without recapturing
+    # the full observation.
+    monkeypatch.setattr(observer, '_uses_completed_depth', lambda: True)
+    def reject_capture(*args):
+        pytest.fail('command path recaptured a depth input')
+    monkeypatch.setattr(observer, '_capture_split_input', reject_capture)
+    proof, issue = observer._combine_split_proof(sample, scan, depth)
+    assert issue is None and proof['valid_until'] == captured + .15
+    monkeypatch.setattr(explore, '_monotonic', lambda: captured + .030)
+    assert observer.read_command_evidence(sample, proof, True) == (captured + .15, None)
+    observer.latest['depth'] = {'generation': 5, 'stamp': captured + .010, 'received_at': captured + .020}
+    until, issue = observer.read_command_evidence(sample, proof, True)
+    assert issue is None and until == captured + .15
+    monkeypatch.setattr(explore, '_monotonic', lambda: captured + .091)
+    assert observer.read_command_evidence(sample, proof, True) == (captured + .15, None)
+    observer.latest['depth']['generation'] = 6  # a missing receipt cannot authorize motion
+    assert observer.read_command_evidence(sample, proof, True) == (None, 'prepared_depth_advanced')
+    observer.latest['depth']['generation'] = 5
+    monkeypatch.setattr(explore, '_monotonic', lambda: captured + .150)
+    assert observer.read_command_evidence(sample, proof, True) == (None, 'prepared_depth_expired')
+
+
+def test_rechecked_geometry_expires_at_original_source_bound(monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._use_source_deadlines = True
+    sample.update(snapshot_at=now - .30, scan_at=now - .39, depth_at=now - .32,
+                  motion_sensors_only=True)
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    monkeypatch.setattr(RosObservation, '_newest_depth_safe_locked', lambda *_: True)
+
+    def check_scan(probe, *_):
+        probe._scan_veto_valid_until = now + .30
+        return True
+
+    monkeypatch.setattr(RosObservation, '_cached_newest_scan_safe_locked', check_scan)
+    _, scan_input = observer._capture_split_input('scan', sample)
+    _, depth_input = observer._capture_split_input('depth', sample)
+    scan, scan_issue = observer._check_split_input('scan', sample, scan_input)
+    depth, depth_issue = observer._check_split_input('depth', sample, depth_input)
+    assert scan_issue is None and depth_issue is None
+    proof, issue = observer._combine_split_proof(sample, scan, depth)
+    assert issue is None and proof['valid_until'] == sample['scan_at'] + .5
+    monkeypatch.setattr(explore, '_monotonic', lambda: proof['valid_until'])
+    assert observer.read_command_evidence(sample, proof, True) == (None, 'prepared_snapshot_expired')
+
+
 def test_split_worker_checks_owned_frame_after_new_depth_arrives(monkeypatch):
     import explore
     observer, sample = observer_and_sample()
@@ -195,11 +259,13 @@ def test_completed_depth_reuses_the_verdict_only_with_original_alignment(obstacl
 
 def test_split_capture_uses_aligned_completed_depth_while_newer_frame_waits(monkeypatch):
     import explore
+    from collections import Counter
     observer, sample = observer_and_sample()
     now = sample['snapshot_at']
     observer._depth_projector = observer._depth_worker = Value()
-    observer.depth_extrinsics = (0., 0., 0., 0., 0., 0.)
+    observer.extrinsics = observer.depth_extrinsics = (0., 0., 0., 0., 0., 0.)
     observer.depth_projection_config = {'sample_stride': 4}
+    observer.depth_preprojection_counts = Counter()
     observer.latest['odom']['stamp'] = now - .069
     observer.odom_history[0]['stamp'] = now - .069
     old = {'stamp': now - .068, 'received_at': now - .06, 'generation': 10}
@@ -211,17 +277,27 @@ def test_split_capture_uses_aligned_completed_depth_while_newer_frame_waits(monk
     info.header, info.width, info.height, info.K = header, 320, 240, (1.,) * 9
     info_entry = {'stamp': now - .011, 'message': info}
     observer.latest['info'] = info_entry
+    sample['depth_at'] = old['stamp']
+    verdict = {'candidate': True, 'reason': 'sampled_depth_corridor'}
     observer._completed_depth_frames = tuple(
         explore.CompletedDepth(2, frame, info_entry, observer.depth_extrinsics,
-                               (('sample_stride', 4),), {'stamp': frame['stamp']}, None)
+                               (('sample_stride', 4),), {'stamp': frame['stamp']}, verdict)
         for frame in (newer, old))
     monkeypatch.setattr(explore, '_monotonic', lambda: now)
     _, captured = observer._capture_split_input('depth', sample)
     assert captured[1] is old
     assert captured[3].projection['stamp'] == old['stamp']
+    checked, issue = observer._checked_completed_depth_part(sample, None)
+    assert issue is None and checked['entry'] is old and checked['expires'] == old['stamp'] + .15
     observer.odom_history.append({'stamp': now - .008, 'pose': (0., 0., 0.), 'epoch': 2})
     _, captured = observer._capture_split_input('depth', sample)
     assert captured[1] is newer
+    advanced, issue = observer._checked_completed_depth_part(sample, checked)
+    assert issue is None and advanced['entry'] is newer
+    sample['pose'] = (.012, 0., 0.)
+    assert observer._checked_completed_depth_part(sample, checked) == (None, 'new_depth_unchecked')
+    verdict.update(candidate=False, reason='depth_obstacle')
+    assert observer._checked_completed_depth_part(sample, checked) == (None, 'depth_obstacle')
 
 
 def test_split_worker_uses_published_odometry_while_ros_lock_is_held(monkeypatch):
@@ -318,6 +394,45 @@ def test_published_command_view_rechecks_one_concurrent_update(update, expected,
     assert len(checked) == (2 if update in ('fresh_odom', 'continuous') else 1)
     if len(checked) == 2:
         assert checked[0] is not checked[1]
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_republished_camera_info_only_rechecks_if_projection_changes(changed, monkeypatch):
+    import explore
+    observer, sample = observer_and_sample()
+    now = sample['snapshot_at']
+    sample['scan_at'] = now
+    observer.extrinsics = observer.depth_extrinsics = observer.depth_projection_config = None
+    observer._sensor_receipts = {}
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
+    original = Value()
+    original.header = Value()
+    original.header.frame_id = 'camera_depth_optical_frame'
+    original.width, original.height, original.K = 640, 400, (1.,) * 9
+    observer.latest['info'] = {'message': original, 'stamp': now - .01}
+    evidence, issue = observer.prepare_initial_command_evidence(sample)
+    assert issue is None
+    observer._publish_split_inputs()
+    checks = []
+    real_check = observer._check_command_view
+
+    def check(sample, evidence, pending, view):
+        result = real_check(sample, evidence, pending, view)
+        checks.append(True)
+        new = Value()
+        new.header, new.height, new.K = original.header, original.height, original.K
+        new.width = original.width - int(changed)
+        observer.latest['info'] = {'message': new, 'stamp': now}
+        observer._publish_split_inputs()
+        return result
+
+    monkeypatch.setattr(observer, '_check_command_view', check)
+    if changed:
+        assert observer.read_command_evidence(sample, evidence, nonblocking=True) == (None, 'camera_info_changed')
+        assert len(checks) == 2
+    else:
+        assert observer.read_command_evidence(sample, evidence, nonblocking=True) == (evidence['valid_until'], None)
+        assert len(checks) == 1
 
 
 def test_seeded_sensors_keep_their_individual_expiry(monkeypatch):

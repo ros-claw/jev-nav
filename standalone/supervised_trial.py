@@ -320,7 +320,8 @@ def run(args, projector=None, scan_validator=None):
                       'min_depth_m': 0.3, 'max_depth_m': 3.0, 'sample_stride': args.depth_sample_stride}
     observation = RosObservation(depth_projection_config=projection, depth_projector=projector,
                                  scan_validator=scan_validator, separate_model_camera=args.separate_model_camera,
-                                 filter_lidar_margin=args.lidar_margin_filter)
+                                 filter_lidar_margin=args.lidar_margin_filter,
+                                 use_source_deadlines=args.direct_relay_writes)
     recorder = ObservationRecorder(clock)
     source = ObservationAdapter(observation, CvJpegEncoder(observation.bridge), take_scene_ownership=True,
                                 projection_only_after_model=True, recheck_snapshot=False,

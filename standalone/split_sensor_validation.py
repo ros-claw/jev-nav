@@ -17,7 +17,7 @@ PENDING_PROOF = ('prepared_pending', 'prepared_scan_advanced', 'prepared_depth_a
                  'prepared_state_busy', 'prepared_scan_expired', 'prepared_depth_expired',
                  'prepared_snapshot_expired', 'prepared_state_expired', 'prepared_evidence_expired')
 
-def pending_sensor_deadline(latest, checked, now, max_age, history=()):
+def pending_sensor_deadline(latest, checked, now, max_age, history=(), receipt_timeout=.070):
     """Shorten a live proof using the complete, bounded receipt history."""
     if not latest or not checked:
         return None
@@ -35,16 +35,18 @@ def pending_sensor_deadline(latest, checked, now, max_age, history=()):
         if (not _number(stamp) or not _number(received) or not stamp_before < stamp <= received <= now
                 or received < receipt_before):
             return None
-        candidate = min(received + .070, stamp + max_age)
+        candidate = stamp + max_age
+        if receipt_timeout is not None:
+            candidate = min(candidate, received + receipt_timeout)
         deadline = candidate if deadline is None else min(deadline, candidate)
         stamp_before, receipt_before = stamp, received
     return deadline if now < deadline else None
 
 
 class _Anchor(object):
-    def __init__(self, sample, parts=None):
+    def __init__(self, sample, expires, parts=None):
         self.sample = sample
-        self.expires = sample['snapshot_at'] + .25
+        self.expires = expires
         self.parts = parts or {}
         self.generations = {}
         self.issue = None
@@ -96,8 +98,9 @@ class SplitSensorValidation(object):
     STOPS = ('new_scan', 'new_depth_unchecked', 'epoch_or_guard', 'transform_changed')
     LATCH = ('front_blocked', 'depth_obstacle', 'epoch_or_guard', 'transform_changed')
 
-    def __init__(self, capture, check, combine, completed_depth_on_read=False):
+    def __init__(self, capture, check, combine, completed_depth_on_read=False, anchor_deadline=None):
         self.capture, self.check, self.combine = capture, check, combine
+        self._anchor_deadline = anchor_deadline or (lambda sample: sample['snapshot_at'] + .25)
         self._cv = threading.Condition()
         self._anchors = (None, None)
         self._pending_commit = None
@@ -185,18 +188,20 @@ class SplitSensorValidation(object):
     def seed(self, sample, scan, depth):
         """Publish the already checked initial proof without changing expiry."""
         with self._cv:
-            self._anchors = (_Anchor(sample, {'scan': scan, 'depth': depth}), self._anchors[1])
+            self._anchors = (_Anchor(sample, self._anchor_deadline(sample), {'scan': scan, 'depth': depth}),
+                             self._anchors[1])
             self._wake_locked()
 
     def prepare(self, sample, budget=.075, scan_seed=None):
-        deadline = min(_monotonic() + budget, sample['snapshot_at'] + .25)
+        expires = self._anchor_deadline(sample)
+        deadline = expires if budget is None else min(_monotonic() + budget, expires)
         with self._cv:
             if self._closed or self._fault is not None:
                 return None, self._fault or 'split_worker_closed'
             self._promote_locked()
             if self._anchors[1] is not None and _monotonic() < self._anchors[1].expires:
                 return None, 'split_proof_pending'
-            anchor = _Anchor(sample, {'scan': scan_seed} if scan_seed is not None else None)
+            anchor = _Anchor(sample, expires, {'scan': scan_seed} if scan_seed is not None else None)
             self._anchors = (self._anchors[0], anchor)
             self._wake_locked()
         while True:
@@ -215,7 +220,8 @@ class SplitSensorValidation(object):
                 if remaining <= 0:
                     self._anchors = (self._anchors[0], None)
                     return None, 'split_proof_pending'
-                if proof is not None and (not isinstance(proof, dict) or proof['valid_until'] - _monotonic() > .035):
+                if proof is not None and (not isinstance(proof, dict)
+                        or proof['valid_until'] - _monotonic() > (0. if budget is None else .035)):
                     return proof, None
                 if proof is not None:
                     issue = 'prepared_pending'
