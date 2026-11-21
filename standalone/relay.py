@@ -21,6 +21,11 @@ The READY line then includes motion_limit_sec; the deadline latches zero even
 if fresh heartbeats continue. Scheduler stalls, transport, host failure and
 actual chassis braking can delay or prevent a physical stop.
 
+With --forward-navigation the READY line is ``READY forward_navigation``.
+The forward limit is 0.02 m/s. Zero is an ordinary setpoint and the local
+controller heartbeat still latches on disconnect. The trial deadline flags
+are reserved for the separate bounded trial protocol.
+
 The relay publishes /cmd_vel and subscribes to the candidate driver's
 /rosclaw_limo/command_watchdog (std_msgs/String v2); that topic name is a driver
 contract and does not require the ROSClaw service. Before READY it publishes
@@ -74,6 +79,8 @@ except NameError:
 HEARTBEAT_SEC = 0.2
 MAX_LINEAR = 0.05
 _MAX_LINEAR_DECIMAL = Decimal('0.05')
+MAX_NAV_LINEAR = .02
+_MAX_NAV_LINEAR_DECIMAL = Decimal('0.02')
 
 
 class _JSONFloat(float):
@@ -87,10 +94,13 @@ class _JSONFloat(float):
             raise ValueError('invalid JSON number')
 
 
-def _safe_velocity(linear, angular):
+def _safe_velocity(linear, angular, forward_navigation=False):
     exact_linear = linear.exact if isinstance(linear, _JSONFloat) else linear
     exact_angular = angular.exact if isinstance(angular, _JSONFloat) else angular
-    upper = _MAX_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_LINEAR
+    if forward_navigation:
+        upper = _MAX_NAV_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_NAV_LINEAR
+    else:
+        upper = _MAX_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_LINEAR
     return 0 <= exact_linear <= upper and exact_angular == 0
 
 
@@ -104,10 +114,11 @@ def _number(value):
 
 
 class RelayGate(object):
-    def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False):
+    def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False, forward_navigation=False):
         if (not _number(started_at) or (max_motion_sec is not None
                 and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))
-                or type(require_intent_deadline) is not bool):
+                or type(require_intent_deadline) is not bool or type(forward_navigation) is not bool
+                or forward_navigation and (max_motion_sec is not None or require_intent_deadline)):
             raise ValueError('invalid start time')
         self.last_at = float(started_at)
         self.last_stamp = None
@@ -120,6 +131,7 @@ class RelayGate(object):
         self.motion_started_at = None
         self.max_motion_sec = max_motion_sec
         self.require_intent_deadline = require_intent_deadline
+        self.forward_navigation = forward_navigation
         self.intent_deadline = None
 
     def stop(self, reason):
@@ -152,7 +164,7 @@ class RelayGate(object):
             valid = (0 <= now - self.last_at < HEARTBEAT_SEC and
                      0 <= now - frame['stamp'] < HEARTBEAT_SEC and
                      (self.last_stamp is None or frame['stamp'] > self.last_stamp) and
-                     _safe_velocity(frame['linear'], frame['angular']))
+                     _safe_velocity(frame['linear'], frame['angular'], self.forward_navigation))
         if valid and self.require_intent_deadline:
             expiry = frame['expires_at']
             valid = (_number(expiry) and frame['stamp'] < expiry <= frame['stamp'] + HEARTBEAT_SEC
@@ -170,7 +182,7 @@ class RelayGate(object):
             self.had_motion = True
             if self.motion_started_at is None:
                 self.motion_started_at = float(now)
-        elif self.had_motion:
+        elif self.had_motion and not self.forward_navigation:
             self.stop('requested_stop')
         return True
 
@@ -518,12 +530,11 @@ def _emit(fd, line):
         return False
 
 
-def main(max_motion_sec=None, require_intent_deadline=False):
+def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=False):
     """Run one session, using inherited pipe stdin and status messages on stdout."""
     global _stopping
     _stopping = False
-    if max_motion_sec is not None and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30):
-        raise ValueError('invalid motion deadline')
+    RelayGate(0., max_motion_sec, require_intent_deadline, forward_navigation)
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
@@ -594,10 +605,13 @@ def main(max_motion_sec=None, require_intent_deadline=False):
             fault, ready, armed, _, _, _, _ = shared.snapshot()
             if not fault and ready and not ready_sent:
                 gate = RelayGate(now, max_motion_sec=max_motion_sec,
-                                 require_intent_deadline=require_intent_deadline)
+                                 require_intent_deadline=require_intent_deadline,
+                                 forward_navigation=forward_navigation)
                 shared.arm(now)
                 ready_line = ('READY' if max_motion_sec is None else
                               'READY motion_limit_sec=%.6f' % max_motion_sec)
+                if forward_navigation:
+                    ready_line = 'READY forward_navigation'
                 if _emit(output_fd, ready_line):
                     ready_sent = True
                 else:
@@ -627,5 +641,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Bounded forward-only LIMO relay')
     parser.add_argument('--max-motion-sec', type=float, default=None)
     parser.add_argument('--require-intent-deadline', action='store_true')
+    parser.add_argument('--forward-navigation', action='store_true')
     arguments = parser.parse_args()
-    sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline))
+    if arguments.forward_navigation and (arguments.require_intent_deadline or arguments.max_motion_sec is not None):
+        parser.error('forward navigation and trial deadline flags are mutually exclusive')
+    sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline, arguments.forward_navigation))

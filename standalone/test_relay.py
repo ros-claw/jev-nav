@@ -21,6 +21,26 @@ except ImportError:  # Python 3.12 removed imp; ROS Melodic still uses Python 2.
 
 
 class GateTests(unittest.TestCase):
+    def test_navigation_can_pause_and_resume_until_a_controller_disconnect(self):
+        gate = relay.RelayGate(10.0, forward_navigation=True)
+        for sequence, linear in enumerate((0.0, 0.014, 0.0, 0.014, 0.02)):
+            now = 10.0 + sequence * .05
+            self.assertTrue(gate.accept({'sequence': sequence, 'stamp': now, 'linear': linear,
+                                         'angular': 0.0}, now))
+            self.assertEqual(gate.command(now), (linear, 0.0))
+            self.assertFalse(gate.stopped)
+        self.assertEqual(gate.command(10.41), (0.0, 0.0))
+        self.assertEqual(gate.reason, 'heartbeat')
+        self.assertFalse(gate.accept({'sequence': 6, 'stamp': 10.42, 'linear': 0.014, 'angular': 0.0}, 10.42))
+
+    def test_navigation_has_a_separate_exact_forward_limit(self):
+        cases = [('0.02000000000000000001', '0'), ('0.014', '1e-1000'), ('-0.001', '0')]
+        for linear, angular in cases:
+            text = ('{"sequence":0,"stamp":10,"linear":%s,"angular":%s}\n' % (linear, angular)).encode('ascii')
+            gate = relay.RelayGate(10.0, forward_navigation=True)
+            self.assertFalse(gate.accept(relay.FrameReader().feed(text)[0], 10.0))
+            self.assertEqual(gate.reason, 'invalid_frame')
+
     def test_required_intent_deadline_expires_before_heartbeat_and_latches(self):
         gate = relay.RelayGate(10.0, require_intent_deadline=True)
         frame = {'sequence': 0, 'stamp': 10.0, 'linear': 0.02, 'angular': 0.0,
@@ -306,7 +326,8 @@ rospy.signal_shutdown = lambda message: None
 sys.modules.update({'rospy': rospy, 'geometry_msgs': geometry,
                     'geometry_msgs.msg': geometry_msg, 'std_msgs': std,
                     'std_msgs.msg': std_msg})
-sys.exit(relay.main(0.3 if mode == 'absolute_deadline' else None))
+sys.exit(relay.main(0.3 if mode == 'absolute_deadline' else None,
+                   forward_navigation=mode == 'forward_navigation'))
 """
 
 
@@ -388,6 +409,21 @@ class SubprocessTests(unittest.TestCase):
         last_nonzero = max(i for i, x in enumerate(commands) if x != 'CMD 0.0000 0.0000')
         self.assertGreaterEqual(len(commands) - last_nonzero - 1, 2)
         self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in commands[last_nonzero + 1:]))
+
+    def test_navigation_publishes_zero_then_resumes_and_stops_on_heartbeat_loss(self):
+        self.start('forward_navigation')
+        self.await_line(1, 'READY forward_navigation')
+        sequence = 0
+        for linear in (.014, 0., .014):
+            start = len(self.lines[2])
+            for _ in range(3):
+                self.send(sequence, linear)
+                sequence += 1
+                self.pump(.05)
+            self.assertIn('CMD %.4f 0.0000' % linear, self.lines[2][start:])
+        self.await_line(1, 'FAULT heartbeat')
+        self.pump(.15)
+        self.assertEqual(self.lines[2][-1], 'CMD 0.0000 0.0000')
 
     def test_relay_enforces_independent_motion_deadline_with_fresh_heartbeats(self):
         self.start('absolute_deadline')

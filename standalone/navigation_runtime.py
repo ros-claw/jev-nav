@@ -7,8 +7,8 @@ from navigation import Command, MAX_RESPONSE_AGE, Navigation, ready
 
 
 class NavigationRuntime(object):
-    def __init__(self, decide, publish):
-        self.navigation = Navigation()
+    def __init__(self, decide, publish, navigation=None):
+        self.navigation = Navigation() if navigation is None else navigation
         self.decide, self.publish = decide, publish
         self._wake = threading.Event()
         self._closed = threading.Event()
@@ -48,7 +48,10 @@ class NavigationRuntime(object):
                     self._next_request = now + 1.
 
         command = self.navigation.step(view, now)
-        self.publish(command)
+        published = self.publish(command)
+        if published is not None:
+            command = published
+            self.navigation.speed = command.linear
         offered = None
         if (not self._closed.is_set() and not self.navigation.fault and self._job is None and view is not None
                 and now >= self._next_request and view.grid_at != self._last_grid):
@@ -59,11 +62,12 @@ class NavigationRuntime(object):
                 self._wake.set()
         return command, offered, decision
 
-    def close(self):
+    def close(self, publish_stop=True):
         self._closed.set()
         self._wake.set()
         try:
-            self.publish(Command(0., 0., 'stop', 'shutdown'))
+            if publish_stop:
+                self.publish(Command(0., 0., 'stop', 'shutdown'))
         finally:
             self._worker.join(1.)
         return not self._worker.is_alive()

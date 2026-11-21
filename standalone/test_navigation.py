@@ -1,13 +1,14 @@
 from __future__ import division
 
 import collections
+import json
 import math
 import threading
 import time
 
 import pytest
 
-from navigation import Grid, Navigation, Pose, View, arc_pose, sweep_clear
+from navigation import Command, Grid, Navigation, Pose, View, arc_pose, sweep_clear
 from navigation_runtime import NavigationRuntime
 
 
@@ -121,6 +122,113 @@ def test_successor_is_decided_while_the_robot_follows_current_segment():
     assert navigation.accept(request, 'left', accepted_at, 11.)
     transition = navigation.step(view(11.5, Pose(.232, 0., 0.)), 11.5)
     assert transition.action == 'left' and transition.angular > 0.
+
+
+def test_hardware_profile_offers_forward_and_does_not_issue_steering():
+    navigation = Navigation(forward_only=True, speed=.014)
+    observation = view(1.)
+    request = navigation.request(observation, 1.)
+    assert request.choices == ('forward', 'stop')
+    assert navigation.accept(request, 'forward', observation, 1.)
+    command = navigation.step(view(1.05, Pose(.01, .005, .02)), 1.05)
+    assert 0. < command.linear <= .014
+    assert command.angular == 0.
+    command = navigation.step(view(1.10, Pose(.01, .025, .02)), 1.10)
+    assert command.reason == 'path_tracking_lost' and command.linear == 0.
+
+
+def test_navigation_trajectory_counts_motion_after_a_pause():
+    from run_navigation import summarize_navigation_trajectory
+    commands = [(1., .014, 0.), (1.05, .014, 0.), (1.1, 0., 0.),
+                (1.2, .014, 0.), (1.25, .014, 0.), (1.30, .014, 0.), (1.35, 0., 0.)]
+    odometry = [(1., 0., 0., 0.), (1.15, .01, 0., 0.), (1.35, .02, 0., 0.)]
+    result = summarize_navigation_trajectory({'commands': commands, 'odom': odometry})
+    assert result['nonzero_cmd_vel_messages'] == 5
+    assert result['longest_nonzero_sec'] == pytest.approx(.15)
+    assert result['odom_displacement_m'] == .02 and result['zero_after_last_motion'] == 1.35
+
+
+def test_low_light_uplift_uses_a_pixelwise_bounded_transform():
+    import numpy as np
+    from run_navigation import brighten_low_light
+
+    dark = np.dstack([np.arange(6, 26, dtype=np.uint8).reshape(4, 5)] * 3)
+    brightened = brighten_low_light(dark)
+    assert brightened.shape == dark.shape and brightened.dtype == dark.dtype
+    assert (brightened >= dark).all() and brightened.max() > dark.max()
+    assert brighten_low_light(np.zeros_like(dark)).max() == 0
+    well_exposed = dark + 100
+    assert brighten_low_light(well_exposed) is well_exposed
+
+
+def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault():
+    from navigation_actuator import ActuationError, NavigationActuator
+    from relay import RelayGate, _monotonic
+
+    class Clock(object):
+        now = staticmethod(_monotonic)
+        sleep = staticmethod(time.sleep)
+
+    class Transport(object):
+        def start_forward_navigation(self):
+            self.gate = RelayGate(_monotonic(), forward_navigation=True)
+
+        def read_line(self, timeout):
+            return b'READY forward_navigation\n'
+
+        def check_status(self):
+            status, self.status = self.status, None
+            return status
+
+        def write_line(self, data, timeout):
+            return self.gate.accept(json.loads(data), _monotonic())
+
+        def close(self):
+            self.gate.stop('closed')
+
+    class Authority(object):
+        def acquire(self):
+            self.allowed, self.released = True, False
+            return True
+
+        def bind_relay(self, actuator):
+            return True
+
+        def verify(self):
+            return self.allowed
+
+        def evidence(self):
+            return {'relay_node': '/independent_relay'}
+
+        def cached_command_deadline(self):
+            return _monotonic() + .05 if self.allowed else None
+
+        def release(self):
+            self.released = True
+
+    transport = Transport()
+    transport.status = None
+    ros, serial = Authority(), Authority()
+    actuator = NavigationActuator(transport, ros, serial, Clock())
+    try:
+        actuator.open()
+        command = Command(.014, 0., 'forward', 'tracking')
+        assert actuator.publish(command) == command
+        serial.allowed = False
+        actual = actuator.publish(command)
+        assert actual.linear == 0. and actual.reason == 'command_authority_unavailable'
+        assert transport.gate.command(_monotonic()) == (0., 0.)
+        serial.allowed = True
+        assert actuator.publish(command) == command
+        transport.status = b'FAULT heartbeat\n'
+        with pytest.raises(ActuationError, match='navigation_relay_fault'):
+            actuator.publish(command)
+        with pytest.raises(ActuationError, match='navigation_relay_fault'):
+            actuator.publish(Command(0., 0., 'stop', 'shutdown'))
+        assert actuator.stop_line == b'FAULT heartbeat\n'
+    finally:
+        actuator.close()
+    assert ros.released and serial.released and transport.gate.command(_monotonic()) == (0., 0.)
 
 
 def test_answer_received_during_a_sensor_gap_waits_for_revalidation():

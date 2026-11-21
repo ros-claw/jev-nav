@@ -160,7 +160,10 @@ def _remaining(goal, pose):
 class Navigation(object):
     """Single-writer task state. Feed immutable observations and finished choices."""
 
-    def __init__(self):
+    def __init__(self, forward_only=False, speed=SPEED):
+        if not 0. < speed <= SPEED:
+            raise ValueError('invalid navigation speed')
+        self.forward_only, self.max_speed = forward_only, speed
         self.goal = self.successor = self.pending = None
         self.sequence = 0
         self.epoch = self.last_at = self.completed = None
@@ -186,14 +189,21 @@ class Navigation(object):
         if self.fault or self.paused or self.successor is not None or not ready(view, now):
             return None
         if self.goal is not None:
-            if _remaining(self.goal, view.pose) > .09:
+            remaining = _remaining(self.goal, view.pose)
+            if remaining > .09:
                 return None
-            anchor = arc_pose(self.goal.origin, LENGTH, CURVATURE[self.goal.action])
+            if self.forward_only:
+                # A straight continuation follows the current measured line.
+                # The predecessor's original heading may differ slightly.
+                anchor = arc_pose(view.pose, max(0., remaining), 0.)
+            else:
+                anchor = arc_pose(self.goal.origin, LENGTH, CURVATURE[self.goal.action])
             predecessor = self.goal.sequence
         else:
             anchor, predecessor = view.pose, None
         choices = []
-        for action in ('forward', 'left', 'right'):
+        actions = ('forward',) if self.forward_only else ('forward', 'left', 'right')
+        for action in actions:
             block = sweep_block(view.grid, anchor, LENGTH, CURVATURE[action], view.pose)
             if block is None:
                 choices.append(action)
@@ -260,19 +270,21 @@ class Navigation(object):
         curvature = CURVATURE[self.goal.action]
         on_path = arc_pose(self.goal.origin, max(0., LENGTH - remaining), curvature)
         error = _relative(on_path, view.pose)
-        if abs(error.y) > .04 or abs(error.yaw) > .22:
+        lateral_limit, yaw_limit = (.02, .05) if self.forward_only else (.04, .22)
+        if abs(error.y) > lateral_limit or abs(error.yaw) > yaw_limit:
             return self._stop('path_tracking_lost')
         target = arc_pose(self.goal.origin, LENGTH - max(0., remaining - .08), curvature)
         lookahead = _relative(view.pose, target)
         if lookahead.x <= 0:
             return self._stop('path_tracking_lost')
-        steer = max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2)))
+        steer = (0. if self.forward_only else
+                 max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2))))
         self.blocked_cell = sweep_block(view.grid, view.pose, min(.10, remaining + .03), steer)
         if self.blocked_cell is not None:
             if self.blocked_cell[0] == 'occupied':
                 return self._stop('path_occupied')
             return self._pause('path_unknown')
         self.paused = False
-        speed = SPEED if self.successor is not None else min(SPEED, math.sqrt(.08 * remaining))
+        speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))
         self.speed = min(speed, self.speed + .04 * min(.05, elapsed))
         return Command(self.speed, self.speed * steer, self.goal.action, 'tracking')

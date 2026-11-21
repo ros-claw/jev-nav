@@ -63,15 +63,24 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
         if "navigation_choices" in observation:
             available = observation["navigation_choices"]
+            operator_clear = observation.get("operator_clear_front", False)
             if (forward_only or not isinstance(available, list) or not 2 <= len(available) <= len(CHOICES)
                     or available[-1] != "stop"
                     or any(not isinstance(value, str) or value not in CHOICES for value in available)
-                    or len(set(available)) != len(available)):
+                    or len(set(available)) != len(available) or type(operator_clear) is not bool
+                    or operator_clear and available != ["forward", "stop"]):
                 return rejected
             choices = available
             task = ("A differential-drive robot is exploring indoors. Choose a short segment from the choices "
                     "checked by its local planner, using the camera and current sensor data. A left or right "
-                    "segment is a shallow forward arc. Choose stop when waiting is appropriate.")
+                    "segment is a shallow forward arc. The locally checked segment length describes the space "
+                    "the robot has evaluated for that choice. In low light, use the supplied range-sensor "
+                    "assessment and the available choices. Choose stop when the evidence calls for waiting.")
+            if operator_clear:
+                context["site_operator_report"] = {"forward_area_clear": True}
+                task += (" This run is a supervised straight-line navigation test. The operator reports the "
+                         "forward area clear. Prefer the locally checked forward segment if the image, range "
+                         "assessment and base state do not indicate a reason to wait.")
         if forward_only:
             task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
                     "choose forward if there is room for the bounded forward segment. Otherwise choose stop.")
@@ -105,6 +114,9 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                     "type": "choice",
                     "name": "next_action",
                     "instructions": (
+                        "Choose from the listed locally checked options. Use the sensor assessment for "
+                        "low-light scenes, and choose stop for a visible obstruction or incompatible state."
+                    ) if "navigation_choices" in observation else (
                         "Select the next exploration direction, preferring progress into visible "
                         "open space when supported. The lidar may cover only the front: forward_view "
                         "groups ray directions about the laser, and reports nearest hit distance and "

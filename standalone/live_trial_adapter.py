@@ -353,12 +353,15 @@ class ObservationAdapter(object):
 
 class CvJpegEncoder(object):
     """Explicitly supplied bridge; CV import/conversion happens only on call."""
-    def __init__(self, bridge):
+    def __init__(self, bridge, transform=None):
         self.bridge = bridge
+        self.transform = transform
 
     def __call__(self, color):
         import cv2
         image = self.bridge.imgmsg_to_cv2(color, desired_encoding="bgr8")
+        if self.transform is not None:
+            image = self.transform(image)
         ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if not ok:
             raise ValueError("JPEG encoding failed")
@@ -457,12 +460,17 @@ class RelayProcessTransport(object):
         self.exited = None
 
     def start(self, max_motion_sec):
+        relay_ready_line(max_motion_sec)
+        self._start(["--require-intent-deadline", "--max-motion-sec", "%.6f" % max_motion_sec])
+
+    def start_forward_navigation(self):
+        self._start(["--forward-navigation"])
+
+    def _start(self, flags):
         if self.process is not None:
             raise ValueError("invalid relay startup")
-        relay_ready_line(max_motion_sec)
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py")
-        command = ["/usr/bin/python2", path, "--require-intent-deadline",
-                   "--max-motion-sec", "%.6f" % max_motion_sec]
+        command = ["/usr/bin/python2", path] + flags
         with open(os.devnull, "wb") as errors:
             self.process = self.popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=errors, close_fds=True)

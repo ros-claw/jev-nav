@@ -211,12 +211,12 @@ def make_ros_monitor(clock, driver_pid, master_uri):
 
 class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
     """Subscribe only; never publish a command."""
-    def __init__(self, clock):
+    def __init__(self, clock, capacity=2000):
         import rospy
         from geometry_msgs.msg import Twist
         from nav_msgs.msg import Odometry
         self.clock, self.lock = clock, threading.Lock()
-        self.odometry, self.commands = collections.deque(maxlen=2000), collections.deque(maxlen=2000)
+        self.odometry, self.commands = collections.deque(maxlen=capacity), collections.deque(maxlen=capacity)
         self.subscribers = [rospy.Subscriber('/odom', Odometry, self._odom, queue_size=10),
                             rospy.Subscriber('/cmd_vel', Twist, self._command, queue_size=10)]
 

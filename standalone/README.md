@@ -2,7 +2,7 @@
 
 `run_navigation.py` evaluates short forward segments and shallow left and right arcs against a rolling grid in `odom`. Decisions receives the image and the available choices. The 20 Hz local controller follows the accepted segment, checks its next swept area, and can start a prepared successor without stopping. A delayed or failed request leaves the active segment in place. If sensing drops out, the controller sends zero and can resume on a fresh check of the same segment. A measured obstruction cancels that segment.
 
-The current ROS entry point sends velocity to an isolated `navigation_command_preview` topic. It reads the actual laser, depth, RGB and odometry streams. The rolling grid publishes the laser and depth acquisition stamps used for that grid. In this entry point the depth image is decimated by two on each axis using the ROS image pipeline before converting it to a point cloud. [ROS image decimation source](https://github.com/ros-perception/image_pipeline/blob/melodic/image_proc/src/nodelets/crop_decimate.cpp)
+The default ROS output is an isolated `navigation_command_preview` topic. The entry point reads laser, depth, RGB and odometry. The rolling grid publishes the laser and depth acquisition stamps used for that grid. The ROS depth pipeline decimates images by two on each axis before converting them to point clouds. [ROS image decimation source](https://github.com/ros-perception/image_pipeline/blob/melodic/image_proc/src/nodelets/crop_decimate.cpp)
 
 Build the repository version of [`limo_fresh_layer`](limo_fresh_layer) in a Catkin workspace and source both that workspace and the LIMO driver workspace. A recorded live preview uses:
 
@@ -10,7 +10,9 @@ Build the repository version of [`limo_fresh_layer`](limo_fresh_layer) in a Catk
 /usr/bin/python2 standalone/run_navigation.py --decisions --seconds 48 --timeline /tmp/jev-navigation.jsonl
 ```
 
-The timeline path must be new. Omitting `--seconds` runs the controller until shutdown. The test `test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices` runs 31 simulated seconds of odometry feedback through three decisions and tests stopping on missing input. Physical execution requires validated coverage of the robot's swept area and a connection to the independent base watchdog.
+The timeline path must be new. Omitting `--seconds` runs the preview until shutdown. The test `test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices` runs 31 simulated seconds of odometry feedback through three decisions and tests stopping on missing input.
+
+`--drive-forward` enables supervised straight operation with Decisions, a current `--operator-clear-front` site report, a finite test duration, and the exact `--driver-pid`, `--driver-exe`, and `--driver-sha256`. It uses a separate relay bound to the candidate driver's watchdog. The relay accepts ordinary zero setpoints and keeps enforcing controller heartbeat and driver status. `--max-travel-m` bounds the supervised run using cumulative wheel odometry. The hardware profile offers forward and stop and emits zero angular velocity. Its JSON contains the relay-attributed `/cmd_vel` trace, the longest uninterrupted nonzero interval, and wheel-odometry displacement.
 
 ## Bounded forward trial
 

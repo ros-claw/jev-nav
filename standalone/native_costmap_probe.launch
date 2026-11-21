@@ -7,14 +7,19 @@
   <arg name="decimate_depth" default="false" />
   <arg name="project_image" default="depth_image" />
   <arg name="project_info" default="/camera/depth/camera_info" />
+  <arg name="depth_points_args" default="standalone depth_image_proc/point_cloud_xyz" />
   <arg name="depth_layer_type" default="costmap_2d::ObstacleLayer" />
   <arg name="inflate" default="true" />
   <group ns="$(arg namespace)">
     <node unless="$(arg decimate_depth)" pkg="topic_tools" type="throttle" name="depth_throttle"
           args="messages /camera/depth/image_raw $(arg depth_rate) /$(arg namespace)/depth_image"
           output="screen" />
+    <node if="$(arg decimate_depth)" pkg="nodelet" type="nodelet" name="depth_pipeline"
+          args="manager" output="screen" required="true">
+      <param name="num_worker_threads" value="2" />
+    </node>
     <node if="$(arg decimate_depth)" pkg="nodelet" type="nodelet" name="depth_decimate"
-          args="standalone image_proc/crop_decimate" output="screen">
+          args="load image_proc/crop_decimate depth_pipeline" output="screen">
       <remap from="camera/image_raw" to="/camera/depth/image_raw" />
       <remap from="camera/camera_info" to="/camera/depth/camera_info" />
       <param name="decimation_x" value="2" />
@@ -22,10 +27,11 @@
       <param name="queue_size" value="2" />
     </node>
     <node pkg="nodelet" type="nodelet" name="depth_points"
-          args="standalone depth_image_proc/point_cloud_xyz" output="screen">
+          args="$(arg depth_points_args)" output="screen">
       <remap from="image_rect" to="$(arg project_image)" />
       <remap from="camera_info" to="$(arg project_info)" />
       <remap from="points" to="/$(arg namespace)/depth_points" />
+      <param name="queue_size" value="2" />
     </node>
     <node pkg="costmap_2d" type="costmap_2d_node" name="rolling_costmap" output="screen" required="true">
       <remap from="/tf" to="/$(arg namespace)/tf" />

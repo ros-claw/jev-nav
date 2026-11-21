@@ -1,5 +1,5 @@
 #!/usr/bin/env python2
-"""Run odometry-frame navigation using live ROS perception and private output."""
+"""Run odometry-frame navigation using live ROS perception."""
 from __future__ import division, print_function
 
 import argparse
@@ -8,24 +8,41 @@ import collections
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
 
-from navigation import Grid, Pose, View, ready
+from navigation import Grid, LENGTH, Navigation, Pose, View, ready
+from navigation_actuator import ActuationError, NavigationActuator
 from navigation_runtime import NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
 from relay import _monotonic
 
 
+def brighten_low_light(image):
+    """Raise measured intensity only. Keep the original pixels and geometry."""
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark, bright = np.percentile(gray, [10, 99])
+    if bright > 60 or bright - dark < 5:
+        return image
+    gain = min(6., 180. / max(20., bright))
+    table = np.minimum(255, np.arange(256, dtype=np.float32) * gain).astype(np.uint8)
+    return cv2.LUT(image, table)
+
+
 class RosNavigationInput(object):
-    def __init__(self, rospy, grid_topic, decisions):
+    def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False):
         from explore import RosObservation
         from limo_fresh_layer.msg import FreshGrid
         from sensor_msgs.msg import Image
 
         self.rospy = rospy
+        self.operator_clear_front = operator_clear_front
         self.observation = RosObservation(sensor_names=('odom', 'status'))
         self.latest_grid = None
         self.last_grid_times = None
@@ -127,9 +144,12 @@ class RosNavigationInput(object):
         state = base_state(odom['message'], status['message'], status['stamp'])
         if state is None:
             return None
-        jpeg = CvJpegEncoder(observation.bridge)(image)
+        jpeg = CvJpegEncoder(observation.bridge, transform=brighten_low_light)(image)
         evidence = {'image_b64': base64.b64encode(jpeg).decode('ascii'), 'captured_at': stamp,
-                    'laser': {}, 'base': state, 'navigation_choices': list(request.choices)}
+                    'laser': {'locally_checked_segment_length_m': LENGTH,
+                              'planning_successor': request.predecessor is not None},
+                    'base': state, 'navigation_choices': list(request.choices),
+                    'operator_clear_front': self.operator_clear_front}
         result = run_decision_process(['/usr/bin/python3', os.path.join(WORKER, 'limo_mapless_decision.py')],
                                       evidence, cancelled, _monotonic, diagnostics=True)
         if result and result.get('ok') is True and result.get('captured_at') == stamp:
@@ -137,14 +157,72 @@ class RosNavigationInput(object):
         return None
 
 
-def main(argv=None):
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--timeline', required=True)
     parser.add_argument('--seconds', type=float, help='end a recorded validation run after this many seconds')
     parser.add_argument('--decisions', action='store_true', help='enable Decisions API calls for checked candidates')
+    parser.add_argument('--drive-forward', action='store_true', help='use the supervised forward hardware output')
+    parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
+    parser.add_argument('--driver-pid', type=int)
+    parser.add_argument('--driver-exe')
+    parser.add_argument('--driver-sha256')
+    parser.add_argument('--speed-mps', type=float)
+    parser.add_argument('--max-travel-m', type=float, default=.40)
     args = parser.parse_args(argv)
+    if args.speed_mps is None:
+        args.speed_mps = .014 if args.drive_forward else .02
     if args.seconds is not None and not 0. < args.seconds < float('inf'):
         parser.error('seconds must be positive and finite')
+    if not 0 < args.speed_mps <= .02 or not .05 <= args.max_travel_m <= .50:
+        parser.error('invalid supervised motion bounds')
+    if args.drive_forward and (not args.decisions or not args.operator_clear_front or args.seconds is None
+                               or args.driver_pid is None or args.driver_pid <= 1
+                               or not args.driver_exe or not os.path.isabs(args.driver_exe)
+                               or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
+        parser.error('forward hardware operation requires Decisions, site report, finite run and driver identity')
+    if args.operator_clear_front and not args.drive_forward:
+        parser.error('the operator site report is only used for supervised hardware operation')
+    return args
+
+
+def summarize_navigation_trajectory(trajectory):
+    """Measure a navigation run that can stop temporarily and resume."""
+    from supervised_trial import summarize_observations
+
+    commands = sorted(trajectory['commands'], key=lambda row: row[0])
+    active = [row for row in commands if row[1] or row[2]]
+    summary = summarize_observations([], commands)
+    summary.update({'measurement_scope': 'relay_callback_window', 'relay_caller_observed': bool(commands),
+                    'longest_nonzero_sec': 0., 'zero_after_last_motion': None})
+    if not active:
+        return summary
+    first = active[0][0]
+    stop = next((row[0] for row in commands if row[0] > active[-1][0] and not (row[1] or row[2])), None)
+    last = active[-1][0] if stop is None else stop
+    odometry = sorted((row[:4] for row in trajectory['odom'] if first <= row[0] <= last), key=lambda row: row[0])
+    summary.update(summarize_observations(odometry, commands))
+    start = previous = None
+    for at, linear, angular in commands:
+        # A gap at least as long as the driver watchdog cannot establish an
+        # uninterrupted interval, even if the recorder saw no zero message.
+        if start is not None and at - previous >= .30:
+            summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], previous - start)
+            start = None
+        if linear or angular:
+            start = at if start is None else start
+        elif start is not None:
+            summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], at - start)
+            start = None
+        previous = at
+    if start is not None:
+        summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], previous - start)
+    summary['zero_after_last_motion'] = stop
+    return summary
+
+
+def main(argv=None):
+    args = parse_args(argv)
 
     import rospy
     from geometry_msgs.msg import Twist
@@ -162,13 +240,17 @@ def main(argv=None):
                 ['roslaunch', os.path.join(directory, 'native_costmap_probe.launch'),
                  'namespace:=' + namespace, 'use_fresh:=true', 'grid_rate:=20.0', 'decimate_depth:=true',
                  'project_image:=camera_out/image_raw', 'project_info:=camera_out/camera_info',
+                 'depth_points_args:=load depth_image_proc/point_cloud_xyz depth_pipeline',
                  'inflate:=false',
                  'depth_layer_type:=limo_fresh_layer/FreshDepthLayer'])
     children = []
-    runtime = timeline = None
+    runtime = timeline = source = actuator = recorder = None
     counts = collections.Counter()
     ready_ticks = 0
     first_pose = last_pose = None
+    travelled = 0.
+    reason = 'session_ended'
+    started = ended = _monotonic()
     try:
         for command in commands:
             children.append(subprocess.Popen(command, preexec_fn=os.setsid, stdout=sys.stderr,
@@ -176,7 +258,7 @@ def main(argv=None):
         rospy.init_node('jev_navigation', anonymous=True)
         if rospy.get_param('/use_sim_time', False):
             raise RuntimeError('ROS wall time required for live acquisition')
-        source = RosNavigationInput(rospy, costmap, args.decisions)
+        source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front)
         publisher = rospy.Publisher(preview, Twist, queue_size=1)
         timeline = Timeline(args.timeline, namespace)
 
@@ -187,7 +269,30 @@ def main(argv=None):
                 publisher.publish(packet)
 
         choose = source.choose if args.decisions else lambda request, cancelled: None
-        runtime = NavigationRuntime(choose, publish)
+        if args.drive_forward:
+            from live_monitors import ProcSerialBackend, SerialOwnershipMonitor
+            from live_trial_adapter import RelayProcessTransport
+            from supervised_trial import ObservationRecorder, RealClock, make_ros_monitor
+
+            # Warm the live sensor pipeline before claiming the chassis. This
+            # also keeps depth-nodelet initialization out of relay startup.
+            warm_until = _monotonic() + 5.
+            while not ready(source.view(), _monotonic()):
+                if rospy.is_shutdown() or _monotonic() >= warm_until:
+                    raise ActuationError('navigation_perception_not_ready')
+                time.sleep(.05)
+            clock = RealClock()
+            ros_guard = make_ros_monitor(clock, args.driver_pid, os.environ.get('ROS_MASTER_URI',
+                                                                                 'http://localhost:11311'))
+            serial_backend = ProcSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1', fuser_timeout=.4)
+            serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
+                                                  args.driver_sha256, max_age=.6, acquire_timeout=1.2,
+                                                  ros_monitor=ros_guard)
+            actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock)
+            recorder = ObservationRecorder(clock, capacity=12000)
+            actuator.open()
+        navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps)
+        runtime = NavigationRuntime(choose, actuator.publish if actuator is not None else publish, navigation)
         started = slot = last_process_check = last_block_report = _monotonic()
         while not rospy.is_shutdown():
             now = _monotonic()
@@ -196,9 +301,14 @@ def main(argv=None):
             if now - last_process_check >= .5:
                 last_process_check = now
                 if any(child.poll() is not None for child in children):
-                    raise RuntimeError('navigation perception process exited')
+                    raise ActuationError('navigation_perception_process_exited')
             view = source.view()
             now = _monotonic()
+            if args.drive_forward and view is not None and last_pose is not None:
+                travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
+                if travelled >= args.max_travel_m:
+                    reason = 'travel_limit'
+                    break
             command, request, decision = runtime.cycle(view, now)
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
@@ -222,8 +332,8 @@ def main(argv=None):
                 blocks = dict(runtime.navigation.candidate_blocks)
                 if runtime.navigation.blocked_cell is not None:
                     blocks['tracking'] = runtime.navigation.blocked_cell
-                for action, (reason, x, y) in blocks.items():
-                    timeline.record('perception', now, {'stage': action, 'reason': reason, 'x': x, 'y': y})
+                for action, (block_reason, x, y) in blocks.items():
+                    timeline.record('perception', now, {'stage': action, 'reason': block_reason, 'x': x, 'y': y})
             slot += .05
             remaining = slot - _monotonic()
             if remaining > 0:
@@ -231,18 +341,39 @@ def main(argv=None):
             else:
                 slot += (1 + int(-remaining / .05)) * .05
     except KeyboardInterrupt:
-        pass
+        reason = 'interrupted'
+    except (ActuationError, IOError, OSError) as exc:
+        reason = str(exc) if isinstance(exc, ActuationError) else type(exc).__name__
     finally:
-        model_joined = runtime.close() if runtime is not None else None
-        timeline_closed = timeline.close() if timeline is not None else None
-        for child in reversed(children):
-            _stop_group(child)
-    print(json.dumps({'mode': 'private_ros_navigation', 'preview_topic': preview, 'control': counts,
-                      'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
-                      'grid_updates': source.grid_updates,
-                      'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
-                      if first_pose is not None else None}, allow_nan=False))
-    return 0 if ready_ticks and timeline_closed and model_joined else 2
+        ended = _monotonic()
+        if timeline is not None:
+            timeline.record('stop', ended, {'reason': reason})
+        try:
+            if actuator is not None:
+                actuator.close()
+        finally:
+            try:
+                model_joined = runtime.close(publish_stop=actuator is None) if runtime is not None else None
+            finally:
+                timeline_closed = timeline.close() if timeline is not None else None
+                for child in reversed(children):
+                    _stop_group(child)
+    result = {'mode': 'supervised_forward_navigation' if args.drive_forward else 'private_ros_navigation',
+              'preview_topic': None if args.drive_forward else preview, 'control': counts, 'reason': reason,
+              'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
+              'grid_updates': source.grid_updates if source is not None else {},
+              'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
+              if first_pose is not None else None}
+    if actuator is not None:
+        trajectory = recorder.trial_trajectory(actuator.caller, started, _monotonic())
+        result.update(relay_caller=actuator.caller, relay_fault=actuator.stop_line,
+                      relay_exited=actuator.transport.exited, path_m=travelled,
+                      observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
+    print(json.dumps(result, allow_nan=False))
+    complete = ready_ticks and timeline_closed and model_joined
+    if args.drive_forward:
+        complete = complete and actuator is not None and actuator.transport.exited and travelled >= .20
+    return 0 if complete else 2
 
 
 if __name__ == '__main__':
