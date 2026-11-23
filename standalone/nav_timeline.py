@@ -31,7 +31,8 @@ _FIELDS = frozenset(('sensor_acquired_at', 'sensor_received_at', 'perception_sta
                      'processing_sec', 'queue_delay_sec', 'remaining_sec', 'dropped',
                      'depth_count', 'front_count', 'status', 'clock_domain',
                      'invalid_count', 'unknown_count', 'unobserved_space', 'sampled_candidate', 'pending',
-                     'callback_at', 'sensor_age_sec', 'raw_front_count', 'raw_valid_count',
+                     'callback_at', 'sensor_age_sec', 'rear_memory_cells', 'rear_memory_age_sec',
+                     'raw_front_count', 'raw_valid_count',
                      'fused_front_count', 'fused_valid_count'))
 
 

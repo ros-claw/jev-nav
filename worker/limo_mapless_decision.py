@@ -20,6 +20,8 @@ DESCRIPTIONS = {
     "left": "Explore to the left",
     "right": "Explore to the right",
     "stop": "Wait",
+    "circulate_left": "Explore the room on a leftward route, following a checked forward start if necessary",
+    "circulate_right": "Explore the room on a rightward route, following a checked forward start if necessary",
 }
 
 
@@ -59,6 +61,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         if not stamp <= started < stamp + MAX_AGE_SEC:
             return rejected
         choices = ("forward", "stop") if forward_only else CHOICES
+        circulate = False
         context = {"laser": observation["laser"], "base": observation["base"]}
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
         if "navigation_choices" in observation:
@@ -81,6 +84,17 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                 task += (" This run is a supervised straight-line navigation test. The operator reports the "
                          "forward area clear. Prefer the locally checked forward segment if the image, range "
                          "assessment and base state do not indicate a reason to wait.")
+            circulate = observation.get("exploration_goal") == "circulate_room" and not operator_clear
+            if circulate:
+                choices = ["circulate_" + side for side in ("left", "right")
+                           if "forward" in available or side in available] + ["stop"]
+                context["checked_start_segments"] = available[:-1]
+                task = ("Choose the direction of a slow route around the room. The local planner will use "
+                        "checked shallow arcs in the selected direction. When no arc is available yet it "
+                        "will first use a checked forward segment, if there is one, to gather coverage. "
+                        "Every subsequent segment is checked locally. Prefer the direction with more open "
+                        "space. Consider obstacles within the checked starting path. A visible object beyond "
+                        "that path can be navigated around and does not alone require waiting.")
         if forward_only:
             task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
                     "choose forward if there is room for the bounded forward segment. Otherwise choose stop.")
@@ -114,6 +128,9 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                     "type": "choice",
                     "name": "next_action",
                     "instructions": (
+                        "Choose a circulation direction when a checked start is usable, or stop when the "
+                        "starting path or the robot state requires waiting."
+                    ) if circulate else (
                         "Choose from the listed locally checked options. Use the sensor assessment for "
                         "low-light scenes, and choose stop for a visible obstruction or incompatible state."
                     ) if "navigation_choices" in observation else (

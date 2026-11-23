@@ -26,6 +26,12 @@ The timeline path must be new. Omitting `--seconds` runs the preview until shutd
 
 `--drive-arcs` selects the hardware profile for forward segments and shallow turns. It requires Decisions, the same driver identity and a finite duration. Each direction must pass the current grid's swept-body check. The relay bounds forward speed and steering curvature and stops on lost heartbeat. The run records angular commands and the measured heading change of each model-selected arc by decision ID. Turn validation needs observed side and rear clearance. Use the private preview to check which directions the installed sensors support.
 
+`--static-room` enables an opt-in route for a supervised room with a clear activity area and fixed surroundings. The controller builds a short-range odometry-frame record from the live sensor grids as it moves. Free observations up to 30 seconds old can fill an occluded cell next to or behind the chassis. The leading corridor still needs live observations, and newly observed obstacles override earlier free cells. Sensor loss commands zero. When a turn loses coverage, a newly checked straight segment can collect more of the room before another turn. The option works with private preview and with `--drive-arcs`.
+
+In this mode Decisions selects a leftward or rightward route. The local controller checks each short segment before continuing on that route. When a turn is occupied, the controller can take a separately checked turn away from it or a checked straight segment. Timeline entries with `stage=local_continuation` link a locally checked segment to its source model decision. The result reports wheel-odometry heading change, return distance and continuous command coverage for a measured lap.
+
+The room output thread sends zero when the latest command has passed its sensor acquisition deadline. It keeps the relay heartbeat alive during a delayed geometry update. Losing the entire navigation process still trips the independent relay watchdog. The relay-attributed `/cmd_vel` trace records what the base received.
+
 ## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;

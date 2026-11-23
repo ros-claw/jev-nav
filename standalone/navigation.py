@@ -142,12 +142,18 @@ def sweep_clear(grid, pose, distance, curvature, known_body=None):
     return sweep_block(grid, pose, distance, curvature, known_body) is None
 
 
-def ready(view, now):
+def observation_deadline(view, now):
     if view is None or view.ready is not True:
-        return False
-    return all(0 <= now - stamp < limit for stamp, limit in (
-        (view.grid_at, .25), (view.scan_at, .30), (view.depth_at, .20),
-        (view.odom_at, .15), (view.status_at, 1.)))
+        return None
+    sources = ((view.grid_at, .25), (view.scan_at, .30), (view.depth_at, .20),
+               (view.odom_at, .15), (view.status_at, 1.))
+    if all(0 <= now - stamp < limit for stamp, limit in sources):
+        return min(stamp + limit for stamp, limit in sources)
+    return None
+
+
+def ready(view, now):
+    return observation_deadline(view, now) is not None
 
 
 def _remaining(goal, pose):
@@ -161,10 +167,11 @@ def _remaining(goal, pose):
 class Navigation(object):
     """Single-writer task state. Feed immutable observations and finished choices."""
 
-    def __init__(self, forward_only=False, speed=SPEED):
+    def __init__(self, forward_only=False, speed=SPEED, successor_lead=None):
         if not 0. < speed <= SPEED:
             raise ValueError('invalid navigation speed')
         self.forward_only, self.max_speed = forward_only, speed
+        self.successor_lead = successor_lead or (FORWARD_SUCCESSOR_LEAD if forward_only else .09)
         self.goal = self.successor = self.pending = None
         self.sequence = 0
         self.epoch = self.last_at = self.completed = None
@@ -174,7 +181,7 @@ class Navigation(object):
         self.blocked_cell = None
         self.candidate_blocks = {}
 
-    def _stop(self, reason):
+    def stop(self, reason):
         self.goal = self.successor = self.pending = self.completed = None
         self.paused = False
         self.speed = 0.
@@ -191,8 +198,7 @@ class Navigation(object):
             return None
         if self.goal is not None:
             remaining = _remaining(self.goal, view.pose)
-            lead = FORWARD_SUCCESSOR_LEAD if self.forward_only else .09
-            if remaining > lead:
+            if remaining > self.successor_lead:
                 return None
             if self.forward_only:
                 # A straight continuation follows the current measured line.
@@ -224,13 +230,13 @@ class Navigation(object):
             return False
         self.pending = None
         if choice == 'stop':
-            self._stop('model_stop')
+            self.stop('model_stop')
             return True
         if not ready(view, now) or request.epoch != view.epoch:
             return False
         active_predecessor = self.goal is not None and request.predecessor == self.goal.sequence
-        # An early forward response is allowed only for the segment still being followed.
-        anchor_limit = FORWARD_SUCCESSOR_LEAD if self.forward_only and active_predecessor else .10
+        # An early response remains tied to the segment still being followed.
+        anchor_limit = max(.10, self.successor_lead) if active_predecessor else .10
         if (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) > anchor_limit
                 or abs(_wrap(view.pose.yaw - request.anchor.yaw)) > .20):
             return False
@@ -252,7 +258,7 @@ class Navigation(object):
             self.fault = 'clock_or_odometry_reset'
         self.last_at = now
         if self.fault:
-            return self._stop(self.fault)
+            return self.stop(self.fault)
         if not ready(view, now):
             return self._pause('perception_unavailable')
         self.epoch = view.epoch
@@ -264,7 +270,7 @@ class Navigation(object):
         if remaining <= STOP_DISTANCE:
             end = arc_pose(self.goal.origin, LENGTH, CURVATURE[self.goal.action])
             if math.hypot(end.x - view.pose.x, end.y - view.pose.y) > .03:
-                return self._stop('path_tracking_lost')
+                return self.stop('path_tracking_lost')
             self.completed = self.goal.sequence
             self.goal, self.successor = self.successor, None
             if self.goal is None:
@@ -277,11 +283,11 @@ class Navigation(object):
         error = _relative(on_path, view.pose)
         lateral_limit, yaw_limit = (.02, .05) if self.forward_only else (.04, .22)
         if abs(error.y) > lateral_limit or abs(error.yaw) > yaw_limit:
-            return self._stop('path_tracking_lost')
+            return self.stop('path_tracking_lost')
         target = arc_pose(self.goal.origin, LENGTH - max(0., remaining - .08), curvature)
         lookahead = _relative(view.pose, target)
         if lookahead.x <= 0:
-            return self._stop('path_tracking_lost')
+            return self.stop('path_tracking_lost')
         steer = (0. if self.forward_only else
                  max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2))))
         lookahead_distance = min(.10, remaining + .03)
@@ -293,7 +299,7 @@ class Navigation(object):
             self.blocked_cell = None
         if self.blocked_cell is not None:
             if self.blocked_cell[0] == 'occupied':
-                return self._stop('path_occupied')
+                return self.stop('path_occupied')
             return self._pause('path_unknown')
         self.paused = False
         speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))

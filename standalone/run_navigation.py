@@ -15,7 +15,7 @@ import time
 import uuid
 
 from navigation import Grid, LENGTH, Navigation, Pose, View, ready
-from navigation_actuator import ActuationError, NavigationActuator
+from navigation_actuator import ActuationError, NavigationActuator, NavigationHeartbeat
 from navigation_runtime import NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
 from relay import _monotonic
@@ -36,13 +36,14 @@ def brighten_low_light(image):
 
 
 class RosNavigationInput(object):
-    def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False):
+    def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False):
         from explore import RosObservation
         from limo_fresh_layer.msg import FreshGrid
         from sensor_msgs.msg import Image
 
         self.rospy = rospy
         self.operator_clear_front = operator_clear_front
+        self.static_room = static_room
         self.observation = RosObservation(sensor_names=('odom', 'status'))
         self.latest_grid = None
         self.last_grid_times = None
@@ -151,6 +152,8 @@ class RosNavigationInput(object):
                               'planning_successor': request.predecessor is not None},
                     'base': state, 'navigation_choices': list(request.choices),
                     'operator_clear_front': self.operator_clear_front}
+        if self.static_room:
+            evidence['exploration_goal'] = 'circulate_room'
         result = run_decision_process(['/usr/bin/python3', os.path.join(WORKER, 'limo_mapless_decision.py')],
                                       evidence, cancelled, _monotonic, diagnostics=True)
         if result and result.get('ok') is True and result.get('captured_at') == stamp:
@@ -168,6 +171,7 @@ def parse_args(argv=None):
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--drive-forward', action='store_true', help='use the supervised forward hardware output')
     output.add_argument('--drive-arcs', action='store_true', help='execute currently observed forward and arc paths')
+    parser.add_argument('--static-room', action='store_true', help='use nearby rear history in a supervised static room')
     parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
@@ -180,8 +184,10 @@ def parse_args(argv=None):
         args.speed_mps = .014 if args.drive else .02
     if args.seconds is not None and not 0. < args.seconds < float('inf'):
         parser.error('seconds must be positive and finite')
-    if not 0 < args.speed_mps <= .02 or not .05 <= args.max_travel_m <= .50:
+    if not 0 < args.speed_mps <= .02 or not .05 <= args.max_travel_m <= (12. if args.static_room else .50):
         parser.error('invalid supervised motion bounds')
+    if args.static_room and args.drive_forward:
+        parser.error('static room exploration uses the arc or private preview output')
     if args.drive and (not args.decisions or args.seconds is None or args.driver_pid is None or args.driver_pid <= 1
                        or not args.driver_exe or not os.path.isabs(args.driver_exe)
                        or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
@@ -217,23 +223,55 @@ def summarize_navigation_trajectory(trajectory):
             current += math.atan2(math.sin(change), math.cos(change))
             minimum, maximum = min(minimum, current), max(maximum, current)
         summary['odom_heading_span_rad'] = maximum - minimum
+    summary['longest_nonzero_sec'] = max([end - start for start, end in nonzero_intervals(commands)] or [0.])
+    summary['zero_after_last_motion'] = stop
+    return summary
+
+
+def nonzero_intervals(commands):
     start = previous = None
     for at, linear, angular in commands:
         # A gap at least as long as the driver watchdog cannot establish an
         # uninterrupted interval, even if the recorder saw no zero message.
         if start is not None and at - previous >= .30:
-            summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], previous - start)
+            yield start, previous
             start = None
         if linear or angular:
             start = at if start is None else start
         elif start is not None:
-            summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], at - start)
+            yield start, at
             start = None
         previous = at
     if start is not None:
-        summary['longest_nonzero_sec'] = max(summary['longest_nonzero_sec'], previous - start)
-    summary['zero_after_last_motion'] = stop
-    return summary
+        yield start, previous
+
+
+def summarize_room_loop(trajectory, arc_traces):
+    """Check wheel-odometry return and heading change after the first actual turn."""
+    report = {'closed': False, 'continuous_commands': False, 'heading_change_rad': 0.,
+              'return_distance_m': None, 'duration_sec': None}
+    arcs = [arc for arc in arc_traces.values() if abs(arc['heading_change_rad']) >= .05]
+    if not arcs:
+        return report
+    first_arc = min(arcs, key=lambda arc: arc['started_at'])
+    samples = sorted(row for row in trajectory['odom'] if row[0] >= first_arc['started_at'])
+    if len(samples) < 2:
+        return report
+    first = samples[0]
+    direction = 1. if first_arc['action'] == 'left' else -1.
+    heading = 0.
+    for previous, current in zip(samples, samples[1:]):
+        change = current[4] - previous[4]
+        heading += math.atan2(math.sin(change), math.cos(change))
+        distance = math.hypot(current[1] - first[1], current[2] - first[2])
+        report.update(heading_change_rad=heading, return_distance_m=distance, duration_sec=current[0] - first[0])
+        if direction * heading >= 2. * math.pi - .18 and distance <= .25:
+            commands = sorted(trajectory['commands'], key=lambda row: row[0])
+            report['closed'] = True
+            report['continuous_commands'] = any(start <= first[0] + .10 and end >= current[0] - .10
+                                                for start, end in nonzero_intervals(commands))
+            break
+    return report
 
 
 def main(argv=None):
@@ -260,8 +298,13 @@ def main(argv=None):
                  'depth_layer_type:=limo_fresh_layer/FreshDepthLayer'])
     children = []
     runtime = timeline = source = actuator = recorder = None
+    heartbeat = view = None
     counts = collections.Counter()
     ready_ticks = 0
+    room = None
+    if args.static_room:
+        from room_perception import RoomPerception
+        room = RoomPerception()
     first_pose = last_pose = None
     unavailable_guards = ()
     authority_diagnostics = {}
@@ -276,7 +319,7 @@ def main(argv=None):
         rospy.init_node('jev_navigation', anonymous=True)
         if rospy.get_param('/use_sim_time', False):
             raise RuntimeError('ROS wall time required for live acquisition')
-        source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front)
+        source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front, args.static_room)
         publisher = rospy.Publisher(preview, Twist, queue_size=1)
         timeline = Timeline(args.timeline, namespace)
 
@@ -308,10 +351,22 @@ def main(argv=None):
                                                   ros_monitor=ros_guard)
             actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock,
                                           arc_navigation=args.drive_arcs)
-            recorder = ObservationRecorder(clock, capacity=12000)
+            recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)
             actuator.open()
-        navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps)
-        runtime = NavigationRuntime(choose, actuator.publish if actuator is not None else publish, navigation)
+            if room is not None:
+                heartbeat = NavigationHeartbeat(actuator, clock)
+                heartbeat.start()
+
+        def publish_room(command):
+            return heartbeat.submit(command, view, _monotonic())
+
+        publish_command = actuator.publish if actuator is not None else publish
+        if heartbeat is not None:
+            publish_command = publish_room
+        navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps,
+                                successor_lead=.15 if room is not None else None)
+        runtime = NavigationRuntime(choose, publish_command, navigation,
+                                    static_room=args.static_room)
         started = slot = last_process_check = last_block_report = _monotonic()
         while not rospy.is_shutdown():
             now = _monotonic()
@@ -323,6 +378,9 @@ def main(argv=None):
                     raise ActuationError('navigation_perception_process_exited')
             view = source.view()
             now = _monotonic()
+            if room is not None:
+                view = room.view(view, now)
+                now = _monotonic()
             if args.drive and view is not None and last_pose is not None:
                 travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
                 if travelled >= args.max_travel_m:
@@ -332,6 +390,9 @@ def main(argv=None):
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
                       'final_action': command.action, 'clock_domain': 'monotonic'}
+            if room is not None:
+                fields['rear_memory_cells'] = room.reused_cells
+                fields['rear_memory_age_sec'] = room.oldest_age
             if command.action != 'stop':
                 fields['decision_id'] = runtime.navigation.goal.sequence
             if view is not None:
@@ -360,6 +421,10 @@ def main(argv=None):
             if decision is not None:
                 timeline.record('decision', now, {'decision_id': decision[0], 'selected_action': decision[1],
                                                   'status': 'accepted' if decision[2] else 'rejected'})
+            if runtime.room_continuation is not None:
+                segment, action, origin_decision = runtime.room_continuation
+                timeline.record('decision', now, {'decision_id': segment, 'selected_action': action,
+                                                  'scene_id': origin_decision, 'stage': 'local_continuation'})
             if now - last_block_report >= 1.:
                 last_block_report = now
                 blocks = dict(runtime.navigation.candidate_blocks)
@@ -383,8 +448,12 @@ def main(argv=None):
             timeline.record('stop', ended, {'reason': reason})
         try:
             if actuator is not None:
-                authority_diagnostics.update(ros=ros_guard.diagnostic(), serial=serial_guard.diagnostic())
-                actuator.close()
+                try:
+                    if heartbeat is not None:
+                        heartbeat.close()
+                    authority_diagnostics.update(ros=ros_guard.diagnostic(), serial=serial_guard.diagnostic())
+                finally:
+                    actuator.close()
         finally:
             try:
                 model_joined = runtime.close(publish_stop=actuator is None) if runtime is not None else None
@@ -396,7 +465,7 @@ def main(argv=None):
     if args.drive_forward:
         mode = 'supervised_forward_navigation'
     elif args.drive_arcs:
-        mode = 'supervised_arc_navigation'
+        mode = 'supervised_static_room' if room is not None else 'supervised_arc_navigation'
     for trace in arc_traces.values():
         change = trace['last_yaw_rad'] - trace['start_yaw_rad']
         trace['heading_change_rad'] = math.atan2(math.sin(change), math.cos(change))
@@ -414,11 +483,15 @@ def main(argv=None):
                       relay_exited=actuator.transport.exited, path_m=travelled,
                       authority_diagnostics=authority_diagnostics,
                       observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
+        if room is not None:
+            result['room_loop'] = summarize_room_loop(trajectory, arc_traces)
     print(json.dumps(result, allow_nan=False))
     complete = ready_ticks and timeline_closed and model_joined
     if args.drive:
         complete = complete and actuator is not None and actuator.transport.exited and travelled >= .20
-    if args.drive_arcs and complete:
+    if args.drive_arcs and room is not None and complete:
+        complete = result['room_loop']['closed'] and result['room_loop']['continuous_commands']
+    elif args.drive_arcs and complete:
         observed = result['observed']
         complete = observed['nonzero_angular_cmd_vel_messages'] and any(
             (1 if trace['action'] == 'left' else -1) * trace['heading_change_rad'] >= .05

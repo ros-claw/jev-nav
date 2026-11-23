@@ -113,6 +113,25 @@ def test_navigation_offers_only_locally_checked_segments():
     assert not reply("left")["ok"]
 
 
+def test_room_model_selects_a_route_with_a_verified_start():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+        "navigation_choices": ["forward", "stop"],
+        "exploration_goal": "circulate_room",
+    }
+
+    def transport(payload, key, timeout):
+        assert [item["value"] for item in payload["questions"][0]["choices"]] == [
+            "circulate_left", "circulate_right", "stop"]
+        assert payload["input"][0]["content"][2]["data"]["checked_start_segments"] == ["forward"]
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": "circulate_left"}]}
+
+    assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_left"
+
+
 def test_transport_failures_return_only_sanitized_classification():
     request = {
         "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),

@@ -184,6 +184,23 @@ def test_turn_measurement_unwraps_heading_while_the_robot_moves():
     assert result['odom_heading_span_rad'] == pytest.approx(2 * math.pi - 6.21)
 
 
+def test_room_loop_requires_turning_and_returning_to_the_arc_start():
+    from run_navigation import summarize_room_loop
+    odom = []
+    for i in range(128):
+        angle = i * 2. * math.pi / 127.
+        yaw = math.atan2(math.sin(angle), math.cos(angle))
+        odom.append((1. + i * .1, math.sin(angle), 1. - math.cos(angle), .018, yaw))
+    trace = {1: {'started_at': 1., 'action': 'left', 'heading_change_rad': .18}}
+    trajectory = {'odom': odom, 'commands': [(row[0], .018, .014) for row in odom]}
+    assert summarize_room_loop(trajectory, trace)['closed']
+    assert summarize_room_loop(trajectory, trace)['continuous_commands']
+    trajectory['commands'][20] = (odom[20][0], 0., 0.)
+    assert not summarize_room_loop(trajectory, trace)['continuous_commands']
+    trajectory['odom'] = odom[:90]
+    assert not summarize_room_loop(trajectory, trace)['closed']
+
+
 def test_low_light_uplift_uses_a_pixelwise_bounded_transform():
     import numpy as np
     from run_navigation import brighten_low_light
@@ -277,6 +294,34 @@ def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault(
     assert ros.released and serial.released and transport.gate.command(_monotonic()) == (0., 0.)
 
 
+def test_output_heartbeats_continue_at_zero_when_the_controller_stops_updating():
+    from navigation_actuator import NavigationHeartbeat
+    from relay import _monotonic
+    from supervised_trial import RealClock
+
+    class Actuator(object):
+        def __init__(self):
+            self.commands = []
+
+        def publish(self, command):
+            self.commands.append((_monotonic(), command))
+            return command
+
+    actuator = Actuator()
+    heartbeat = NavigationHeartbeat(actuator, RealClock())
+    heartbeat.start()
+    try:
+        start = _monotonic()
+        heartbeat.submit(Command(.018, .014, 'left', 'tracking'), view(start), start)
+        time.sleep(.30)
+    finally:
+        heartbeat.close()
+    observed = actuator.commands
+    assert any(command.linear > 0. for _, command in observed)
+    expired = [command for at, command in observed if at - start >= .16]
+    assert len(expired) >= 2 and all(command.linear == command.angular == 0. for command in expired)
+
+
 def test_answer_received_during_a_sensor_gap_waits_for_revalidation():
     runtime = NavigationRuntime(lambda request, cancelled: 'forward', lambda command: None)
     try:
@@ -289,6 +334,71 @@ def test_answer_received_during_a_sensor_gap_waits_for_revalidation():
         assert command.linear == 0. and decision is None
         command, request, decision = runtime.cycle(view(1.10), 1.10)
         assert command.linear > 0. and request is None and decision[2]
+    finally:
+        assert runtime.close()
+
+
+def test_room_intent_reuses_one_model_choice_for_locally_checked_successors():
+    calls = []
+
+    def choose(request, cancelled):
+        calls.append(request.sequence)
+        return 'circulate_left'
+
+    navigation = Navigation(successor_lead=.15)
+    runtime = NavigationRuntime(choose, lambda command: None, navigation, static_room=True)
+    try:
+        runtime.cycle(view(1.), 1.)
+        timeout = time.time() + 1.
+        while runtime._result is None and time.time() < timeout:
+            time.sleep(.001)
+        command, _, decision = runtime.cycle(view(1.05), 1.05)
+        assert command.action == 'left' and decision == (1, 'circulate_left', True)
+        on_arc = arc_pose(Pose(0., 0., 0.), .10, .8)
+        _, request, decision = runtime.cycle(view(6.5, on_arc), 6.5)
+        assert request is None and decision is None
+        assert runtime.room_continuation == (2, 'left', 1)
+        assert navigation.successor.action == 'left' and calls == [1]
+        lost, _, _ = runtime.cycle(None, 6.55)
+        assert lost.linear == 0. and lost.angular == 0.
+    finally:
+        assert runtime.close()
+
+
+@pytest.mark.parametrize('markings,stop_reason', [({(-.13, -.119): -1}, 'path_unknown'),
+                                                   ({(.22, .13): 100, (.22, -.13): 100}, 'path_occupied')])
+def test_room_reobserves_straight_when_a_turn_is_blocked(markings, stop_reason):
+    navigation = Navigation(successor_lead=.15)
+    runtime = NavigationRuntime(lambda request, cancelled: 'circulate_left', lambda command: None,
+                                navigation, static_room=True)
+    try:
+        runtime.cycle(view(1.), 1.)
+        timeout = time.time() + 1.
+        while runtime._result is None and time.time() < timeout:
+            time.sleep(.001)
+        assert runtime.cycle(view(1.05), 1.05)[0].action == 'left'
+        cells = grid(markings)
+        assert runtime.cycle(view(1.10, cells=cells), 1.10)[0].reason == stop_reason
+        assert runtime.room_continuation == (2, 'forward', 1)
+        command, _, _ = runtime.cycle(view(1.15, cells=cells), 1.15)
+        assert command.linear > 0. and command.angular == 0.
+    finally:
+        assert runtime.close()
+
+
+def test_room_can_use_an_observed_away_turn_before_driving_toward_an_obstacle():
+    navigation = Navigation(successor_lead=.15)
+    runtime = NavigationRuntime(lambda request, cancelled: 'circulate_left', lambda command: None,
+                                navigation, static_room=True)
+    try:
+        runtime.cycle(view(1.), 1.)
+        timeout = time.time() + 1.
+        while runtime._result is None and time.time() < timeout:
+            time.sleep(.001)
+        assert runtime.cycle(view(1.05), 1.05)[0].action == 'left'
+        cells = grid({(.22, .13): 100})
+        assert runtime.cycle(view(1.10, cells=cells), 1.10)[0].reason == 'path_occupied'
+        assert runtime.room_continuation == (2, 'right', 1)
     finally:
         assert runtime.close()
 

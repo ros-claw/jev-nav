@@ -4,12 +4,63 @@ from __future__ import division
 import json
 import threading
 
-from navigation import Command
+from navigation import Command, observation_deadline
 from relay import safe_velocity
 
 
 class ActuationError(RuntimeError):
     pass
+
+
+class NavigationHeartbeat(object):
+    """Keep the relay fed with zero while local geometry updates are late."""
+    EXPIRED = Command(0., 0., 'stop', 'navigation_sample_expired')
+
+    def __init__(self, actuator, clock):
+        self.actuator, self.clock = actuator, clock
+        self.latest = self.EXPIRED, 0.
+        self._wake = threading.Event()
+        self._closed = threading.Event()
+        self._worker = threading.Thread(target=self._run, name='navigation-heartbeat')
+        self._worker.daemon = True
+        self.fault = None
+
+    def start(self):
+        self._worker.start()
+
+    def submit(self, command, view, now):
+        if self.fault is not None:
+            raise self.fault
+        if command.linear or command.angular:
+            until = observation_deadline(view, now)
+            command = self.EXPIRED if until is None else command
+        else:
+            until = None
+        self.latest = command, until
+        self._wake.set()
+        return command
+
+    def _run(self):
+        try:
+            while not self._closed.is_set():
+                self._wake.clear()
+                command, until = self.latest
+                if until is not None and self.clock.now() >= until:
+                    command = self.EXPIRED
+                self.actuator.publish(command)
+                delay = .04
+                if until is not None and (command.linear or command.angular):
+                    delay = min(delay, max(0., until - self.clock.now()))
+                self._wake.wait(delay)
+        except (ActuationError, IOError, OSError) as error:
+            self.fault = error
+        except Exception:
+            self.fault = ActuationError('navigation_heartbeat_failed')
+
+    def close(self):
+        self._closed.set()
+        self._wake.set()
+        self._worker.join(.4)
 
 
 class NavigationActuator(object):
