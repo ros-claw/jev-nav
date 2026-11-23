@@ -14,6 +14,7 @@ Segment = namedtuple('Segment', 'sequence action origin')
 
 LENGTH = .24
 ROOM_LENGTH = .12
+ROOM_OBSTACLE_LOOKAHEAD = .60
 FORWARD_SUCCESSOR_LEAD = .15
 CURVATURE = {'forward': 0., 'left': .8, 'right': -.8}
 ROOM_CURVATURE = {'forward': 0., 'left': 1.35, 'right': -1.35}
@@ -199,6 +200,7 @@ class Navigation(object):
         self.epoch = self.last_at = self.completed = None
         self.fault = None
         self.speed = 0.
+        self.steer = 0.
         self.paused = False
         self.blocked_cell = None
         self.candidate_blocks = {}
@@ -206,11 +208,11 @@ class Navigation(object):
     def stop(self, reason):
         self.goal = self.successor = self.pending = self.completed = None
         self.paused = False
-        self.speed = 0.
+        self.speed = self.steer = 0.
         return Command(0., 0., 'stop', reason)
 
     def _pause(self, reason):
-        self.speed = 0.
+        self.speed = self.steer = 0.
         self.paused = True
         return Command(0., 0., 'stop', reason)
 
@@ -218,9 +220,14 @@ class Navigation(object):
         self.candidate_blocks = {}
         if self.fault or self.paused or self.successor is not None or not ready(view, now):
             return None
-        if self.goal is not None:
-            if self.goal.action in PIVOTS:
+        actions = ('forward',) if self.forward_only else ('forward', 'left', 'right')
+        if self.goal is not None and self.goal.action in PIVOTS:
+            end_yaw = _wrap(self.goal.origin.yaw + PIVOTS[self.goal.action])
+            if abs(_wrap(end_yaw - view.pose.yaw)) > .12:
                 return None
+            anchor, predecessor = view.pose._replace(yaw=end_yaw), self.goal.sequence
+            actions = ('forward',)
+        elif self.goal is not None:
             remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
             if remaining > self.successor_lead:
                 return None
@@ -234,7 +241,6 @@ class Navigation(object):
         else:
             anchor, predecessor = view.pose, None
         choices = []
-        actions = ('forward',) if self.forward_only else ('forward', 'left', 'right')
         for action in actions:
             block = sweep_block(view.grid, anchor, self.length, self.curvature[action], view.pose)
             if block is None:
@@ -250,10 +256,16 @@ class Navigation(object):
     def prepare_pivot(self, view, now, direction, request=None):
         if (not self.static_room or self.fault or self.paused or self.successor is not None
                 or not ready(view, now) or self.goal is not None and request is None
+                or self.goal is not None and self.goal.action in PIVOTS
                 or request is not None and request is not self.pending):
             return None
         anchor = view.pose if request is None else request.anchor
         if not sweep_block(view.grid, anchor, .42, 0., occupied_only=True):
+            return None
+        if request is not None and any(
+                action in request.choices and not sweep_block(
+                    view.grid, anchor, ROOM_OBSTACLE_LOOKAHEAD, self.curvature[action], occupied_only=True)
+                for action in ('left', 'right')):
             return None
         away = 'right' if direction == 'left' else 'left'
         for option in (direction, away):
@@ -318,7 +330,7 @@ class Navigation(object):
             self.paused = False
             return Command(0., 0., 'stop', 'waiting_for_goal')
         if self.goal.action in PIVOTS:
-            return self._pivot(view)
+            return self._pivot(view, elapsed)
 
         remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
         if remaining <= STOP_DISTANCE:
@@ -328,26 +340,41 @@ class Navigation(object):
             self.completed = self.goal.sequence
             self.goal, self.successor = self.successor, None
             if self.goal is None:
-                self.speed = 0.
+                self.speed = self.steer = 0.
                 return Command(0., 0., 'stop', 'goal_reached')
             if self.goal.action in PIVOTS:
-                return self._pivot(view)
-            remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
+                return self._pivot(view, elapsed)
+        return self._track(view, elapsed)
 
+    def _track(self, view, elapsed):
         curvature = self.curvature[self.goal.action]
+        remaining = _remaining(self.goal, view.pose, self.length, curvature)
         on_path = arc_pose(self.goal.origin, max(0., self.length - remaining), curvature)
         error = _relative(on_path, view.pose)
         lateral_limit, yaw_limit = (.02, .05) if self.forward_only else (.04, .22)
         if abs(error.y) > lateral_limit or abs(error.yaw) > yaw_limit:
             return self.stop('path_tracking_lost')
-        target = arc_pose(self.goal.origin, self.length - max(0., remaining - .08), curvature)
+        if (self.static_room and remaining < .08 and self.successor is not None
+                and self.successor.action not in PIVOTS):
+            target = arc_pose(self.successor.origin, .08 - max(0., remaining),
+                              self.curvature[self.successor.action])
+        else:
+            target = arc_pose(self.goal.origin, self.length - max(0., remaining - .08), curvature)
         lookahead = _relative(view.pose, target)
         if lookahead.x <= 0:
             return self.stop('path_tracking_lost')
         steer = (0. if self.forward_only else
                  max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2))))
         lookahead_distance = min(.10, remaining + .03)
-        self.blocked_cell = sweep_block(view.grid, view.pose, lookahead_distance, steer)
+        checked = False
+        if self.static_room:
+            limit = 5. * min(.05, elapsed)
+            gradual = max(self.steer - limit, min(self.steer + limit, steer))
+            if gradual != steer and sweep_clear(view.grid, view.pose, lookahead_distance, gradual):
+                steer = gradual
+                checked = True
+        if not checked:
+            self.blocked_cell = sweep_block(view.grid, view.pose, lookahead_distance, steer)
         if (self.goal.action == 'forward' and steer and self.blocked_cell is not None
                 and self.blocked_cell[0] == 'unknown'
                 and sweep_clear(view.grid, view.pose, lookahead_distance, 0.)):
@@ -360,9 +387,11 @@ class Navigation(object):
         self.paused = False
         speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))
         self.speed = min(speed, self.speed + .04 * min(.05, elapsed))
+        self.steer = steer
         return Command(self.speed, self.speed * steer, self.goal.action, 'tracking')
 
-    def _pivot(self, view):
+    def _pivot(self, view, elapsed):
+        self.steer = 0.
         relative = _relative(self.goal.origin, view.pose)
         if math.hypot(relative.x, relative.y) > .025:
             return self.stop('path_tracking_lost')
@@ -370,8 +399,11 @@ class Navigation(object):
         sign = 1. if angle > 0. else -1.
         remaining = (angle - relative.yaw) * sign
         if remaining <= .012:
-            self.completed, self.goal = self.goal.sequence, None
+            self.completed = self.goal.sequence
+            self.goal, self.successor = self.successor, None
             self.speed = 0.
+            if self.goal is not None:
+                return self._track(view, elapsed)
             return Command(0., 0., 'stop', 'goal_reached')
         self.blocked_cell = rotation_block(view.grid, view.pose, sign * min(.13, remaining + .025))
         if self.blocked_cell is not None:

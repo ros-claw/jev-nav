@@ -34,6 +34,8 @@ The room output thread sends zero when the latest command has passed its sensor 
 
 The room profile checks 12 cm segments and looks farther for occupied cells when selecting a detour. A point turn is available when the straight route encounters an obstacle, the complete rotational sweep is observed, and a checked forward exit is available. The room relay caps rotation to 0.05 rad/s and enforces the same command and driver watchdogs during a point turn.
 
+The room controller follows through to the next checked segment as it nears a waypoint. Curvature changes are gradual when the resulting sweep is clear. A point turn can prepare and hand off to its checked forward exit. If path tracking loses the waypoint, the controller stops the current segment and can prepare a new segment at the measured pose using the accepted route. Clock and odometry faults still cancel the route.
+
 `run_trail_recovery.py` checks a recorded straight strip when the robot has stopped close to an obstacle. Its default verifies the recorded wheel odometry and reference without connecting to hardware. The supervised execute mode checks the live forward reference and follows the previously driven strip at bounded reverse speed. A separate reverse relay limits speed, heading corrections, and motion duration. This recovery depends on the strip remaining clear in the attended static room.
 
 ## Bounded forward trial

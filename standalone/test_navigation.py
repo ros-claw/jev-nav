@@ -433,6 +433,78 @@ def test_room_can_prepare_a_checked_pivot_at_a_close_obstacle():
     assert blind.prepare_pivot(view(1., cells=grid({(.47, 0.): 100, (-.18, -.06): -1})), 1., 'left') is None
 
 
+def test_room_keeps_the_model_route_when_tracking_needs_a_new_anchor():
+    calls = []
+
+    def choose(request, cancelled):
+        calls.append(request.sequence)
+        return 'circulate_left'
+
+    nav = Navigation(static_room=True)
+    runtime = NavigationRuntime(choose, lambda command: None, nav, static_room=True)
+    try:
+        runtime.cycle(view(1.), 1.)
+        timeout = time.time() + 1.
+        while runtime._result is None and time.time() < timeout:
+            time.sleep(.001)
+        assert runtime.cycle(view(1.05), 1.05)[0].action == 'left'
+        observation = view(1.10, Pose(.03, .06, .08))
+        command, request, _ = runtime.cycle(observation, 1.10)
+        assert command.reason == 'path_tracking_lost' and command.linear == 0.
+        assert request is None and runtime.room_continuation == (2, 'left', 1)
+        assert runtime.cycle(view(1.15, observation.pose), 1.15)[0].linear > 0.
+        assert calls == [1]
+    finally:
+        assert runtime.close()
+
+
+def test_room_looks_into_a_checked_successor_before_the_waypoint():
+    nav = Navigation(static_room=True)
+    select(nav, 'forward', 1., view(1.))
+    assert nav.step(view(1.05), 1.05).linear > 0.
+    before_join = view(7., Pose(.105, .003, 0.))
+    select(nav, 'forward', 7., before_join)
+    nav.speed = .02
+    cmd = nav.step(before_join, 7.)
+    assert cmd.linear == pytest.approx(.02)
+    assert -.03 < cmd.angular < 0.
+
+
+def test_room_slew_limiting_never_holds_an_occupied_sweep():
+    nav = Navigation(static_room=True)
+    select(nav, 'left', 1., view(1.))
+    nav.steer, nav.speed = -2., .02
+    # Gradual steering still swings the rear toward this cell. The new left
+    # curve has a clear swept area and can be used immediately.
+    cmd = nav.step(view(1.05, cells=grid({(-.10, .14): 100})), 1.05)
+    assert cmd.linear > 0. and cmd.angular > 0.
+    stopped = nav.step(view(1.10, cells=grid({(.22, 0.): 100})), 1.10)
+    assert stopped.reason == 'path_occupied' and stopped.linear == stopped.angular == 0.
+
+
+def test_room_pivot_hands_off_to_checked_forward_without_a_zero_setpoint():
+    nav = Navigation(static_room=True)
+    cells = grid({(.47, 0.): 100})
+    assert nav.prepare_pivot(view(1., cells=cells), 1., 'left') == 'pivot_left'
+    near_end = view(10., Pose(0., 0., .62), cells)
+    assert nav.step(near_end, 10.).angular > 0.
+    exit_request = nav.request(near_end, 10.)
+    assert exit_request.choices == ('forward', 'stop')
+    assert nav.accept(exit_request, 'forward', near_end, 10.)
+    after_pivot = view(10.05, Pose(0., 0., .695), cells)
+    cmd = nav.step(after_pivot, 10.05)
+    assert cmd.action == 'forward' and cmd.linear > 0.
+
+
+def test_room_prefers_a_checked_detour_arc_to_a_pivot():
+    nav = Navigation(static_room=True)
+    observation = view(1., cells=grid({(.35, .08): 100}))
+    offered = nav.request(observation, 1.)
+    assert 'right' in offered.choices
+    assert nav.prepare_pivot(observation, 1., 'left', offered) is None
+    assert nav.pending is offered
+
+
 def test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices():
     release = threading.Event()
     choices = iter(('forward', 'left', 'right', 'forward'))

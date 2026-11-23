@@ -3,7 +3,8 @@ from __future__ import division
 
 import threading
 
-from navigation import PIVOTS, Command, MAX_RESPONSE_AGE, Navigation, ready, sweep_block, sweep_clear
+from navigation import (PIVOTS, ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
+                        ready, sweep_block, sweep_clear)
 
 
 ROOM_DIRECTIONS = {'circulate_left': 'left', 'circulate_right': 'right'}
@@ -65,8 +66,10 @@ class NavigationRuntime(object):
         if survey:
             self.navigation.stop('path_unknown')
             self._last_grid = None
-        if command.reason in ('path_tracking_lost', 'clock_or_odometry_reset'):
+        if command.reason == 'clock_or_odometry_reset':
             self.room_plan = None
+        elif command.reason == 'path_tracking_lost' and self.room_plan is not None:
+            self._last_grid = None
         published = self.publish(command)
         if published is not None:
             command = published
@@ -102,9 +105,9 @@ class NavigationRuntime(object):
             # Look farther for already observed obstacles. Both executable
             # choices still require a strict, shorter swept-area check.
             if (view is not None and away in request.choices
-                    and sweep_block(view.grid, request.anchor, .60, self.navigation.curvature[direction],
+                    and sweep_block(view.grid, request.anchor, ROOM_OBSTACLE_LOOKAHEAD, self.navigation.curvature[direction],
                                     occupied_only=True)
-                    and not sweep_block(view.grid, request.anchor, .60, self.navigation.curvature[away],
+                    and not sweep_block(view.grid, request.anchor, ROOM_OBSTACLE_LOOKAHEAD, self.navigation.curvature[away],
                                         occupied_only=True)):
                 return away
             return direction
