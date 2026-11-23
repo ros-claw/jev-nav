@@ -28,7 +28,7 @@ _FIELDS = frozenset(('sensor_acquired_at', 'sensor_received_at', 'perception_sta
                      'selected_action', 'final_action', 'veto_reason', 'stop_reason',
                      'linear', 'angular', 'x', 'y', 'yaw', 'linear_velocity',
                      'relay_at', 'relay_linear', 'relay_angular', 'relay_reason',
-                     'blocked_action',
+                     'blocked_action', 'turn_target_rad',
                      'angular_velocity', 'sequence', 'epoch', 'latency_sec',
                      'processing_sec', 'queue_delay_sec', 'remaining_sec', 'dropped',
                      'depth_count', 'front_count', 'status', 'clock_domain',

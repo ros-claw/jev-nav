@@ -383,6 +383,7 @@ def main(argv=None):
     last_authority_check = 0.
     authority_diagnostics = {}
     arc_traces = {}
+    early_detours = 0
     travelled = 0.
     reason = 'session_ended'
     started = ended = _monotonic()
@@ -477,6 +478,8 @@ def main(argv=None):
                 fields['rear_memory_age_sec'] = room.oldest_age
             if command.action != 'stop':
                 fields['decision_id'] = runtime.navigation.goal.sequence
+                if command.action in PIVOTS:
+                    fields['turn_target_rad'] = runtime.navigation.goal.turn
             if view is not None:
                 ready_ticks += int(ready(view, now))
                 fields.update(scan_at=view.scan_at, depth_at=view.depth_at, odom_at=view.odom_at,
@@ -489,6 +492,12 @@ def main(argv=None):
                         'action': command.action, 'started_at': now, 'start_yaw_rad': view.pose.yaw})
                     trace.update(last_at=now, last_yaw_rad=view.pose.yaw)
             timeline.record('control', now, fields)
+            if runtime.early_detour is not None:
+                previous, (_, x, y) = runtime.early_detour
+                early_detours += 1
+                timeline.record('decision', now, {'stage': 'early_detour', 'reason': 'obstacle_ahead',
+                                                   'blocked_action': previous, 'selected_action': command.action,
+                                                   'scene_id': runtime.room_plan[0], 'x': x, 'y': y})
             if command.reason in ('perception_unavailable', 'clock_or_odometry_reset'):
                 diagnostics = source.observation.diagnostic_status()
                 fault = diagnostics['clock_fault'] or diagnostics['odom_fault'] or runtime.navigation.fault
@@ -577,6 +586,7 @@ def main(argv=None):
               'observation_diagnostics': source.observation.diagnostic_status() if source is not None else {},
               'decision_errors': source.decision_errors if source is not None else {},
               'decision_scan_counts': source.decision_scan_counts if source is not None else {},
+              'early_detours': early_detours,
               'arc_traces': arc_traces,
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}

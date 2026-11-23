@@ -10,15 +10,17 @@ Grid = namedtuple('Grid', 'x y resolution width height cells')
 View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready')
 Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks')
 Command = namedtuple('Command', 'linear angular action reason')
-Segment = namedtuple('Segment', 'sequence action origin')
+Segment = namedtuple('Segment', 'sequence action origin turn')
 
 LENGTH = .24
 ROOM_LENGTH = .12
 ROOM_OBSTACLE_LOOKAHEAD = .60
+ROOM_TRACK_LOOKAHEAD = .36
 FORWARD_SUCCESSOR_LEAD = .15
 CURVATURE = {'forward': 0., 'left': .8, 'right': -.8}
 ROOM_CURVATURE = {'forward': 0., 'left': 1.35, 'right': -1.35}
 PIVOTS = {'pivot_left': .70, 'pivot_right': -.70}
+ROOM_CORNER_TURNS = (.70, 1.40, 2.10, 2.45)
 SPEED = .02
 MAX_RESPONSE_AGE = 8.
 HALF_LENGTH, HALF_WIDTH = .16, .11
@@ -204,6 +206,7 @@ class Navigation(object):
         self.paused = False
         self.blocked_cell = self.blocked_action = None
         self.candidate_blocks = {}
+        self._blocked_corner = None
 
     def stop(self, reason):
         self.goal = self.successor = self.pending = self.completed = None
@@ -222,7 +225,7 @@ class Navigation(object):
             return None
         actions = ('forward',) if self.forward_only else ('forward', 'left', 'right')
         if self.goal is not None and self.goal.action in PIVOTS:
-            end_yaw = _wrap(self.goal.origin.yaw + PIVOTS[self.goal.action])
+            end_yaw = _wrap(self.goal.origin.yaw + self.goal.turn)
             if abs(_wrap(end_yaw - view.pose.yaw)) > .12:
                 return None
             anchor, predecessor = view.pose._replace(yaw=end_yaw), self.goal.sequence
@@ -259,7 +262,7 @@ class Navigation(object):
                                blocks)
         return self.pending
 
-    def prepare_pivot(self, view, now, direction, request=None):
+    def prepare_pivot(self, view, now, direction, request=None, allow_wide=False):
         if (not self.static_room or self.fault or self.paused or self.successor is not None
                 or not ready(view, now) or self.goal is not None and request is None
                 or self.goal is not None and self.goal.action in PIVOTS
@@ -274,19 +277,27 @@ class Navigation(object):
                 for action in ('left', 'right')):
             return None
         away = 'right' if direction == 'left' else 'left'
-        for option in (direction, away):
-            action = 'pivot_' + option
-            if not self._pivot_clear(view, anchor, action):
-                continue
-            if request is None:
-                self.sequence += 1
-            self.pending = None
-            pivot = Segment(self.sequence, action, anchor)
-            if self.goal is None:
-                self.goal = pivot
-            else:
-                self.successor = pivot
-            return action
+        corner = ((view.epoch, view.pose, view.grid, direction)
+                  if allow_wide and self.goal is None and request is None else None)
+        if corner is not None and corner == self._blocked_corner:
+            return None
+        for angle in ROOM_CORNER_TURNS if corner is not None else (.70,):
+            for option in (direction, away):
+                action = 'pivot_' + option
+                turn = math.copysign(angle, PIVOTS[action])
+                if not self._pivot_clear(view, anchor, action, turn):
+                    continue
+                if request is None:
+                    self.sequence += 1
+                self.pending = self._blocked_corner = None
+                pivot = Segment(self.sequence, action, anchor, turn)
+                if self.goal is None:
+                    self.goal = pivot
+                else:
+                    self.successor = pivot
+                return action
+        if corner is not None:
+            self._blocked_corner = corner
         return None
 
     def replace_unknown_path(self, view, now, direction):
@@ -314,15 +325,45 @@ class Navigation(object):
                 return None
         self.stop('path_unknown')
         self.sequence += 1
-        self.goal = Segment(self.sequence, action, view.pose)
+        self.goal = Segment(self.sequence, action, view.pose, PIVOTS.get(action))
         return action
 
-    def _pivot_clear(self, view, anchor, action):
-        angle = PIVOTS[action]
+    def anticipate_obstacle(self, view, now, command, direction):
+        """Start a checked detour while the current setpoint still passes its sweep."""
+        if (not self.static_room or command.linear <= 0. or self.goal is None
+                or self.goal.action != command.action or not ready(view, now)
+                or view.epoch != self.epoch or self.successor is not None and self.successor.action in PIVOTS):
+            return None
+        curvature = self.curvature[self.goal.action]
+        distance = ROOM_TRACK_LOOKAHEAD
+        if self.successor is not None:
+            distance = min(distance, max(0., _remaining(self.goal, view.pose, self.length, curvature)))
+        block = sweep_block(view.grid, view.pose, distance, curvature, occupied_only=True)
+        if block is None and self.successor is not None and distance < ROOM_TRACK_LOOKAHEAD:
+            block = sweep_block(view.grid, self.successor.origin, ROOM_TRACK_LOOKAHEAD - distance,
+                                self.curvature[self.successor.action], view.pose, occupied_only=True)
+        if block is None:
+            return None
+        away = 'right' if direction == 'left' else 'left'
+        for action in (direction, away, 'forward'):
+            if action == self.goal.action:
+                continue
+            candidate = self.curvature[action]
+            if (sweep_clear(view.grid, view.pose, self.length, candidate)
+                    and not sweep_block(view.grid, view.pose, ROOM_TRACK_LOOKAHEAD, candidate, occupied_only=True)):
+                self.sequence += 1
+                self.goal = Segment(self.sequence, action, view.pose, None)
+                self.successor = self.pending = self.completed = None
+                # Reuse the tracker's steering and swept-body gate for the published command.
+                return self._track(view, 0.), block
+        return None
+
+    def _pivot_clear(self, view, anchor, action, turn=None):
+        angle = PIVOTS[action] if turn is None else turn
         turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
-        return (rotation_block(view.grid, anchor, angle, view.pose) is None
-                and sweep_clear(view.grid, turned, self.length, 0., view.pose)
-                and sweep_block(view.grid, turned, .31, 0., occupied_only=True) is None)
+        return (sweep_clear(view.grid, turned, self.length, 0., view.pose)
+                and sweep_block(view.grid, turned, .31, 0., occupied_only=True) is None
+                and rotation_block(view.grid, anchor, angle, view.pose) is None)
 
     def anchor_current(self, request, view, now):
         if not ready(view, now) or request.epoch != view.epoch:
@@ -352,7 +393,7 @@ class Navigation(object):
                 return False
         elif not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
             return False
-        segment = Segment(request.sequence, choice, request.anchor)
+        segment = Segment(request.sequence, choice, request.anchor, PIVOTS.get(choice))
         if active_predecessor:
             self.successor = segment
         elif self.goal is None and request.predecessor in (None, self.completed):
@@ -442,7 +483,7 @@ class Navigation(object):
         relative = _relative(self.goal.origin, view.pose)
         if math.hypot(relative.x, relative.y) > .025:
             return self.stop('path_tracking_lost')
-        angle = PIVOTS[self.goal.action]
+        angle = self.goal.turn
         sign = 1. if angle > 0. else -1.
         remaining = (angle - relative.yaw) * sign
         if remaining <= .012:

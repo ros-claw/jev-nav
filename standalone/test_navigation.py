@@ -584,6 +584,35 @@ def test_room_pivot_hands_off_to_checked_forward_without_a_zero_setpoint():
     assert cmd.action == 'forward' and cmd.linear > 0.
 
 
+def test_room_stationary_pivot_can_find_an_exit_beyond_the_fixed_turn():
+    side = 120
+    coordinates = [-3. + (index + .5) * .05 for index in range(side)]
+    cells = tuple(100 if (abs(x) >= 1.92 or abs(y) >= 1.60 or -1.60 <= x < -1.45 and .70 <= y < .85)
+                  else 0 for y in coordinates for x in coordinates)
+    corner = Grid(-3., -3., .05, side, side, cells)
+    pose = Pose(-1.6477, 1.3001, 2.8506)
+    observation = view(1., pose, corner)
+    nav = Navigation(static_room=True)
+    assert nav.request(observation, 1.) is None
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None, nav, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        for at in (1., 1.05, 1.10, 1.15, 1.20):
+            assert runtime.cycle(view(at, pose, corner), at)[0].action == 'stop'
+            assert nav.goal is None
+        runtime.cycle(view(1.25, pose, corner), 1.25)
+        assert runtime.room_continuation[1] == 'pivot_right'
+    finally:
+        assert runtime.close()
+    assert nav.goal.turn == pytest.approx(-2.45)
+    assert nav.step(view(1.30, pose, corner), 1.30).angular < 0.
+    turned = pose._replace(yaw=pose.yaw + nav.goal.turn)
+    exit_view = view(50., turned._replace(yaw=turned.yaw + .06), corner)
+    assert nav.step(exit_view, 50.).angular < 0.
+    select(nav, 'forward', 50., exit_view)
+    assert nav.step(view(50.05, turned, corner), 50.05).linear > 0.
+
+
 def test_room_prefers_a_checked_detour_arc_to_a_pivot():
     nav = Navigation(static_room=True)
     observation = view(1., cells=grid({(.35, .08): 100}))
@@ -591,6 +620,44 @@ def test_room_prefers_a_checked_detour_arc_to_a_pivot():
     assert 'right' in offered.choices
     assert nav.prepare_pivot(observation, 1., 'left', offered) is None
     assert nav.pending is offered
+
+
+@pytest.mark.parametrize('scenario', ['clear_detour', 'blocked_detour', 'unknown_detour', 'known_successor',
+                                     'near_obstacle', 'stale', 'short_deadline'])
+def test_room_preempts_a_new_obstacle_before_the_immediate_sweep_is_blocked(scenario):
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    pose = Pose(.06, 0., 0.)
+    navigation.step(view(1.05, pose), 1.05)
+    successor = 'left' if scenario == 'known_successor' else 'forward'
+    select(navigation, successor, 1.05, view(1.05, pose))
+    obstacle = (.23, 0.) if scenario == 'near_obstacle' else (
+        (.41, 0.) if scenario == 'blocked_detour' else (.45, -.095))
+    cells = {obstacle: 100}
+    if scenario == 'unknown_detour':
+        cells[.17, .10] = -1
+    measured = view(1.10, pose, cells=grid(cells),
+                    scan={'stale': .75, 'short_deadline': .83}.get(scenario))
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        command, _, _ = runtime.cycle(measured, 1.10)
+        if scenario == 'clear_detour':
+            assert command.action == 'left' and command.linear > 0.
+            assert runtime.early_detour[0] == 'forward'
+            assert runtime.room_plan == (1, 'left')
+            following, _, _ = runtime.cycle(view(1.15, pose, cells=measured.grid), 1.15)
+            assert following.linear > 0. and following.angular > 0.
+        else:
+            assert runtime.early_detour is None
+            if scenario in ('near_obstacle', 'stale'):
+                assert command.linear == command.angular == 0.
+            else:
+                assert command.action == 'forward' and command.linear > 0.
+                assert navigation.successor.action == successor
+    finally:
+        assert runtime.close()
 
 
 def test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices():

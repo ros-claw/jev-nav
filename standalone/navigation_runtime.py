@@ -1,13 +1,18 @@
 """Run local control with an asynchronous Decisions worker."""
 from __future__ import division
 
+import math
 import threading
 
-from navigation import ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation, ready, sweep_block
+from navigation import (ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
+                        _relative, observation_deadline, ready, sweep_block)
 
 
 ROOM_DIRECTIONS = {'circulate_left': 'left', 'circulate_right': 'right'}
 ROOM_ROUTE_REVIEW_SEC = 45.
+ROOM_PREDICTION_PERIOD = .25
+ROOM_PREDICTION_BUDGET = .055
+ROOM_DETOUR_COOLDOWN = 1.
 
 
 def offered_direction(request, direction):
@@ -30,6 +35,10 @@ class NavigationRuntime(object):
         self.room_replacement = False
         self.review_origin = None
         self._review_after = 0.
+        self._predict_after = 0.
+        self._prediction_grid = None
+        self.early_detour = None
+        self._settling = None
         self._worker = threading.Thread(target=self._work, name='navigation-decisions')
         self._worker.daemon = True
         self._worker.start()
@@ -53,6 +62,7 @@ class NavigationRuntime(object):
         decision = None
         self.room_continuation = None
         self.room_replacement = False
+        self.early_detour = None
         if result is not None:
             request, choice = result
             current_request = request is self.navigation.pending or self.review_origin is not None
@@ -86,8 +96,23 @@ class NavigationRuntime(object):
                     self._next_request = now + 1.
 
         command = self.navigation.step(view, now)
+        if (self.room_plan is not None and command.linear > 0. and now >= self._predict_after
+                and view.grid_at != self._prediction_grid):
+            until = observation_deadline(view, now)
+            if until is not None and until - now >= ROOM_PREDICTION_BUDGET:
+                self._prediction_grid = view.grid_at
+                self._predict_after = now + ROOM_PREDICTION_PERIOD
+                previous = command.action
+                detour = self.navigation.anticipate_obstacle(view, now, command, self.room_plan[1])
+                if detour is not None:
+                    command, block = detour
+                    self.early_detour = previous, block
+                    self._predict_after = now + ROOM_DETOUR_COOLDOWN
         if command.reason != 'path_unknown':
             self._blocked_replacement = None
+        settled = command.reason == 'waiting_for_goal' and self.room_plan is not None and self._settled(view, now)
+        if command.reason != 'waiting_for_goal' or self.room_plan is None:
+            self._settling = None
         if command.reason == 'clock_or_odometry_reset':
             self.room_plan = None
         elif command.reason == 'path_tracking_lost' and self.room_plan is not None:
@@ -116,7 +141,7 @@ class NavigationRuntime(object):
             offered = self.navigation.request(view, now)
             if self.room_plan is not None:
                 source, direction = self.room_plan
-                pivot = self.navigation.prepare_pivot(view, now, direction, offered)
+                pivot = self.navigation.prepare_pivot(view, now, direction, offered, allow_wide=settled)
                 if pivot is not None:
                     self.room_continuation = (self.navigation.sequence, pivot, source)
                     offered = None
@@ -138,6 +163,15 @@ class NavigationRuntime(object):
             elif offered is not None:
                 offered = None
         return command, offered, decision
+
+    def _settled(self, view, now):
+        if self._settling is not None:
+            at, pose, odom_at = self._settling
+            motion = _relative(pose, view.pose)
+            if math.hypot(motion.x, motion.y) <= .003 and abs(motion.yaw) <= .012:
+                return now - at >= .25 and view.odom_at > odom_at
+        self._settling = now, view.pose, view.odom_at
+        return False
 
     def _review_route(self, request, choice, direction, view, now):
         if (self.room_plan is None or self.room_plan[0] != self.review_origin
