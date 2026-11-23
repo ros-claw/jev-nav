@@ -12,6 +12,8 @@ roslaunch standalone/navigation_hardware.launch
 
 This profile expects the [watchdog-capable LIMO driver](../docs/DRIVER_WATCHDOG_CANDIDATE.md), the X2L launch from `ydlidar_ros`, and an `astra_camera` build with the `keep_streaming` and `tf_publish_rate` arguments. The fixed sensor and optical transforms are latched on `/tf_static`; odometry remains time-varying. Depth projection can use each frame's acquisition time as soon as the corresponding odometry transform is available. Verify the mounting coordinates in the launch file before using it on another installation.
 
+For a stationary lidar coverage check, set `laser_angle_min:=-180 laser_angle_max:=180` on `roslaunch`. The installed LIMO covered the front while the rear bearings needed for both arcs had no valid returns. The launch also accepts `laser_x`, `laser_y`, `laser_z`, and `laser_yaw` for a measured lidar mounting position and orientation.
+
 Run a recorded live preview in another shell with the same ROS environment.
 
 ```sh
@@ -21,6 +23,8 @@ Run a recorded live preview in another shell with the same ROS environment.
 The timeline path must be new. Omitting `--seconds` runs the preview until shutdown. The test `test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices` runs 31 simulated seconds of odometry feedback through three decisions and tests stopping on missing input.
 
 `--drive-forward` enables supervised straight operation with Decisions, a current `--operator-clear-front` site report, a finite test duration, and the exact `--driver-pid`, `--driver-exe`, and `--driver-sha256`. It uses a separate relay bound to the candidate driver's watchdog. The relay accepts ordinary zero setpoints and keeps enforcing controller heartbeat and driver status. `--max-travel-m` bounds the supervised run using cumulative wheel odometry. The hardware profile offers forward and stop and emits zero angular velocity. Its JSON contains the relay-attributed `/cmd_vel` trace, the longest uninterrupted nonzero interval, and wheel-odometry displacement.
+
+`--drive-arcs` selects the hardware profile for forward segments and shallow turns. It requires Decisions, the same driver identity and a finite duration. Each direction must pass the current grid's swept-body check. The relay bounds forward speed and steering curvature and stops on lost heartbeat. The run records angular commands and the measured heading change of each model-selected arc by decision ID. Turn validation needs observed side and rear clearance. Use the private preview to check which directions the installed sensors support.
 
 ## Bounded forward trial
 

@@ -165,7 +165,9 @@ def parse_args(argv=None):
     parser.add_argument('--timeline', required=True)
     parser.add_argument('--seconds', type=float, help='end a recorded validation run after this many seconds')
     parser.add_argument('--decisions', action='store_true', help='enable Decisions API calls for checked candidates')
-    parser.add_argument('--drive-forward', action='store_true', help='use the supervised forward hardware output')
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument('--drive-forward', action='store_true', help='use the supervised forward hardware output')
+    output.add_argument('--drive-arcs', action='store_true', help='execute currently observed forward and arc paths')
     parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
@@ -173,19 +175,19 @@ def parse_args(argv=None):
     parser.add_argument('--speed-mps', type=float)
     parser.add_argument('--max-travel-m', type=float, default=.40)
     args = parser.parse_args(argv)
+    args.drive = args.drive_forward or args.drive_arcs
     if args.speed_mps is None:
-        args.speed_mps = .014 if args.drive_forward else .02
+        args.speed_mps = .014 if args.drive else .02
     if args.seconds is not None and not 0. < args.seconds < float('inf'):
         parser.error('seconds must be positive and finite')
     if not 0 < args.speed_mps <= .02 or not .05 <= args.max_travel_m <= .50:
         parser.error('invalid supervised motion bounds')
-    if args.drive_forward and (not args.decisions or not args.operator_clear_front or args.seconds is None
-                               or args.driver_pid is None or args.driver_pid <= 1
-                               or not args.driver_exe or not os.path.isabs(args.driver_exe)
-                               or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
-        parser.error('forward hardware operation requires Decisions, site report, finite run and driver identity')
-    if args.operator_clear_front and not args.drive_forward:
-        parser.error('the operator site report is only used for supervised hardware operation')
+    if args.drive and (not args.decisions or args.seconds is None or args.driver_pid is None or args.driver_pid <= 1
+                       or not args.driver_exe or not os.path.isabs(args.driver_exe)
+                       or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
+        parser.error('hardware operation requires Decisions, a finite run and driver identity')
+    if args.operator_clear_front != args.drive_forward:
+        parser.error('the operator clear-front report is required for --drive-forward only')
     return args
 
 
@@ -197,14 +199,24 @@ def summarize_navigation_trajectory(trajectory):
     active = [row for row in commands if row[1] or row[2]]
     summary = summarize_observations([], commands)
     summary.update({'measurement_scope': 'relay_callback_window', 'relay_caller_observed': bool(commands),
-                    'longest_nonzero_sec': 0., 'zero_after_last_motion': None})
+                    'longest_nonzero_sec': 0., 'zero_after_last_motion': None,
+                    'nonzero_angular_cmd_vel_messages': sum(row[2] != 0. for row in commands),
+                    'odom_heading_span_rad': None})
     if not active:
         return summary
     first = active[0][0]
     stop = next((row[0] for row in commands if row[0] > active[-1][0] and not (row[1] or row[2])), None)
     last = active[-1][0] if stop is None else stop
-    odometry = sorted((row[:4] for row in trajectory['odom'] if first <= row[0] <= last), key=lambda row: row[0])
-    summary.update(summarize_observations(odometry, commands))
+    odometry = sorted((row for row in trajectory['odom'] if first <= row[0] <= last), key=lambda row: row[0])
+    summary.update(summarize_observations([row[:4] for row in odometry], commands))
+    headings = [row[4] for row in odometry if len(row) >= 5]
+    if headings:
+        current = minimum = maximum = 0.
+        for before, after in zip(headings, headings[1:]):
+            change = after - before
+            current += math.atan2(math.sin(change), math.cos(change))
+            minimum, maximum = min(minimum, current), max(maximum, current)
+        summary['odom_heading_span_rad'] = maximum - minimum
     start = previous = None
     for at, linear, angular in commands:
         # A gap at least as long as the driver watchdog cannot establish an
@@ -253,6 +265,7 @@ def main(argv=None):
     first_pose = last_pose = None
     unavailable_guards = ()
     authority_diagnostics = {}
+    arc_traces = {}
     travelled = 0.
     reason = 'session_ended'
     started = ended = _monotonic()
@@ -274,7 +287,7 @@ def main(argv=None):
                 publisher.publish(packet)
 
         choose = source.choose if args.decisions else lambda request, cancelled: None
-        if args.drive_forward:
+        if args.drive:
             from live_monitors import ProcFdSerialBackend, SerialOwnershipMonitor
             from live_trial_adapter import RelayProcessTransport
             from supervised_trial import ObservationRecorder, RealClock, make_ros_monitor
@@ -293,7 +306,8 @@ def main(argv=None):
             serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                                   args.driver_sha256, max_age=.6, acquire_timeout=1.2,
                                                   ros_monitor=ros_guard)
-            actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock)
+            actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock,
+                                          arc_navigation=args.drive_arcs)
             recorder = ObservationRecorder(clock, capacity=12000)
             actuator.open()
         navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps)
@@ -309,7 +323,7 @@ def main(argv=None):
                     raise ActuationError('navigation_perception_process_exited')
             view = source.view()
             now = _monotonic()
-            if args.drive_forward and view is not None and last_pose is not None:
+            if args.drive and view is not None and last_pose is not None:
                 travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
                 if travelled >= args.max_travel_m:
                     reason = 'travel_limit'
@@ -327,6 +341,10 @@ def main(argv=None):
                               x=view.pose.x, y=view.pose.y, yaw=view.pose.yaw, epoch=view.epoch)
                 first_pose = view.pose if first_pose is None else first_pose
                 last_pose = view.pose
+                if command.action in ('left', 'right'):
+                    trace = arc_traces.setdefault(fields['decision_id'], {
+                        'action': command.action, 'started_at': now, 'start_yaw_rad': view.pose.yaw})
+                    trace.update(last_at=now, last_yaw_rad=view.pose.yaw)
             timeline.record('control', now, fields)
             if actuator is not None and actuator.unavailable_guards != unavailable_guards:
                 unavailable_guards = actuator.unavailable_guards
@@ -374,11 +392,20 @@ def main(argv=None):
                 timeline_closed = timeline.close() if timeline is not None else None
                 for child in reversed(children):
                     _stop_group(child)
-    result = {'mode': 'supervised_forward_navigation' if args.drive_forward else 'private_ros_navigation',
-              'preview_topic': None if args.drive_forward else preview, 'control': counts, 'reason': reason,
+    mode = 'private_ros_navigation'
+    if args.drive_forward:
+        mode = 'supervised_forward_navigation'
+    elif args.drive_arcs:
+        mode = 'supervised_arc_navigation'
+    for trace in arc_traces.values():
+        change = trace['last_yaw_rad'] - trace['start_yaw_rad']
+        trace['heading_change_rad'] = math.atan2(math.sin(change), math.cos(change))
+    result = {'mode': mode,
+              'preview_topic': None if args.drive else preview, 'control': counts, 'reason': reason,
               'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
               'grid_updates': source.grid_updates if source is not None else {},
               'decision_errors': source.decision_errors if source is not None else {},
+              'arc_traces': arc_traces,
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}
     if actuator is not None:
@@ -389,8 +416,13 @@ def main(argv=None):
                       observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
     print(json.dumps(result, allow_nan=False))
     complete = ready_ticks and timeline_closed and model_joined
-    if args.drive_forward:
+    if args.drive:
         complete = complete and actuator is not None and actuator.transport.exited and travelled >= .20
+    if args.drive_arcs and complete:
+        observed = result['observed']
+        complete = observed['nonzero_angular_cmd_vel_messages'] and any(
+            (1 if trace['action'] == 'left' else -1) * trace['heading_change_rad'] >= .05
+            for trace in arc_traces.values())
     return 0 if complete else 2
 
 

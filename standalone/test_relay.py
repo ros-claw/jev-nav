@@ -21,6 +21,24 @@ except ImportError:  # Python 3.12 removed imp; ROS Melodic still uses Python 2.
 
 
 class GateTests(unittest.TestCase):
+    def test_arc_navigation_accepts_both_directions_and_stops_on_disconnect(self):
+        gate = relay.RelayGate(10., arc_navigation=True)
+        for index, velocities in enumerate(((.014, .0112), (0., 0.), (.014, -.0112))):
+            now = 10. + index * .05
+            self.assertTrue(gate.accept(dict(sequence=index, stamp=now, linear=velocities[0],
+                                             angular=velocities[1]), now))
+            self.assertEqual(gate.command(now), velocities)
+        self.assertEqual(gate.command(10.31), (0., 0.))
+        self.assertEqual(gate.reason, 'heartbeat')
+
+    def test_arc_navigation_rejects_pivot_reverse_and_excess_curvature(self):
+        for linear, angular in (('0', '0.01'), ('0', '1e-10000000'), ('-0.014', '0'), ('0.02', '0.043'),
+                                ('0.001', '0.004'), ('0.020000000000000000001', '0')):
+            text = ('{"sequence":0,"stamp":10,"linear":%s,"angular":%s}\n' % (linear, angular)).encode('ascii')
+            gate = relay.RelayGate(10., arc_navigation=True)
+            self.assertFalse(gate.accept(relay.FrameReader().feed(text)[0], 10.))
+            self.assertEqual(gate.reason, 'invalid_frame')
+
     def test_navigation_can_pause_and_resume_until_a_controller_disconnect(self):
         gate = relay.RelayGate(10.0, forward_navigation=True)
         for sequence, linear in enumerate((0.0, 0.014, 0.0, 0.014, 0.02)):
@@ -327,7 +345,7 @@ sys.modules.update({'rospy': rospy, 'geometry_msgs': geometry,
                     'geometry_msgs.msg': geometry_msg, 'std_msgs': std,
                     'std_msgs.msg': std_msg})
 sys.exit(relay.main(0.3 if mode == 'absolute_deadline' else None,
-                   forward_navigation=mode == 'forward_navigation'))
+                   forward_navigation=mode == 'forward_navigation', arc_navigation=mode == 'arc_navigation'))
 """
 
 
@@ -409,6 +427,21 @@ class SubprocessTests(unittest.TestCase):
         last_nonzero = max(i for i, x in enumerate(commands) if x != 'CMD 0.0000 0.0000')
         self.assertGreaterEqual(len(commands) - last_nonzero - 1, 2)
         self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in commands[last_nonzero + 1:]))
+
+    def test_arc_navigation_publishes_both_axes_and_zeros_on_heartbeat_loss(self):
+        self.start('arc_navigation')
+        self.await_line(1, 'READY arc_navigation')
+        sequence = 0
+        for linear, angular in ((.014, .0112), (0., 0.), (.014, -.0112)):
+            start = len(self.lines[2])
+            for _ in range(3):
+                self.send(sequence, linear, angular)
+                sequence += 1
+                self.pump(.05)
+            self.assertIn('CMD %.4f %.4f' % (linear, angular), self.lines[2][start:])
+        self.await_line(1, 'FAULT heartbeat')
+        self.pump(.15)
+        self.assertEqual(self.lines[2][-1], 'CMD 0.0000 0.0000')
 
     def test_navigation_publishes_zero_then_resumes_and_stops_on_heartbeat_loss(self):
         self.start('forward_navigation')

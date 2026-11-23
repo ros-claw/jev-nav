@@ -284,7 +284,13 @@ class Navigation(object):
             return self._stop('path_tracking_lost')
         steer = (0. if self.forward_only else
                  max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2))))
-        self.blocked_cell = sweep_block(view.grid, view.pose, min(.10, remaining + .03), steer)
+        lookahead_distance = min(.10, remaining + .03)
+        self.blocked_cell = sweep_block(view.grid, view.pose, lookahead_distance, steer)
+        if (self.goal.action == 'forward' and steer and self.blocked_cell is not None
+                and self.blocked_cell[0] == 'unknown'
+                and sweep_clear(view.grid, view.pose, lookahead_distance, 0.)):
+            steer = 0.
+            self.blocked_cell = None
         if self.blocked_cell is not None:
             if self.blocked_cell[0] == 'occupied':
                 return self._stop('path_occupied')

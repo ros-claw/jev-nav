@@ -466,6 +466,9 @@ class RelayProcessTransport(object):
     def start_forward_navigation(self):
         self._start(["--forward-navigation"])
 
+    def start_arc_navigation(self):
+        self._start(["--arc-navigation"])
+
     def _start(self, flags):
         if self.process is not None:
             raise ValueError("invalid relay startup")

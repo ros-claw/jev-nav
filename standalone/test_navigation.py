@@ -111,6 +111,15 @@ def test_arc_does_not_claim_the_area_directly_behind_a_forward_moving_body():
     assert not sweep_clear(grid({(.05, -.117): -1}), pose, .24, .8)
 
 
+def test_straight_goal_uses_forward_only_if_an_unobserved_correction_is_blocked():
+    navigation = Navigation()
+    select(navigation, 'forward', 1., view(1.))
+    cells = grid({(-.138, .114): -1})
+    observation = view(1.05, Pose(.01, .002, .01), cells)
+    command = navigation.step(observation, 1.05)
+    assert command.action == 'forward' and command.linear > 0. and command.angular == 0.
+
+
 def test_successor_is_decided_while_the_robot_follows_current_segment():
     navigation = Navigation()
     select(navigation, 'forward', 1., view(1.))
@@ -165,6 +174,16 @@ def test_navigation_trajectory_counts_motion_after_a_pause():
     assert result['odom_displacement_m'] == .02 and result['zero_after_last_motion'] == 1.35
 
 
+def test_turn_measurement_unwraps_heading_while_the_robot_moves():
+    from run_navigation import summarize_navigation_trajectory
+    commands = [(1., .014, .011), (1.05, .014, .011), (1.10, 0., 0.)]
+    odometry = [(1., 0., 0., .014, 3.12), (1.05, .001, 0., .014, -3.13),
+                (1.10, .002, 0., 0., -3.09)]
+    result = summarize_navigation_trajectory({'commands': commands, 'odom': odometry})
+    assert result['nonzero_angular_cmd_vel_messages'] == 2
+    assert result['odom_heading_span_rad'] == pytest.approx(2 * math.pi - 6.21)
+
+
 def test_low_light_uplift_uses_a_pixelwise_bounded_transform():
     import numpy as np
     from run_navigation import brighten_low_light
@@ -178,7 +197,8 @@ def test_low_light_uplift_uses_a_pixelwise_bounded_transform():
     assert brighten_low_light(well_exposed) is well_exposed
 
 
-def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault():
+@pytest.mark.parametrize('arc_navigation', [False, True])
+def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault(arc_navigation):
     from navigation_actuator import ActuationError, NavigationActuator
     from relay import RelayGate, _monotonic
 
@@ -189,9 +209,14 @@ def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault(
     class Transport(object):
         def start_forward_navigation(self):
             self.gate = RelayGate(_monotonic(), forward_navigation=True)
+            self.ready = b'READY forward_navigation\n'
+
+        def start_arc_navigation(self):
+            self.gate = RelayGate(_monotonic(), arc_navigation=True)
+            self.ready = b'READY arc_navigation\n'
 
         def read_line(self, timeout):
-            return b'READY forward_navigation\n'
+            return self.ready
 
         def check_status(self):
             status, self.status = self.status, None
@@ -226,11 +251,13 @@ def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault(
     transport = Transport()
     transport.status = None
     ros, serial = Authority(), Authority()
-    actuator = NavigationActuator(transport, ros, serial, Clock())
+    actuator = NavigationActuator(transport, ros, serial, Clock(), arc_navigation=arc_navigation)
     try:
         actuator.open()
-        command = Command(.014, 0., 'forward', 'tracking')
+        command = (Command(.014, -.0112, 'right', 'tracking') if arc_navigation
+                   else Command(.014, 0., 'forward', 'tracking'))
         assert actuator.publish(command) == command
+        assert transport.gate.command(_monotonic()) == (command.linear, command.angular)
         serial.allowed = False
         actual = actuator.publish(command)
         assert actual.linear == 0. and actual.reason == 'command_authority_unavailable'

@@ -21,10 +21,11 @@ The READY line then includes motion_limit_sec; the deadline latches zero even
 if fresh heartbeats continue. Scheduler stalls, transport, host failure and
 actual chassis braking can delay or prevent a physical stop.
 
-With --forward-navigation the READY line is ``READY forward_navigation``.
-The forward limit is 0.02 m/s. Zero is an ordinary setpoint and the local
-controller heartbeat still latches on disconnect. The trial deadline flags
-are reserved for the separate bounded trial protocol.
+With --forward-navigation or --arc-navigation the READY line identifies the
+selected mode. Both limit forward speed to 0.02 m/s. The arc profile enables
+angular velocity within a bounded curvature and requires forward translation.
+Zero is an ordinary navigation setpoint. The controller heartbeat latches on
+disconnect. The trial deadline flags belong to the bounded trial protocol.
 
 The relay publishes /cmd_vel and subscribes to the candidate driver's
 /rosclaw_limo/command_watchdog (std_msgs/String v2); that topic name is a driver
@@ -69,7 +70,7 @@ import stat
 import sys
 import threading
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 try:
     INTEGER_TYPES = (int, long)
@@ -81,6 +82,8 @@ MAX_LINEAR = 0.05
 _MAX_LINEAR_DECIMAL = Decimal('0.05')
 MAX_NAV_LINEAR = .02
 _MAX_NAV_LINEAR_DECIMAL = Decimal('0.02')
+MAX_ARC_CURVATURE = 2.1  # The controller checks swept paths up to 2 rad/m.
+_MAX_ARC_CURVATURE_DECIMAL = Decimal('2.1')
 
 
 class _JSONFloat(float):
@@ -94,14 +97,26 @@ class _JSONFloat(float):
             raise ValueError('invalid JSON number')
 
 
-def _safe_velocity(linear, angular, forward_navigation=False):
+def safe_velocity(linear, angular, forward_navigation=False, arc_navigation=False):
+    if not _number(linear) or not _number(angular):
+        return False
     exact_linear = linear.exact if isinstance(linear, _JSONFloat) else linear
     exact_angular = angular.exact if isinstance(angular, _JSONFloat) else angular
-    if forward_navigation:
+    if forward_navigation or arc_navigation:
         upper = _MAX_NAV_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_NAV_LINEAR
     else:
         upper = _MAX_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_LINEAR
-    return 0 <= exact_linear <= upper and exact_angular == 0
+    if not 0 <= exact_linear <= upper:
+        return False
+    if not arc_navigation:
+        return exact_angular == 0
+    if exact_linear == 0:
+        return exact_angular == 0
+    if isinstance(exact_linear, Decimal) or isinstance(exact_angular, Decimal):
+        with localcontext() as context:
+            context.prec = MAX_FRAME_BYTES + 8
+            return Decimal(exact_angular).copy_abs() <= exact_linear * _MAX_ARC_CURVATURE_DECIMAL
+    return abs(exact_angular) <= linear * MAX_ARC_CURVATURE
 
 
 def _number(value):
@@ -114,11 +129,14 @@ def _number(value):
 
 
 class RelayGate(object):
-    def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False, forward_navigation=False):
+    def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False,
+                 forward_navigation=False, arc_navigation=False):
+        continuous_navigation = forward_navigation or arc_navigation
         if (not _number(started_at) or (max_motion_sec is not None
                 and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))
                 or type(require_intent_deadline) is not bool or type(forward_navigation) is not bool
-                or forward_navigation and (max_motion_sec is not None or require_intent_deadline)):
+                or type(arc_navigation) is not bool or forward_navigation and arc_navigation
+                or continuous_navigation and (max_motion_sec is not None or require_intent_deadline)):
             raise ValueError('invalid start time')
         self.last_at = float(started_at)
         self.last_stamp = None
@@ -131,7 +149,8 @@ class RelayGate(object):
         self.motion_started_at = None
         self.max_motion_sec = max_motion_sec
         self.require_intent_deadline = require_intent_deadline
-        self.forward_navigation = forward_navigation
+        self.continuous_navigation = continuous_navigation
+        self.arc_navigation = arc_navigation
         self.intent_deadline = None
 
     def stop(self, reason):
@@ -158,13 +177,13 @@ class RelayGate(object):
                  isinstance(frame.get('sequence'), INTEGER_TYPES) and
                  not isinstance(frame.get('sequence'), bool) and
                  self.sequence < frame['sequence'] <= 9223372036854775807 and
-                 _number(now) and _number(frame.get('stamp')) and
-                 _number(frame.get('linear')) and _number(frame.get('angular')))
+                 _number(now) and _number(frame.get('stamp')))
         if valid:
             valid = (0 <= now - self.last_at < HEARTBEAT_SEC and
                      0 <= now - frame['stamp'] < HEARTBEAT_SEC and
                      (self.last_stamp is None or frame['stamp'] > self.last_stamp) and
-                     _safe_velocity(frame['linear'], frame['angular'], self.forward_navigation))
+                     safe_velocity(frame['linear'], frame['angular'], self.continuous_navigation,
+                                   self.arc_navigation))
         if valid and self.require_intent_deadline:
             expiry = frame['expires_at']
             valid = (_number(expiry) and frame['stamp'] < expiry <= frame['stamp'] + HEARTBEAT_SEC
@@ -182,7 +201,7 @@ class RelayGate(object):
             self.had_motion = True
             if self.motion_started_at is None:
                 self.motion_started_at = float(now)
-        elif self.had_motion and not self.forward_navigation:
+        elif self.had_motion and not self.continuous_navigation:
             self.stop('requested_stop')
         return True
 
@@ -530,11 +549,11 @@ def _emit(fd, line):
         return False
 
 
-def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=False):
+def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=False, arc_navigation=False):
     """Run one session, using inherited pipe stdin and status messages on stdout."""
     global _stopping
     _stopping = False
-    RelayGate(0., max_motion_sec, require_intent_deadline, forward_navigation)
+    RelayGate(0., max_motion_sec, require_intent_deadline, forward_navigation, arc_navigation)
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
@@ -606,11 +625,13 @@ def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=
             if not fault and ready and not ready_sent:
                 gate = RelayGate(now, max_motion_sec=max_motion_sec,
                                  require_intent_deadline=require_intent_deadline,
-                                 forward_navigation=forward_navigation)
+                                 forward_navigation=forward_navigation, arc_navigation=arc_navigation)
                 shared.arm(now)
                 ready_line = ('READY' if max_motion_sec is None else
                               'READY motion_limit_sec=%.6f' % max_motion_sec)
-                if forward_navigation:
+                if arc_navigation:
+                    ready_line = 'READY arc_navigation'
+                elif forward_navigation:
                     ready_line = 'READY forward_navigation'
                 if _emit(output_fd, ready_line):
                     ready_sent = True
@@ -638,11 +659,15 @@ def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Bounded forward-only LIMO relay')
+    parser = argparse.ArgumentParser(description='Bounded LIMO navigation relay')
     parser.add_argument('--max-motion-sec', type=float, default=None)
     parser.add_argument('--require-intent-deadline', action='store_true')
-    parser.add_argument('--forward-navigation', action='store_true')
+    navigation = parser.add_mutually_exclusive_group()
+    navigation.add_argument('--forward-navigation', action='store_true')
+    navigation.add_argument('--arc-navigation', action='store_true')
     arguments = parser.parse_args()
-    if arguments.forward_navigation and (arguments.require_intent_deadline or arguments.max_motion_sec is not None):
-        parser.error('forward navigation and trial deadline flags are mutually exclusive')
-    sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline, arguments.forward_navigation))
+    if (arguments.forward_navigation or arguments.arc_navigation) and (
+            arguments.require_intent_deadline or arguments.max_motion_sec is not None):
+        parser.error('continuous navigation and trial deadline flags are mutually exclusive')
+    sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline,
+                  arguments.forward_navigation, arguments.arc_navigation))

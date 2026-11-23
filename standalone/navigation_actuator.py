@@ -1,10 +1,11 @@
-"""Own the forward navigation relay and enforce local output authority."""
+"""Own the navigation relay and enforce local output authority."""
 from __future__ import division
 
 import json
 import threading
 
 from navigation import Command
+from relay import safe_velocity
 
 
 class ActuationError(RuntimeError):
@@ -12,7 +13,7 @@ class ActuationError(RuntimeError):
 
 
 class NavigationActuator(object):
-    def __init__(self, transport, ros_guard, serial_guard, clock):
+    def __init__(self, transport, ros_guard, serial_guard, clock, arc_navigation=False):
         self.transport = transport
         self.ros_guard, self.serial_guard, self.clock = ros_guard, serial_guard, clock
         self.sequence = 0
@@ -20,13 +21,19 @@ class NavigationActuator(object):
         self.armed = False
         self.stop_line = None
         self.unavailable_guards = ()
+        self.arc_navigation = arc_navigation
 
     def open(self):
         if not self.ros_guard.acquire() or not self.serial_guard.acquire():
             raise ActuationError('command_authority_unavailable')
-        self.transport.start_forward_navigation()
+        if self.arc_navigation:
+            self.transport.start_arc_navigation()
+            ready_line = b'READY arc_navigation\n'
+        else:
+            self.transport.start_forward_navigation()
+            ready_line = b'READY forward_navigation\n'
         self.stop_line = self.transport.read_line(3.5)
-        if self.stop_line != b'READY forward_navigation\n':
+        if self.stop_line != ready_line:
             raise ActuationError('navigation_relay_not_ready')
         self.stop_line = None
         self._send(0.)
@@ -49,12 +56,12 @@ class NavigationActuator(object):
             raise ActuationError('navigation_relay_caller_missing')
         self.armed = True
 
-    def _send(self, linear):
+    def _send(self, linear, angular=0.):
         if self.stop_line is None:
             self.stop_line = self.transport.check_status()
         if self.stop_line is not None:
             raise ActuationError('navigation_relay_fault')
-        frame = {'sequence': self.sequence, 'stamp': self.clock.now(), 'linear': linear, 'angular': 0.}
+        frame = {'sequence': self.sequence, 'stamp': self.clock.now(), 'linear': linear, 'angular': angular}
         payload = (json.dumps(frame, allow_nan=False, separators=(',', ':')) + '\n').encode('ascii')
         if self.transport.write_line(payload, .01) is not True:
             raise ActuationError('navigation_relay_write_failed')
@@ -63,9 +70,10 @@ class NavigationActuator(object):
     def publish(self, command):
         if not self.armed:
             raise ActuationError('navigation_relay_not_armed')
-        if command.angular != 0. or not 0. <= command.linear <= .02:
+        if not safe_velocity(command.linear, command.angular, forward_navigation=True,
+                             arc_navigation=self.arc_navigation):
             self._send(0.)
-            raise ActuationError('unexpected_forward_command')
+            raise ActuationError('unexpected_arc_command' if self.arc_navigation else 'unexpected_forward_command')
         self.unavailable_guards = ()
         if command.linear:
             self.unavailable_guards = tuple(
@@ -73,7 +81,7 @@ class NavigationActuator(object):
                 if guard.cached_command_deadline() is None)
         if self.unavailable_guards:
             command = Command(0., 0., 'stop', 'command_authority_unavailable')
-        self._send(command.linear)
+        self._send(command.linear, command.angular)
         return command
 
     def close(self):
