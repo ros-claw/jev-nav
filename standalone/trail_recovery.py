@@ -3,12 +3,109 @@ from __future__ import division
 
 import math
 
-from navigation import Pose, _relative
+from navigation import Command, HALF_LENGTH, HALF_WIDTH, Pose, _relative, _wrap
 
 TRAIL_MARGIN_M = .04
 MAX_LATERAL_M = .006
 MAX_HEADING_RAD = .025
 LIDAR_X = .105
+
+
+def measured_trail(trace, reference, distance):
+    """Recover terminal-relative keyframes from a completed physical recording."""
+    trajectory = trace['trajectory']
+    if (trace['mode'] != 'supervised_static_room' or trace['relay_exited'] is not True
+            or trajectory['clock'] != 'host_monotonic_receipt' or not .12 <= distance <= .45):
+        raise ValueError('curved retrace needs a completed supervised static-room recording')
+    rows = trajectory['odom']
+    if not rows:
+        raise ValueError('missing recorded odometry')
+    end = Pose(rows[-1][1], rows[-1][2], rows[-1][4])
+    anchor = _relative(end, Pose(reference['x'], reference['y'], reference['yaw']))
+    if math.hypot(anchor.x, anchor.y) > .005 or abs(anchor.yaw) > .015:
+        raise ValueError('front reference must match the end of the recorded path')
+    points = [Pose(0., 0., 0.)]
+    length, turn = 0., 0.
+    previous = None
+    for row in reversed(rows):
+        if not all(not math.isnan(value) and not math.isinf(value) for value in row[:6]):
+            raise ValueError('invalid recorded odometry')
+        pose = _relative(end, Pose(row[1], row[2], row[4]))
+        if previous is not None:
+            step = _relative(previous[1], pose)
+            if (not 0 < previous[0] - row[0] <= .20 or math.hypot(step.x, step.y) > .01
+                    or abs(step.yaw) > .035 or step.x > .002):
+                raise ValueError('recorded trail is discontinuous or contains forward retrace motion')
+        previous = row[0], pose
+        delta = _relative(points[-1], pose)
+        linear = math.hypot(delta.x, delta.y)
+        if linear < .015 and abs(delta.yaw) < .039:
+            continue
+        if linear > .018 or abs(delta.y) > .005 or abs(delta.yaw) > .055:
+            raise ValueError('recorded keyframe is not reachable within its corridor')
+        length += linear
+        turn += abs(delta.yaw)
+        if turn > 1.1:
+            raise ValueError('recorded trail exceeds the recovery rotation budget')
+        points.append(pose)
+        if length >= distance:
+            return points, {'measured_trail_m': length, 'retreat_distance_m': distance,
+                            'measured_turn_rad': turn, 'keyframes': points}
+    raise ValueError('recorded trail is too short')
+
+
+class TrailFollower(object):
+    """Track short recorded segments in order using current wheel odometry."""
+    def __init__(self, points):
+        self.points = points
+        self.index = 0
+
+    def step(self, pose):
+        while self.index + 1 < len(self.points):
+            start, end = self.points[self.index:self.index + 2]
+            dx, dy = end.x - start.x, end.y - start.y
+            distance = math.hypot(dx, dy)
+            turn = _wrap(end.yaw - start.yaw)
+            if distance < .007:
+                error = _wrap(end.yaw - pose.yaw)
+                if math.hypot(end.x - pose.x, end.y - pose.y) > .012 or abs(error) > .11:
+                    return Command(0., 0., 'stop', 'retrace_path_departure')
+                if abs(error) > .014:
+                    angular = math.copysign(min(.05, max(.027, 2.4 * abs(error))), error)
+                    return Command(0., angular, 'reverse', 'recorded_pivot')
+            else:
+                x, y = pose.x - start.x, pose.y - start.y
+                along = (x * dx + y * dy) / distance
+                fraction = min(1., max(0., along / distance))
+                yaw = _wrap(start.yaw + turn * fraction)
+                error = _wrap(yaw - pose.yaw)
+                if math.hypot(x - fraction * dx, y - fraction * dy) > .014 or abs(error) > .11:
+                    return Command(0., 0., 'stop', 'retrace_path_departure')
+                if along < distance - .002:
+                    lateral = -(x - fraction * dx) * math.sin(yaw) + (y - fraction * dy) * math.cos(yaw)
+                    linear = .018
+                    angular = max(-.045, min(.045, turn * linear / distance + 2. * error + 9. * lateral))
+                    return Command(-linear, angular, 'reverse', 'recorded_retrace')
+            self.index += 1
+        return Command(0., 0., 'stop', 'retrace_distance_reached')
+
+
+def front_obstacle(scan, angular):
+    """Check live front returns against the footprint over the stopping horizon."""
+    yaw = .30 * angular
+    c, s = math.cos(yaw), math.sin(yaw)
+    valid = 0
+    for index, value in enumerate(scan.ranges):
+        angle = scan.angle_min + index * scan.angle_increment
+        if not (-math.pi / 2 <= angle <= math.pi / 2 and scan.range_min <= value < scan.range_max):
+            continue
+        valid += 1
+        x, y = LIDAR_X + value * math.cos(angle), value * math.sin(angle)
+        if (abs(x) <= HALF_LENGTH + .012 and abs(y) <= HALF_WIDTH + .012
+                or abs(c * x + s * y) <= HALF_LENGTH + .012
+                and abs(-s * x + c * y) <= HALF_WIDTH + .012):
+            return True
+    return valid < 6
 
 
 def straight_trail(trace, reference, distance):
@@ -54,6 +151,28 @@ def scan_matches(scan, reference):
         if scan.range_min <= value <= scan.range_max and abs(value - distance) <= .025:
             count += 1
     return count >= len(expected) * .8
+
+
+def recorded_scan_matches(scan, reference):
+    """Match distinct neighboring beams despite sub-degree scanner sampling jitter."""
+    expected = sorted(reference['closest_rays'])
+    shift = front_registration(scan, reference)
+    if shift is None or abs(shift) > .008:
+        return False
+    matched = set()
+    for degrees, distance in expected:
+        angle = math.radians(degrees)
+        index = int(round((angle - scan.angle_min) / scan.angle_increment))
+        candidates = []
+        for beam in range(max(0, index - 2), min(len(scan.ranges), index + 3)):
+            value = scan.ranges[beam]
+            separation = abs(angle - (scan.angle_min + beam * scan.angle_increment))
+            if (beam not in matched and separation <= math.radians(.85)
+                    and scan.range_min <= value < scan.range_max and abs(value - distance) <= .012):
+                candidates.append((separation, beam))
+        if candidates:
+            matched.add(min(candidates)[1])
+    return len(matched) >= len(expected) * .8
 
 
 def prior_retrace_offset(report, distance):

@@ -41,6 +41,16 @@ class GateTests(unittest.TestCase):
         self.assertEqual(gate.command(10.31), (0., 0.))
         self.assertEqual(gate.reason, 'heartbeat')
 
+    def test_recorded_retrace_bounds_pivots_and_stops_on_disconnect(self):
+        frame = dict(sequence=0, stamp=10., linear=0., angular=.05)
+        gate = relay.RelayGate(10., max_motion_sec=55., reverse_navigation=True, trail_pivot=True)
+        self.assertTrue(gate.accept(frame, 10.))
+        self.assertEqual(gate.command(10.21), (0., 0.))
+        self.assertEqual(gate.reason, 'heartbeat')
+        for velocities in ((0., .051), (.001, 0.), (-.019, 0.)):
+            gate = relay.RelayGate(10., max_motion_sec=55., reverse_navigation=True, trail_pivot=True)
+            self.assertFalse(gate.accept(dict(frame, linear=velocities[0], angular=velocities[1]), 10.))
+
     def test_room_pivot_is_bounded_and_kept_out_of_the_standard_arc_profile(self):
         frame = dict(sequence=0, stamp=10., linear=0., angular=.05)
         self.assertFalse(relay.RelayGate(10., arc_navigation=True).accept(frame, 10.))

@@ -472,6 +472,9 @@ class RelayProcessTransport(object):
     def start_reverse_navigation(self):
         self._start(["--reverse-navigation", "--max-motion-sec", "30"])
 
+    def start_recorded_trail(self):
+        self._start(["--reverse-navigation", "--trail-pivot", "--max-motion-sec", "55"])
+
     def start_room_navigation(self):
         self._start(["--arc-navigation", "--room-pivot"])
 

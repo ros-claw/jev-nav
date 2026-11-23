@@ -24,6 +24,7 @@ class NavigationHeartbeat(object):
         self._worker = threading.Thread(target=self._run, name='navigation-heartbeat')
         self._worker.daemon = True
         self.fault = None
+        self.applied = None
 
     def start(self):
         self._worker.start()
@@ -47,7 +48,7 @@ class NavigationHeartbeat(object):
                 command, until = self.latest
                 if until is not None and self.clock.now() >= until:
                     command = self.EXPIRED
-                self.actuator.publish(command)
+                self.applied = self.clock.now(), self.actuator.publish(command)
                 delay = .04
                 if until is not None and (command.linear or command.angular):
                     delay = min(delay, max(0., until - self.clock.now()))
@@ -65,7 +66,7 @@ class NavigationHeartbeat(object):
 
 class NavigationActuator(object):
     def __init__(self, transport, ros_guard, serial_guard, clock, arc_navigation=False,
-                 reverse_navigation=False, room_pivot=False):
+                 reverse_navigation=False, room_pivot=False, trail_pivot=False):
         self.transport = transport
         self.ros_guard, self.serial_guard, self.clock = ros_guard, serial_guard, clock
         self.sequence = 0
@@ -76,11 +77,15 @@ class NavigationActuator(object):
         self.arc_navigation = arc_navigation
         self.reverse_navigation = reverse_navigation
         self.room_pivot = room_pivot
+        self.trail_pivot = trail_pivot
 
     def open(self):
         if not self.ros_guard.acquire() or not self.serial_guard.acquire():
             raise ActuationError('command_authority_unavailable')
-        if self.reverse_navigation:
+        if self.trail_pivot and self.reverse_navigation:
+            self.transport.start_recorded_trail()
+            ready_line = b'READY recorded_trail\n'
+        elif self.reverse_navigation:
             self.transport.start_reverse_navigation()
             ready_line = b'READY reverse_navigation\n'
         elif self.room_pivot:
@@ -132,7 +137,7 @@ class NavigationActuator(object):
             raise ActuationError('navigation_relay_not_armed')
         if not safe_velocity(command.linear, command.angular, forward_navigation=True,
                              arc_navigation=self.arc_navigation, reverse_navigation=self.reverse_navigation,
-                             room_pivot=self.room_pivot):
+                             room_pivot=self.room_pivot, trail_pivot=self.trail_pivot):
             self._send(0.)
             if self.reverse_navigation:
                 raise ActuationError('unexpected_retrace_command')

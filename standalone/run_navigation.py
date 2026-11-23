@@ -39,7 +39,7 @@ class RosNavigationInput(object):
     def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False):
         from explore import RosObservation
         from limo_fresh_layer.msg import FreshGrid
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import Image, LaserScan
 
         self.rospy = rospy
         self.operator_clear_front = operator_clear_front
@@ -48,15 +48,42 @@ class RosNavigationInput(object):
         self.latest_grid = None
         self.last_grid_times = None
         self.latest_color = None
+        self.latest_scan = None
         self.grid_updates = collections.Counter()
         self.decision_errors = collections.Counter()
+        self.decision_scan_counts = collections.Counter()
         self.subscriptions = [rospy.Subscriber(grid_topic, FreshGrid, self._grid, queue_size=1)]
         if decisions:
+            import tf2_ros
+            self.sensor_tf = tf2_ros.Buffer()
+            self.sensor_tf_listener = tf2_ros.TransformListener(self.sensor_tf)
             self.subscriptions.append(rospy.Subscriber('/camera/color/image_raw', Image, self._color,
                                                         queue_size=1, buff_size=1024 * 1024))
+            self.subscriptions.append(rospy.Subscriber('/scan', LaserScan, self._scan, queue_size=1))
 
     def _color(self, message):
         self.latest_color = message
+
+    def _scan(self, message):
+        self.latest_scan = message
+
+    def decision_scan(self, image_at, clocks):
+        import tf2_ros
+        from explore import physical_forward_view, source_time
+
+        scan = self.latest_scan
+        if scan is None or scan.header.frame_id.lstrip('/') != 'laser_link':
+            return None
+        stamp = source_time(clocks[0], clocks[1], scan.header.stamp.to_sec(), .30)
+        if stamp is None or abs(stamp - image_at) > .20:
+            return None
+        try:
+            transform = self.sensor_tf.lookup_transform('base_link', 'laser_link', scan.header.stamp).transform
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            return None
+        return physical_forward_view(scan.ranges, scan.angle_min, scan.angle_increment,
+                                     scan.range_min, scan.range_max, transform.translation.x,
+                                     transform.translation.y, _yaw(transform.rotation))
 
     def _grid(self, message):
         from explore import sample_clocks, source_time
@@ -146,10 +173,16 @@ class RosNavigationInput(object):
         state = base_state(odom['message'], status['message'], status['stamp'])
         if state is None:
             return None
+        scan = self.decision_scan(stamp, clocks)
+        self.decision_scan_counts['with_forward_view' if scan is not None else 'without_forward_view'] += 1
         jpeg = CvJpegEncoder(observation.bridge, transform=brighten_low_light)(image)
+        laser = {'locally_checked_segment_length_m': ROOM_LENGTH if self.static_room else LENGTH,
+                 'planning_successor': request.predecessor is not None,
+                 'blocked_segments': {action: reason for action, reason, _, _ in request.blocks}}
+        if scan is not None:
+            laser['forward_view'] = scan
         evidence = {'image_b64': base64.b64encode(jpeg).decode('ascii'), 'captured_at': stamp,
-                    'laser': {'locally_checked_segment_length_m': ROOM_LENGTH if self.static_room else LENGTH,
-                              'planning_successor': request.predecessor is not None},
+                    'laser': laser,
                     'base': state, 'navigation_choices': list(request.choices),
                     'operator_clear_front': self.operator_clear_front}
         if self.static_room:
@@ -343,8 +376,9 @@ def main(argv=None):
                     raise ActuationError('navigation_perception_not_ready')
                 time.sleep(.05)
             clock = RealClock()
-            ros_guard = make_ros_monitor(clock, args.driver_pid, os.environ.get('ROS_MASTER_URI',
-                                                                                 'http://localhost:11311'))
+            ros_guard = make_ros_monitor(clock, args.driver_pid,
+                                         os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'),
+                                         retry_late_samples=True)
             serial_backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
             serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                                   args.driver_sha256, max_age=.6, acquire_timeout=1.2,
@@ -390,6 +424,11 @@ def main(argv=None):
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
                       'final_action': command.action, 'clock_domain': 'monotonic'}
+            applied = heartbeat.applied if heartbeat is not None else None
+            if applied is not None:
+                relay_at, relay_command = applied
+                fields.update(relay_at=relay_at, relay_linear=relay_command.linear,
+                              relay_angular=relay_command.angular, relay_reason=relay_command.reason)
             if room is not None:
                 fields['rear_memory_cells'] = room.reused_cells
                 fields['rear_memory_age_sec'] = room.oldest_age
@@ -415,9 +454,13 @@ def main(argv=None):
                         reason_code = report['reason'] if report['reason'] != 'ok' else 'command_deadline_unavailable'
                         timeline.record('run', now, {'stage': stage, 'reason': reason_code,
                                                      'status': 'latched' if report['fault_latched'] else 'sampled'})
+                        if report['fault_latched']:
+                            raise ActuationError('navigation_%s_%s' % (stage, reason_code))
             if request is not None:
                 timeline.record('decision', now, {'decision_id': request.sequence, 'stage': 'requested',
-                                                  'candidate_id': '.'.join(request.choices)})
+                                                  'candidate_id': '.'.join(request.choices),
+                                                  'status': 'route_review' if runtime.review_origin is not None
+                                                  else 'initial_route'})
             if decision is not None:
                 timeline.record('decision', now, {'decision_id': decision[0], 'selected_action': decision[1],
                                                   'status': 'accepted' if decision[2] else 'rejected'})
@@ -474,6 +517,7 @@ def main(argv=None):
               'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
               'grid_updates': source.grid_updates if source is not None else {},
               'decision_errors': source.decision_errors if source is not None else {},
+              'decision_scan_counts': source.decision_scan_counts if source is not None else {},
               'arc_traces': arc_traces,
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}

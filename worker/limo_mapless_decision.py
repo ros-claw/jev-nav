@@ -15,6 +15,7 @@ import urllib.request
 MAX_IMAGE_BYTES = 2_000_000
 MAX_AGE_SEC = 8.0
 CHOICES = ("forward", "left", "right", "stop")
+ROOM_STARTS = CHOICES + ("pivot_left", "pivot_right")
 DESCRIPTIONS = {
     "forward": "Continue exploring ahead",
     "left": "Explore to the left",
@@ -67,9 +68,11 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         if "navigation_choices" in observation:
             available = observation["navigation_choices"]
             operator_clear = observation.get("operator_clear_front", False)
-            if (forward_only or not isinstance(available, list) or not 2 <= len(available) <= len(CHOICES)
+            circulate = observation.get("exploration_goal") == "circulate_room" and not operator_clear
+            legal = ROOM_STARTS if circulate else CHOICES
+            if (forward_only or not isinstance(available, list) or not 2 <= len(available) <= len(legal)
                     or available[-1] != "stop"
-                    or any(not isinstance(value, str) or value not in CHOICES for value in available)
+                    or any(not isinstance(value, str) or value not in legal for value in available)
                     or len(set(available)) != len(available) or type(operator_clear) is not bool
                     or operator_clear and available != ["forward", "stop"]):
                 return rejected
@@ -84,17 +87,21 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                 task += (" This run is a supervised straight-line navigation test. The operator reports the "
                          "forward area clear. Prefer the locally checked forward segment if the image, range "
                          "assessment and base state do not indicate a reason to wait.")
-            circulate = observation.get("exploration_goal") == "circulate_room" and not operator_clear
             if circulate:
                 choices = ["circulate_" + side for side in ("left", "right")
-                           if "forward" in available or side in available] + ["stop"]
+                           if "forward" in available or side in available or "pivot_" + side in available] + ["stop"]
                 context["checked_start_segments"] = available[:-1]
                 task = ("Choose the direction of a slow route around the room. The local planner will use "
                         "checked shallow arcs in the selected direction. When no arc is available yet it "
                         "will first use a checked forward segment, if there is one, to gather coverage. "
+                        "A checked pivot turns in place before continuing along an observed corridor. "
                         "Every subsequent segment is checked locally. Prefer the direction with more open "
                         "space. Consider obstacles within the checked starting path. A visible object beyond "
-                        "that path can be navigated around and does not alone require waiting.")
+                        "that path can be navigated around and does not alone require waiting. Compare measured "
+                        "front-left, front-center and front-right lidar sectors with the camera. Ray directions "
+                        "are relative to the laser and hit bearings are relative to the robot base. "
+                        "Blocked segments give the local planner's occupied or unknown reason. Missing "
+                        "returns, gaps and zero rear coverage give no clearance evidence.")
         if forward_only:
             task = ("A robot is testing a short forward segment indoors. From the camera and current sensor data, "
                     "choose forward if there is room for the bounded forward segment. Otherwise choose stop.")

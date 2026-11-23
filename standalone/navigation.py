@@ -8,7 +8,7 @@ import math
 Pose = namedtuple('Pose', 'x y yaw')
 Grid = namedtuple('Grid', 'x y resolution width height cells')
 View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready')
-Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor')
+Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks')
 Command = namedtuple('Command', 'linear angular action reason')
 Segment = namedtuple('Segment', 'sequence action origin')
 
@@ -247,10 +247,16 @@ class Navigation(object):
                 choices.append(action)
             else:
                 self.candidate_blocks[action] = block
+        if (not choices and self.static_room and self.goal is None
+                and any(block[0] == 'occupied' for block in self.candidate_blocks.values())):
+            choices = [action for action in ('pivot_left', 'pivot_right') if self._pivot_clear(view, anchor, action)]
         if not choices:
             return None
         self.sequence += 1
-        self.pending = Request(self.sequence, now, view.epoch, anchor, tuple(choices) + ('stop',), predecessor)
+        blocks = tuple((action,) + self.candidate_blocks[action] for action in actions
+                       if action in self.candidate_blocks)
+        self.pending = Request(self.sequence, now, view.epoch, anchor, tuple(choices) + ('stop',), predecessor,
+                               blocks)
         return self.pending
 
     def prepare_pivot(self, view, now, direction, request=None):
@@ -270,11 +276,7 @@ class Navigation(object):
         away = 'right' if direction == 'left' else 'left'
         for option in (direction, away):
             action = 'pivot_' + option
-            angle = PIVOTS[action]
-            turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
-            if (rotation_block(view.grid, anchor, angle, view.pose) is not None
-                    or not sweep_clear(view.grid, turned, self.length, 0., view.pose)
-                    or sweep_block(view.grid, turned, .31, 0., occupied_only=True)):
+            if not self._pivot_clear(view, anchor, action):
                 continue
             if request is None:
                 self.sequence += 1
@@ -287,6 +289,21 @@ class Navigation(object):
             return action
         return None
 
+    def _pivot_clear(self, view, anchor, action):
+        angle = PIVOTS[action]
+        turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
+        return (rotation_block(view.grid, anchor, angle, view.pose) is None
+                and sweep_clear(view.grid, turned, self.length, 0., view.pose)
+                and sweep_block(view.grid, turned, .31, 0., occupied_only=True) is None)
+
+    def anchor_current(self, request, view, now):
+        if not ready(view, now) or request.epoch != view.epoch:
+            return False
+        active_predecessor = self.goal is not None and request.predecessor == self.goal.sequence
+        anchor_limit = max(.10, self.successor_lead) if active_predecessor else .10
+        return (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) <= anchor_limit
+                and abs(_wrap(view.pose.yaw - request.anchor.yaw)) <= .20)
+
     def accept(self, request, choice, view, now):
         if (request is None or request is not self.pending or self.fault
                 or not 0 <= now - request.at < MAX_RESPONSE_AGE
@@ -296,15 +313,16 @@ class Navigation(object):
         if choice == 'stop':
             self.stop('model_stop')
             return True
-        if not ready(view, now) or request.epoch != view.epoch:
-            return False
         active_predecessor = self.goal is not None and request.predecessor == self.goal.sequence
         # An early response remains tied to the segment still being followed.
-        anchor_limit = max(.10, self.successor_lead) if active_predecessor else .10
-        if (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) > anchor_limit
-                or abs(_wrap(view.pose.yaw - request.anchor.yaw)) > .20):
+        if not self.anchor_current(request, view, now):
             return False
-        if not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
+        if choice in PIVOTS:
+            offset = _relative(request.anchor, view.pose)
+            if (math.hypot(offset.x, offset.y) > .015 or abs(offset.yaw) > .05
+                    or not self._pivot_clear(view, request.anchor, choice)):
+                return False
+        elif not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
             return False
         segment = Segment(request.sequence, choice, request.anchor)
         if active_predecessor:

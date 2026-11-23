@@ -114,10 +114,12 @@ def test_navigation_offers_only_locally_checked_segments():
 
 
 def test_room_model_selects_a_route_with_a_verified_start():
+    laser = {"forward_view": {"rear_valid_rays": 0, "base_hits": {"right": {"nearest_m": 0.20}}},
+             "blocked_segments": {"right": "occupied", "left": "unknown"}}
     request = {
         "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
         "captured_at": 100.0,
-        "laser": {},
+        "laser": laser,
         "base": {},
         "navigation_choices": ["forward", "stop"],
         "exploration_goal": "circulate_room",
@@ -126,10 +128,30 @@ def test_room_model_selects_a_route_with_a_verified_start():
     def transport(payload, key, timeout):
         assert [item["value"] for item in payload["questions"][0]["choices"]] == [
             "circulate_left", "circulate_right", "stop"]
-        assert payload["input"][0]["content"][2]["data"]["checked_start_segments"] == ["forward"]
+        context = payload["input"][0]["content"][2]["data"]
+        assert context["checked_start_segments"] == ["forward"]
+        assert context["laser"] == laser
         return {"answers": [{"name": "next_action", "type": "choice", "choice": "circulate_left"}]}
 
     assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_left"
+
+
+def test_room_model_can_select_only_the_verified_pivot_side():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+        "navigation_choices": ["pivot_right", "stop"],
+        "exploration_goal": "circulate_room",
+    }
+
+    def transport(payload, key, timeout):
+        assert [item["value"] for item in payload["questions"][0]["choices"]] == ["circulate_right", "stop"]
+        assert payload["input"][0]["content"][2]["data"]["checked_start_segments"] == ["pivot_right"]
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": "circulate_right"}]}
+
+    assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_right"
 
 
 def test_transport_failures_return_only_sanitized_classification():

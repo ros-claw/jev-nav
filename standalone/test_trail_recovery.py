@@ -3,7 +3,9 @@ from collections import namedtuple
 
 import pytest
 
-from trail_recovery import front_registration, straight_trail
+from navigation import Pose
+from trail_recovery import (TrailFollower, front_obstacle, front_registration, measured_trail,
+                            recorded_scan_matches, scan_matches, straight_trail)
 
 
 def test_retrace_requires_bounded_measured_travel_ending_at_the_reference():
@@ -26,3 +28,48 @@ def test_front_registration_rejects_unrelated_or_insufficient_returns():
     assert front_registration(sample, reference) == pytest.approx(.025, abs=.001)
     assert front_registration(sample._replace(ranges=[.6] * 9), reference) is None
     assert front_registration(sample._replace(ranges=[.325] * 3 + [float('inf')] * 6), reference) is None
+
+
+def test_retrace_tracks_measured_translation_and_pivot_in_sequence():
+    rows = [(index * .05, index * .001, 0., .02, 0., 0.) for index in range(91)]
+    rows.extend((4.5 + index * .05, .09, 0., 0., index * .0025, .05) for index in range(1, 65))
+    rows.extend((7.7 + index * .05, .09 + index * .001 * math.cos(.16),
+                 index * .001 * math.sin(.16), .02, .16, 0.) for index in range(1, 101))
+    trace = {'mode': 'supervised_static_room', 'relay_exited': True,
+             'trajectory': {'clock': 'host_monotonic_receipt', 'odom': rows}}
+    end = rows[-1]
+    reference = {'x': end[1], 'y': end[2], 'yaw': end[4]}
+    points, _ = measured_trail(trace, reference, .17)
+    follower = TrailFollower(points)
+    pose = Pose(0., 0., 0.)
+    assert follower.step(pose._replace(y=.03)).reason == 'retrace_path_departure'
+    rotated = False
+    for _ in range(600):
+        command = follower.step(pose)
+        if not (command.linear or command.angular):
+            break
+        rotated |= not command.linear and bool(command.angular)
+        pose = Pose(pose.x + command.linear * .04 * math.cos(pose.yaw),
+                    pose.y + command.linear * .04 * math.sin(pose.yaw), pose.yaw + command.angular * .04)
+    assert rotated and command.reason == 'retrace_distance_reached'
+    assert math.hypot(pose.x - points[-1].x, pose.y - points[-1].y) < .008
+
+
+def test_retrace_stops_for_live_front_obstacle_or_no_valid_scan():
+    scan = namedtuple('Scan', 'angle_min angle_increment range_min range_max ranges')
+    sample = scan(-.1, .025, .04, 8., [.3] * 9)
+    assert not front_obstacle(sample, .05)
+    assert front_obstacle(sample._replace(ranges=[.055] * 9), -.05)
+    assert front_obstacle(sample._replace(ranges=[float('inf')] * 9), .05)
+
+
+def test_recorded_reference_handles_alternating_invalid_laser_bins():
+    scan = namedtuple('Scan', 'angle_min angle_increment range_min range_max ranges')
+    expected = {'closest_rays': [(index * .8, .2 + index * .002) for index in range(10)]}
+    ranges = []
+    for _, distance in expected['closest_rays']:
+        ranges.extend([float('inf'), distance])
+    sample = scan(0., math.radians(.4), .04, 8., ranges)
+    assert not scan_matches(sample, expected)
+    assert recorded_scan_matches(sample, expected)
+    assert not recorded_scan_matches(sample._replace(ranges=[.22] * len(ranges)), expected)

@@ -1,16 +1,18 @@
 #!/usr/bin/env python2
-"""Retrace a verified straight strip in an attended static room."""
+"""Retrace verified odometry in an attended static room."""
 from __future__ import division, print_function
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
 
 from navigation import Command, Pose, _relative
-from trail_recovery import (MAX_LATERAL_M, continued_offset, front_registration, predicted_front, prior_retrace_offset,
+from trail_recovery import (MAX_LATERAL_M, TrailFollower, continued_offset, front_obstacle, front_registration,
+                            measured_trail, predicted_front, prior_retrace_offset, recorded_scan_matches,
                             scan_matches, straight_trail)
 
 
@@ -20,12 +22,15 @@ def main(argv=None):
     parser.add_argument('--front-reference', required=True)
     parser.add_argument('--distance-m', type=float, default=.32)
     parser.add_argument('--resume', help='recording of a partial retrace on this strip')
+    parser.add_argument('--recorded-curve', action='store_true', help='follow recorded turns and reverse segments')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--static-room-clear', action='store_true')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
     args = parser.parse_args(argv)
+    if args.recorded_curve and args.resume:
+        parser.error('partial straight-trail registration is only available for a straight retreat')
     if args.execute and (not args.static_room_clear or not args.driver_pid or args.driver_pid <= 1
                          or not args.driver_exe or not os.path.isabs(args.driver_exe)
                          or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
@@ -34,7 +39,12 @@ def main(argv=None):
         trace = json.load(stream)
     with open(args.front_reference) as stream:
         reference = json.load(stream)
-    report = straight_trail(trace, reference, args.distance_m)
+    follower = None
+    if args.recorded_curve:
+        points, report = measured_trail(trace, reference, args.distance_m)
+        follower = TrailFollower(points)
+    else:
+        report = straight_trail(trace, reference, args.distance_m)
     offset = Pose(0., 0., 0.)
     if args.resume:
         with open(args.resume) as stream:
@@ -43,10 +53,10 @@ def main(argv=None):
     if not args.execute:
         print(json.dumps(report, allow_nan=False))
         return 0
-    return execute(args, reference, report, offset)
+    return execute(args, reference, report, offset, follower)
 
 
-def execute(args, reference, report, origin):
+def execute(args, reference, report, origin, follower):
     import rospy
     from explore import RosObservation, base_state, sample_clocks, source_time
     from live_monitors import ProcFdSerialBackend, SerialOwnershipMonitor
@@ -65,7 +75,7 @@ def execute(args, reference, report, origin):
     def receive(message):
         pair = sample_clocks(clock.now, lambda: rospy.Time.now().to_sec())
         stamp = source_time(pair[0], pair[1], message.header.stamp.to_sec(), .30) if pair else None
-        if stamp is not None:
+        if stamp is not None and message.header.frame_id.lstrip('/') == 'laser_link':
             scan[0] = (message, stamp)
 
     subscription = rospy.Subscriber('/scan', LaserScan, receive, queue_size=1)
@@ -90,13 +100,15 @@ def execute(args, reference, report, origin):
     backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
     serial = SerialOwnershipMonitor(backend, clock, args.driver_pid, args.driver_exe, args.driver_sha256,
                                     max_age=.6, acquire_timeout=1.2, ros_monitor=ros)
-    actuator = NavigationActuator(RelayProcessTransport(clock), ros, serial, clock, reverse_navigation=True)
+    actuator = NavigationActuator(RelayProcessTransport(clock), ros, serial, clock, reverse_navigation=True,
+                                  trail_pivot=follower is not None)
     recorder = ObservationRecorder(clock)
     start = clock.now()
     offset = origin
     distance = -offset.x
     reason = 'observation_unavailable'
     zero = Command(0., 0., 'stop', 'retrace_wait')
+    matches_reference = recorded_scan_matches if follower is not None else scan_matches
 
     def check_anchor(seconds, armed=False):
         until = clock.now() + seconds
@@ -107,7 +119,7 @@ def execute(args, reference, report, origin):
             if sample is not None and sample[2].header.stamp != seen:
                 seen = sample[2].header.stamp
                 match = (front_registration(sample[2], reference) if args.resume else
-                         0. if scan_matches(sample[2], reference) else None)
+                         0. if matches_reference(sample[2], reference) else None)
                 if match is None:
                     matches = []
                 else:
@@ -132,7 +144,8 @@ def execute(args, reference, report, origin):
         pose, epoch = initial[:2]
         start = last_ready = clock.now()
         reason = 'session_ended'
-        while not rospy.is_shutdown() and clock.now() - start < 29.8:
+        duration = 54.8 if follower is not None else 29.8
+        while not rospy.is_shutdown() and clock.now() - start < duration:
             now = clock.now()
             sample = snapshot(now)
             if sample is None and now - last_ready < .3:
@@ -144,6 +157,21 @@ def execute(args, reference, report, origin):
                 break
             last_ready = now
             offset = continued_offset(origin, _relative(pose, sample[0]))
+            if follower is not None:
+                distance = math.hypot(offset.x, offset.y)
+                requested = follower.step(offset)
+                if not (requested.linear or requested.angular):
+                    reason = requested.reason
+                    break
+                if front_obstacle(sample[2], requested.angular):
+                    reason = 'retrace_live_obstacle_or_missing_returns'
+                    break
+                command = actuator.publish(requested)
+                if not (command.linear or command.angular):
+                    reason = command.reason
+                    break
+                time.sleep(.04)
+                continue
             distance = -offset.x
             if distance < -.005 or abs(offset.y) > MAX_LATERAL_M or abs(offset.yaw) > .04:
                 reason = 'retrace_path_departure'
@@ -165,6 +193,8 @@ def execute(args, reference, report, origin):
     data = recorder.trial_trajectory(actuator.caller, start, clock.now())
     report.update(reason=reason, displacement_m=distance, final_offset=offset, trajectory=data,
                   relay_fault=actuator.stop_line, relay_exited=actuator.transport.exited)
+    if follower is not None:
+        report['last_completed_keyframe'] = follower.index
     print(json.dumps(report, allow_nan=False))
     return 0 if reason == 'retrace_distance_reached' and actuator.transport.exited else 2
 

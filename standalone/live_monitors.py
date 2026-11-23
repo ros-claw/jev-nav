@@ -90,6 +90,9 @@ class _AsyncMonitor(object):
     def _diagnostic_details(self, sample):
         return {}
 
+    def _late_sample(self, value, now):
+        self._latch_fault("sample_time_invalid_or_expired")
+
     def _latch_fault(self, reason):
         if not self._faulted:
             self._faulted = True
@@ -132,8 +135,7 @@ class _AsyncMonitor(object):
                     self._sampling_started_mono = None
                     if self._stop.is_set():
                         break
-                    if (not _number(started) or not _number(now)
-                            or not 0 <= now - started <= self.max_age):
+                    if not _number(started) or not _number(now) or now < started:
                         self._latch_fault("sample_time_invalid_or_expired")
                     else:
                         if self._last_clock is not None and now < self._last_clock:
@@ -143,15 +145,19 @@ class _AsyncMonitor(object):
                         elif mono_now - self._clock_changed_mono_at > self.max_age:
                             self._latch_fault("clock_frozen")
                         self._last_clock = now
-                        self._sample = value
-                        self._sample_at = now
-                        self._sample_mono_at = mono_now
-                        # Once confirmed, any observed violation is permanent.
-                        if self._confirmed:
-                            if self._assess(value, now) is None:
-                                self._latch_fault(self._diagnose_assessment(value, now))
-                            else:
-                                self._publish_command_deadline(now, mono_now)
+                        if now - started > self.max_age:
+                            self._late_sample(value, now)
+                        else:
+                            self._sample = value
+                            self._sample_at = now
+                            self._sample_mono_at = mono_now
+                            # Once confirmed, any observed violation is permanent.
+                            if self._confirmed:
+                                if self._assess(value, now) is None:
+                                    self._latch_fault(self._diagnose_assessment(value, now))
+                                else:
+                                    self._read_reason = "ok"
+                                    self._publish_command_deadline(now, mono_now)
                     self._updated.set()
                 self._wake.wait(self.poll_interval)
                 self._wake.clear()
@@ -184,7 +190,8 @@ class _AsyncMonitor(object):
             elif not _number(now):
                 self._read_reason = "clock_invalid"
             elif self._sample_at is None or self._sample_mono_at is None:
-                self._read_reason = "sample_unavailable"
+                if self._read_reason != "sample_deadline_missed":
+                    self._read_reason = "sample_unavailable"
             elif (not 0 <= now - self._sample_at <= self.max_age
                   or not 0 <= _monotonic() - self._sample_mono_at <= self.max_age):
                 if (self._sampling_started_mono is not None
@@ -238,7 +245,7 @@ class _AsyncMonitor(object):
                 elif sampling_age is not None and sampling_age > self.max_age:
                     reason = "background_sample_timeout"
                 elif age is None or mono_age is None:
-                    reason = "sample_unavailable"
+                    reason = self._read_reason
                 elif not 0 <= age <= self.max_age or not 0 <= mono_age <= self.max_age:
                     reason = "cache_expired"
                 else:
@@ -392,15 +399,32 @@ def _parse_watchdog(packet, now, driver_pid):
 class RosCallerMonitor(_AsyncMonitor):
     """Bind one /cmd_vel node to the relay process and driver's v2 status."""
     def __init__(self, backend, clock, driver_pid, poll_interval=0.05, max_age=0.25,
-                 acquire_timeout=0.5, bind_timeout=0.12):
+                 acquire_timeout=0.5, bind_timeout=0.12, retry_late_samples=False):
         if (not _valid_pid(driver_pid) or not _number(bind_timeout) or not 0 < bind_timeout <= 0.4
-                or not _number(max_age) or not 0 < max_age <= 0.3):
+                or not _number(max_age) or not 0 < max_age <= 0.3 or type(retry_late_samples) is not bool):
             raise ValueError("invalid ROS monitor settings")
         _AsyncMonitor.__init__(self, backend, clock, poll_interval, max_age, acquire_timeout)
         self.driver_pid, self.bind_timeout = driver_pid, bind_timeout
         self._relay = None
         self._relay_pid = None
         self._last_status = None
+        self._retry_late_samples = retry_late_samples
+        self._late_samples_discarded = 0
+
+    def _late_sample(self, value, now):
+        if not self._retry_late_samples or not self._confirmed or self._faulted:
+            _AsyncMonitor._late_sample(self, value, now)
+            return
+        self._command_evidence = None
+        if self._assess(value, now) is None:
+            self._sample = value
+            self._latch_fault(self._diagnose_assessment(value, now))
+            return
+        # The identity checks passed, but only a fresh graph can restore authority.
+        self._sample = self._sample_at = self._sample_mono_at = None
+        self._read_reason = "sample_deadline_missed"
+        self._late_samples_discarded += 1
+        self.backend.invalidate_graph()
 
     def _graph_fresh(self, sample, now):
         get_generation = getattr(self.backend, "graph_generation", None)
@@ -432,6 +456,7 @@ class RosCallerMonitor(_AsyncMonitor):
     def _diagnostic_details(self, sample):
         # Never include raw graph entries, caller names, status text or URIs.
         details = {"driver_pid_expected": self.driver_pid, "relay_pid_expected": self._relay_pid,
+                   "late_samples_discarded": self._late_samples_discarded,
                    "driver_pid_observed": None, "relay_pid_observed": None,
                    "cmd_publisher_count": None, "watchdog_publisher_count": None,
                    "watchdog_source": "unavailable"}

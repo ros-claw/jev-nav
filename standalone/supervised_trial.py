@@ -201,12 +201,12 @@ def make_relay(clock, motion_limit_sec=0.3):
     return ThreadedRelayAdapter(RelayProcessTransport(clock), clock, motion_limit_sec=motion_limit_sec)
 
 
-def make_ros_monitor(clock, driver_pid, master_uri):
+def make_ros_monitor(clock, driver_pid, master_uri, retry_late_samples=False):
     from live_monitors import Ros1ReadOnlyBackend, RosCallerMonitor
     backend = Ros1ReadOnlyBackend(master_uri, clock, rpc_timeout=0.2)
     # Read the most recent watchdog packet more frequently between graph RPCs.
     return RosCallerMonitor(backend, clock, driver_pid, poll_interval=0.05, max_age=0.3,
-                            acquire_timeout=1.0, bind_timeout=0.35)
+                            acquire_timeout=1.0, bind_timeout=0.35, retry_late_samples=retry_late_samples)
 
 
 class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2

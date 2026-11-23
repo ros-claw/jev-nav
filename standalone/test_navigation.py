@@ -433,6 +433,31 @@ def test_room_can_prepare_a_checked_pivot_at_a_close_obstacle():
     assert blind.prepare_pivot(view(1., cells=grid({(.47, 0.): 100, (-.18, -.06): -1})), 1., 'left') is None
 
 
+def test_room_offers_safe_pivots_to_the_model_when_forward_paths_end_at_a_box():
+    navigation = Navigation(static_room=True)
+    cells = grid({(.25, .015): 100})
+    request = navigation.request(view(1., cells=cells), 1.)
+    assert request.choices == ('pivot_left', 'pivot_right', 'stop')
+    assert {action: reason for action, reason, _, _ in request.blocks} == {
+        'forward': 'occupied', 'left': 'occupied', 'right': 'occupied'}
+    new_box = view(1.05, cells=grid({(.25, .015): 100, (.13, .13): 100}))
+    assert not navigation.accept(request, 'pivot_left', new_box, 1.05)
+
+    runtime = NavigationRuntime(lambda request, cancelled: 'circulate_left', lambda command: None,
+                                navigation, static_room=True)
+    try:
+        _, request, _ = runtime.cycle(view(2., cells=cells), 2.)
+        assert request.choices[0] == 'pivot_left'
+        until = time.time() + 1.
+        while runtime._result is None and time.time() < until:
+            time.sleep(.001)
+        command, _, decision = runtime.cycle(view(2.05, cells=cells), 2.05)
+        assert decision == (request.sequence, 'circulate_left', True)
+        assert command.linear == 0. and command.angular > 0.
+    finally:
+        assert runtime.close()
+
+
 def test_room_keeps_the_model_route_when_tracking_needs_a_new_anchor():
     calls = []
 
@@ -553,6 +578,75 @@ def test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choice
         assert pose.x > .56
         stopped, _, _ = runtime.cycle(view(now + .05, pose, cells, scan=now - .5), now + .05)
         assert stopped.reason == 'perception_unavailable' and stopped.linear == stopped.angular == 0.
+    finally:
+        assert runtime.close()
+
+
+def test_room_rechecks_route_with_the_model_without_waiting_at_local_segments(monkeypatch):
+    import navigation_runtime
+    monkeypatch.setattr(navigation_runtime, 'ROOM_ROUTE_REVIEW_SEC', 5.)
+    release = threading.Event()
+    requests = []
+
+    def decide(request, cancelled):
+        requests.append(request)
+        if len(requests) == 1:
+            return 'circulate_left'
+        while not release.wait(.005):
+            if cancelled():
+                return None
+        return 'circulate_right'
+
+    def await_decision():
+        until = time.time() + 1.
+        while runtime._result is None and time.time() < until:
+            time.sleep(.001)
+        assert runtime._result is not None
+
+    runtime = NavigationRuntime(decide, lambda command: None, Navigation(static_room=True), static_room=True)
+    pose, cells = Pose(0., 0., 0.), grid()
+    answer_at = None
+    actions, accepted = set(), []
+    try:
+        runtime.cycle(view(1., pose, cells), 1.)
+        await_decision()
+        for index in range(1, 520):
+            now = 1. + index * .05
+            if answer_at is not None and now >= answer_at and not release.is_set():
+                release.set()
+                await_decision()
+            command, request, decision = runtime.cycle(view(now, pose, cells), now)
+            assert command.linear > 0., (now, command)
+            actions.add(command.action)
+            if request and answer_at is None:
+                answer_at = now + 5.5
+            if decision:
+                assert decision[2]
+                accepted.append(decision[1])
+            pose = arc_pose(pose, command.linear * .05, command.angular / command.linear)
+        assert accepted[:2] == ['circulate_left', 'circulate_right']
+        assert actions == {'left', 'right'}
+    finally:
+        assert runtime.close()
+
+
+def test_room_reuses_a_fresh_direction_when_the_offered_arc_becomes_blocked():
+    navigation = Navigation(static_room=True)
+    runtime = NavigationRuntime(lambda request, cancelled: 'circulate_left', lambda command: None,
+                                navigation, static_room=True)
+    try:
+        _, first, _ = runtime.cycle(view(1.), 1.)
+        assert 'left' in first.choices
+        until = time.time() + 1.
+        while runtime._result is None and time.time() < until:
+            time.sleep(.001)
+        blocked = grid({(.25, .015): 100})
+        command, request, decision = runtime.cycle(view(1.05, cells=blocked), 1.05)
+        assert command.linear == command.angular == 0.
+        assert decision == (first.sequence, 'circulate_left', True)
+        assert request is None and runtime.room_continuation[1:] == ('pivot_left', first.sequence)
+        command, _, _ = runtime.cycle(view(1.10, cells=blocked), 1.10)
+        assert command.action == 'pivot_left' and command.angular > 0.
     finally:
         assert runtime.close()
 

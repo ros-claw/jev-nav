@@ -731,6 +731,56 @@ def test_diagnostic_distinguishes_inflight_sample_timeout_and_cached_age():
         guard.release()
 
 
+@pytest.mark.parametrize('other_publisher', [False, True])
+def test_navigation_discards_late_authority_and_requires_a_fresh_sample(other_publisher):
+    clock = Clock()
+    inject = threading.Event()
+    retry = threading.Event()
+    graph_invalidated = threading.Event()
+
+    class DelayedRosGraph(Backend):
+        def invalidate_graph(self):
+            graph_invalidated.set()
+
+        def sample(self):
+            if not inject.is_set():
+                return super(DelayedRosGraph, self).sample()
+            if not graph_invalidated.is_set():
+                clock.t += .31
+                publishers = ['/relay', '/other'] if other_publisher else ['/relay']
+            else:
+                retry.wait(.8)
+                publishers = ['/relay']
+            sample = ros_sample(clock, publishers, caller='/relay', primed=1)
+            sample['watchdog']['data'] = sample['watchdog']['data'].rsplit(' ', 1)[0] + ' %.6f' % clock.now()
+            return sample
+
+    backend = DelayedRosGraph(ros_sample(clock))
+    guard = module().RosCallerMonitor(backend, clock, 11139, poll_interval=.01, max_age=.3,
+                                      bind_timeout=.4, retry_late_samples=True)
+    try:
+        assert guard.acquire()
+        backend.set(ros_sample(clock, ['/relay'], caller='/relay', primed=1))
+        assert guard.bind_relay(Relay(222))
+        graph_invalidated.clear()
+        assert guard.cached_command_deadline() is not None
+        inject.set()
+        reason = 'cmd_publisher_count' if other_publisher else 'sample_deadline_missed'
+        report = diagnostic_wait(guard, reason)
+        assert report['fault_latched'] == other_publisher
+        assert guard.cached_command_deadline() is None
+        assert graph_invalidated.is_set() != other_publisher
+        retry.set()
+        if not other_publisher:
+            until = time.time() + .3
+            while guard.cached_command_deadline() is None and time.time() < until:
+                time.sleep(.002)
+            assert guard.cached_command_deadline() is not None
+    finally:
+        retry.set()
+        guard.release()
+
+
 @pytest.mark.parametrize("error,reason", [(RuntimeError("secret rpc detail"), "rpc_exception"),
                                             (socket.timeout("secret timeout"), "rpc_timeout")])  # noqa: UP041
 def test_diagnostic_reports_rpc_exception_without_details(error, reason):
