@@ -44,7 +44,7 @@ class RosNavigationInput(object):
         self.rospy = rospy
         self.operator_clear_front = operator_clear_front
         self.static_room = static_room
-        self.observation = RosObservation(sensor_names=('odom', 'status'))
+        self.observation = RosObservation(sensor_names=('odom', 'status'), drop_expired_odometry=True)
         self.latest_grid = None
         self.last_grid_times = None
         self.latest_color = None
@@ -230,6 +230,44 @@ def parse_args(argv=None):
     return args
 
 
+def summarize_wheel_motion(odometry):
+    """Measure wheel motion without joining intervals across missing samples."""
+    if not odometry or any(len(row) < 6 for row in odometry):
+        return None
+    moving = [abs(row[3]) >= .003 or abs(row[5]) >= .01 for row in odometry]
+    report = {'longest_sec': 0., 'pause_count': 0, 'stationary_sec': 0., 'unobserved_gaps': 0}
+    if not any(moving):
+        return report
+    first, last = moving.index(True), len(moving) - list(reversed(moving)).index(True)
+    stationary_since = None
+    begin = previous = odometry[first][0]
+    for row, has_motion in zip(odometry[first:last], moving[first:last]):
+        at = row[0]
+        gap = at - previous >= .24
+        if stationary_since is not None and (gap or has_motion):
+            end = previous if gap else at
+            duration = end - stationary_since
+            if duration >= .25:
+                if begin is not None:
+                    report['longest_sec'] = max(report['longest_sec'], stationary_since - begin)
+                report['pause_count'] += 1
+                report['stationary_sec'] += duration
+                begin = end
+            stationary_since = None
+        if gap:
+            if begin is not None:
+                report['longest_sec'] = max(report['longest_sec'], previous - begin)
+            report['unobserved_gaps'] += 1
+            begin = None
+        if has_motion and begin is None:
+            begin = at
+        if not has_motion and stationary_since is None:
+            stationary_since = at
+        previous = at
+    report['longest_sec'] = max(report['longest_sec'], previous - begin)
+    return report
+
+
 def summarize_navigation_trajectory(trajectory):
     """Measure a navigation run that can stop temporarily and resume."""
     from supervised_trial import summarize_observations
@@ -240,7 +278,7 @@ def summarize_navigation_trajectory(trajectory):
     summary.update({'measurement_scope': 'relay_callback_window', 'relay_caller_observed': bool(commands),
                     'longest_nonzero_sec': 0., 'zero_after_last_motion': None,
                     'nonzero_angular_cmd_vel_messages': sum(row[2] != 0. for row in commands),
-                    'odom_heading_span_rad': None})
+                    'odom_heading_span_rad': None, 'wheel_motion': None})
     if not active:
         return summary
     first = active[0][0]
@@ -248,6 +286,7 @@ def summarize_navigation_trajectory(trajectory):
     last = active[-1][0] if stop is None else stop
     odometry = sorted((row for row in trajectory['odom'] if first <= row[0] <= last), key=lambda row: row[0])
     summary.update(summarize_observations([row[:4] for row in odometry], commands))
+    summary['wheel_motion'] = summarize_wheel_motion(odometry)
     headings = [row[4] for row in odometry if len(row) >= 5]
     if headings:
         current = minimum = maximum = 0.
@@ -340,6 +379,8 @@ def main(argv=None):
         room = RoomPerception()
     first_pose = last_pose = None
     unavailable_guards = ()
+    authority_states = {}
+    last_authority_check = 0.
     authority_diagnostics = {}
     arc_traces = {}
     travelled = 0.
@@ -424,6 +465,8 @@ def main(argv=None):
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
                       'final_action': command.action, 'clock_domain': 'monotonic'}
+            if runtime.navigation.blocked_action is not None:
+                fields['blocked_action'] = runtime.navigation.blocked_action
             applied = heartbeat.applied if heartbeat is not None else None
             if applied is not None:
                 relay_at, relay_command = applied
@@ -446,16 +489,29 @@ def main(argv=None):
                         'action': command.action, 'started_at': now, 'start_yaw_rad': view.pose.yaw})
                     trace.update(last_at=now, last_yaw_rad=view.pose.yaw)
             timeline.record('control', now, fields)
-            if actuator is not None and actuator.unavailable_guards != unavailable_guards:
-                unavailable_guards = actuator.unavailable_guards
+            if command.reason in ('perception_unavailable', 'clock_or_odometry_reset'):
+                diagnostics = source.observation.diagnostic_status()
+                fault = diagnostics['clock_fault'] or diagnostics['odom_fault'] or runtime.navigation.fault
+                if fault:
+                    reason = fault
+                    timeline.record('run', now, {'stage': 'observation', 'status': 'latched', 'reason': fault})
+                    break
+            guards = actuator.unavailable_guards if actuator is not None else ()
+            if guards != unavailable_guards or (guards and now - last_authority_check >= .25):
+                unavailable_guards = guards
+                last_authority_check = now
                 for stage, guard in (('ros_authority', ros_guard), ('serial_authority', serial_guard)):
                     if stage in unavailable_guards:
                         report = guard.diagnostic()
                         reason_code = report['reason'] if report['reason'] != 'ok' else 'command_deadline_unavailable'
-                        timeline.record('run', now, {'stage': stage, 'reason': reason_code,
-                                                     'status': 'latched' if report['fault_latched'] else 'sampled'})
+                        state = reason_code, 'latched' if report['fault_latched'] else 'sampled'
+                        if authority_states.get(stage) != state:
+                            timeline.record('run', now, {'stage': stage, 'reason': state[0], 'status': state[1]})
+                            authority_states[stage] = state
                         if report['fault_latched']:
                             raise ActuationError('navigation_%s_%s' % (stage, reason_code))
+                    else:
+                        authority_states.pop(stage, None)
             if request is not None:
                 timeline.record('decision', now, {'decision_id': request.sequence, 'stage': 'requested',
                                                   'candidate_id': '.'.join(request.choices),
@@ -467,7 +523,9 @@ def main(argv=None):
             if runtime.room_continuation is not None:
                 segment, action, origin_decision = runtime.room_continuation
                 timeline.record('decision', now, {'decision_id': segment, 'selected_action': action,
-                                                  'scene_id': origin_decision, 'stage': 'local_continuation'})
+                                                  'scene_id': origin_decision,
+                                                  'stage': 'local_replacement' if runtime.room_replacement
+                                                  else 'local_continuation'})
             if now - last_block_report >= 1.:
                 last_block_report = now
                 blocks = dict(runtime.navigation.candidate_blocks)
@@ -516,6 +574,7 @@ def main(argv=None):
               'preview_topic': None if args.drive else preview, 'control': counts, 'reason': reason,
               'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
               'grid_updates': source.grid_updates if source is not None else {},
+              'observation_diagnostics': source.observation.diagnostic_status() if source is not None else {},
               'decision_errors': source.decision_errors if source is not None else {},
               'decision_scan_counts': source.decision_scan_counts if source is not None else {},
               'arc_traces': arc_traces,

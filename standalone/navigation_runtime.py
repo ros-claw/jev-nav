@@ -3,8 +3,7 @@ from __future__ import division
 
 import threading
 
-from navigation import (PIVOTS, ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
-                        ready, sweep_block, sweep_clear)
+from navigation import ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation, ready, sweep_block
 
 
 ROOM_DIRECTIONS = {'circulate_left': 'left', 'circulate_right': 'right'}
@@ -24,9 +23,11 @@ class NavigationRuntime(object):
         self._job = self._result = None
         self._next_request = 0.
         self._last_grid = None
+        self._blocked_replacement = None
         self.static_room = static_room
         self.room_plan = None
         self.room_continuation = None
+        self.room_replacement = False
         self.review_origin = None
         self._review_after = 0.
         self._worker = threading.Thread(target=self._work, name='navigation-decisions')
@@ -51,6 +52,7 @@ class NavigationRuntime(object):
         result = self._result
         decision = None
         self.room_continuation = None
+        self.room_replacement = False
         if result is not None:
             request, choice = result
             current_request = request is self.navigation.pending or self.review_origin is not None
@@ -84,12 +86,8 @@ class NavigationRuntime(object):
                     self._next_request = now + 1.
 
         command = self.navigation.step(view, now)
-        survey = (self.room_plan is not None and command.reason == 'path_unknown'
-                  and (self.navigation.goal.action in ('left', 'right') or self.navigation.goal.action in PIVOTS)
-                  and sweep_clear(view.grid, view.pose, self.navigation.length, 0.))
-        if survey:
-            self.navigation.stop('path_unknown')
-            self._last_grid = None
+        if command.reason != 'path_unknown':
+            self._blocked_replacement = None
         if command.reason == 'clock_or_odometry_reset':
             self.room_plan = None
         elif command.reason == 'path_tracking_lost' and self.room_plan is not None:
@@ -103,8 +101,20 @@ class NavigationRuntime(object):
                 and (self._job is None or self.review_origin is not None and self.room_plan is not None)
                 and now >= self._next_request and view.grid_at != self._last_grid):
             self._last_grid = view.grid_at
+            if self.room_plan is not None and command.reason == 'path_unknown':
+                source, direction = self.room_plan
+                geometry = (self.navigation.goal.sequence, view.epoch, view.pose, view.grid, direction)
+                if geometry == self._blocked_replacement:
+                    return command, None, decision
+                action = self.navigation.replace_unknown_path(view, now, direction)
+                if action is not None:
+                    self.room_continuation = (self.navigation.sequence, action, source)
+                    self.room_replacement = True
+                else:
+                    self._blocked_replacement = geometry
+                return command, None, decision
             offered = self.navigation.request(view, now)
-            if self.room_plan is not None and not survey:
+            if self.room_plan is not None:
                 source, direction = self.room_plan
                 pivot = self.navigation.prepare_pivot(view, now, direction, offered)
                 if pivot is not None:
@@ -112,7 +122,7 @@ class NavigationRuntime(object):
                     offered = None
             if offered is not None and self.room_plan is not None:
                 source, direction = self.room_plan
-                action = 'forward' if survey else self._room_action(offered, direction, view)
+                action = self._room_action(offered, direction, view)
                 if action and self.navigation.accept(offered, action, view, now):
                     self.room_continuation = (offered.sequence, action, source)
                     if self._job is None and now >= self._review_after:

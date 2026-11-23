@@ -202,7 +202,7 @@ class Navigation(object):
         self.speed = 0.
         self.steer = 0.
         self.paused = False
-        self.blocked_cell = None
+        self.blocked_cell = self.blocked_action = None
         self.candidate_blocks = {}
 
     def stop(self, reason):
@@ -289,6 +289,34 @@ class Navigation(object):
             return action
         return None
 
+    def replace_unknown_path(self, view, now, direction):
+        """Replace a paused path only with a fresh sweep from the measured pose."""
+        if (self.fault or self.forward_only or not self.paused or self.goal is None
+                or self.blocked_cell is None or self.blocked_cell[0] != 'unknown' or not ready(view, now)
+                or view.epoch != self.epoch):
+            return None
+        self.candidate_blocks = {}
+        away = 'right' if direction == 'left' else 'left'
+        for action in ('forward', direction, away):
+            if action == self.goal.action:
+                continue
+            block = sweep_block(view.grid, view.pose, self.length, self.curvature[action])
+            if block is None:
+                break
+            self.candidate_blocks[action] = block
+        else:
+            if not self.static_room or not sweep_block(view.grid, view.pose, .42, 0., occupied_only=True):
+                return None
+            for action in ('pivot_' + direction, 'pivot_' + away):
+                if action != self.goal.action and self._pivot_clear(view, view.pose, action):
+                    break
+            else:
+                return None
+        self.stop('path_unknown')
+        self.sequence += 1
+        self.goal = Segment(self.sequence, action, view.pose)
+        return action
+
     def _pivot_clear(self, view, anchor, action):
         angle = PIVOTS[action]
         turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
@@ -334,7 +362,7 @@ class Navigation(object):
         return True
 
     def step(self, view, now):
-        self.blocked_cell = None
+        self.blocked_cell = self.blocked_action = None
         elapsed = .05 if self.last_at is None else now - self.last_at
         if elapsed < 0 or (view is not None and self.epoch is not None and view.epoch != self.epoch):
             self.fault = 'clock_or_odometry_reset'
@@ -399,6 +427,7 @@ class Navigation(object):
             steer = 0.
             self.blocked_cell = None
         if self.blocked_cell is not None:
+            self.blocked_action = self.goal.action
             if self.blocked_cell[0] == 'occupied':
                 return self.stop('path_occupied')
             return self._pause('path_unknown')
@@ -425,6 +454,7 @@ class Navigation(object):
             return Command(0., 0., 'stop', 'goal_reached')
         self.blocked_cell = rotation_block(view.grid, view.pose, sign * min(.13, remaining + .025))
         if self.blocked_cell is not None:
+            self.blocked_action = self.goal.action
             if self.blocked_cell[0] == 'occupied':
                 return self.stop('path_occupied')
             return self._pause('path_unknown')

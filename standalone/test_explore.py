@@ -132,6 +132,35 @@ def test_callback_records_sensor_age_when_source_time_is_invalid(monkeypatch):
     assert 'sensor_age_sec' not in observer.epoch_issue
 
 
+def test_navigation_drops_expired_odometry_without_resetting_a_valid_epoch(monkeypatch):
+    import explore
+
+    class ClockGuardStub(object):
+        def observe(self, *_args):
+            return True
+
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock = threading.Lock()
+    observer.clock_guard = ClockGuardStub()
+    observer.rospy = type('Ros', (), {'Time': None})()
+    observer.drop_expired_odometry, observer.expired_odometry = True, 0
+    recent = {'stamp': 49.97}
+    observer.latest, observer.epoch, observer.limits = {'odom': recent}, 4, {'odom': .25}
+    observer.epoch_issue = None
+    header = type('Header', (), {'stamp': type('Stamp', (), {'to_sec': lambda self: 99.7})()})()
+    message = type('Odometry', (), {'header': header})()
+    monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (100., 50.))
+
+    observer._receive(message, 'odom')
+    assert observer.latest['odom'] is recent
+    assert observer.epoch == 4 and observer.epoch_issue is None
+    assert observer.expired_odometry == 1
+
+    header.stamp.to_sec = lambda: 100.02
+    observer._receive(message, 'odom')
+    assert observer.epoch == 5 and 'odom' not in observer.latest
+
+
 def test_delayed_clock_pair_is_discarded_instead_of_false_clock_jump():
     times = iter([10.0, 10.004, 10.1, 10.14])
     first = sample_clocks(lambda: next(times), lambda: 100.0)

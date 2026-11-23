@@ -582,7 +582,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
     """Read ROS sensors directly; this object never creates a velocity publisher."""
 
     def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None, scan_validator=None,
-                 separate_model_camera=False, filter_lidar_margin=False, use_source_deadlines=False):
+                 separate_model_camera=False, filter_lidar_margin=False, use_source_deadlines=False,
+                 drop_expired_odometry=False):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -594,6 +595,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.listener = tf.TransformListener()
         self.lock = threading.Lock()
         self.latest = {}
+        self.drop_expired_odometry = drop_expired_odometry
+        self.expired_odometry = 0
         self._sensor_generations = {'scan': 0, 'depth': 0}
         self._sensor_receipts = {name: collections.deque(maxlen=4) for name in self._sensor_generations}
         self.odom_history = collections.deque(maxlen=600)
@@ -665,13 +668,17 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                 header_stamp = message.header.stamp.to_sec()
                 stamp = source_time(ros_now, received, header_stamp, self.limits[name])
                 if stamp is None:
+                    age = ros_now - header_stamp if _finite(header_stamp) and _finite(ros_now) else None
+                    if (name == 'odom' and getattr(self, 'drop_expired_odometry', False)
+                            and _finite(age) and header_stamp > 0 and age > self.limits[name]):
+                        # The next fresh odometry sample still has to pass the continuity guard.
+                        self.expired_odometry += 1
+                        return
                     self.latest.pop(name, None)
                     self.epoch += 1
                     self.epoch_issue = {'reason': 'source_time_invalid', 'sensor': name}
-                    if _finite(header_stamp) and _finite(ros_now):
-                        age = ros_now - header_stamp
-                        if _finite(age):
-                            self.epoch_issue['sensor_age_sec'] = age
+                    if _finite(age):
+                        self.epoch_issue['sensor_age_sec'] = age
                     return
                 # Keep the receipt in the same monotonic/ROS clock pairing as
                 # the acquisition stamp; it must never predate that stamp.
@@ -1986,6 +1993,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     for name, record in self.latest.items()}
             return {"epoch": self.epoch, "clock_fault": self.clock_guard.fault_reason,
                     "odom_fault": self.odom_guard.fault_reason, "sensor_ages_sec": ages,
+                    "expired_odometry": getattr(self, 'expired_odometry', 0),
                     "epoch_issue": getattr(self, 'epoch_issue', None),
                     "lidar_filtered_frames": getattr(self, '_lidar_filtered_frames', 0),
                     "lidar_filtered_bins": getattr(self, '_lidar_filtered_bins', 0),

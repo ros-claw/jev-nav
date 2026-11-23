@@ -174,6 +174,19 @@ def test_navigation_trajectory_counts_motion_after_a_pause():
     assert result['odom_displacement_m'] == .02 and result['zero_after_last_motion'] == 1.35
 
 
+def test_navigation_distinguishes_wheel_pauses_and_missing_odometry_from_relay_output():
+    from run_navigation import summarize_navigation_trajectory
+    commands = [(i * .05, .02, 0.) for i in range(40)] + [(2., 0., 0.)]
+    odometry = [(i * .05, i * .001, 0., .02 if i < 11 or i >= 18 else 0., 0., 0.)
+                for i in range(40) if not 26 <= i <= 31]
+    observed = summarize_navigation_trajectory({'commands': commands, 'odom': odometry})
+    assert observed['longest_nonzero_sec'] == 2.
+    assert observed['wheel_motion']['pause_count'] == 1
+    assert observed['wheel_motion']['stationary_sec'] == pytest.approx(.35)
+    assert observed['wheel_motion']['unobserved_gaps'] == 1
+    assert observed['wheel_motion']['longest_sec'] == pytest.approx(.55)
+
+
 def test_turn_measurement_unwraps_heading_while_the_robot_moves():
     from run_navigation import summarize_navigation_trajectory
     commands = [(1., .014, .011), (1.05, .014, .011), (1.10, 0., 0.)]
@@ -431,6 +444,56 @@ def test_room_can_prepare_a_checked_pivot_at_a_close_obstacle():
 
     blind = Navigation(static_room=True)
     assert blind.prepare_pivot(view(1., cells=grid({(.47, 0.): 100, (-.18, -.06): -1})), 1., 'left') is None
+
+
+@pytest.mark.parametrize('front_cell', [0, -1, 100])
+def test_room_reanchors_a_paused_forward_segment_only_if_an_alternative_is_observed(front_cell):
+    side, resolution = 60, .05
+    cells = [0] * (side * side)
+    cells[30 * side + 30] = -1
+    cells[33 * side + (30 if front_cell == -1 else 29)] = front_cell
+    observed = Grid(-1.305, -1.659, resolution, side, side, tuple(cells))
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        stopped, _, _ = runtime.cycle(view(1.05, cells=observed), 1.05)
+        assert stopped.linear == stopped.angular == 0.
+        command, _, _ = runtime.cycle(view(1.10, cells=observed), 1.10)
+        if front_cell:
+            assert command.linear == command.angular == 0.
+        else:
+            assert stopped.reason == 'path_unknown'
+            assert command.action == 'left' and command.linear > 0. and command.angular > 0.
+            assert runtime.room_plan == (1, 'left')
+    finally:
+        assert runtime.close()
+
+
+def test_room_rechecks_failed_alternatives_after_geometry_changes(monkeypatch):
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    checked = []
+    replace = navigation.replace_unknown_path
+
+    def count_checks(observation, now, direction):
+        checked.append(now)
+        return replace(observation, now, direction)
+
+    monkeypatch.setattr(navigation, 'replace_unknown_path', count_checks)
+    try:
+        for now in (1.05, 1.10, 1.15):
+            command, _, _ = runtime.cycle(view(now, cells=grid({(.21, 0.): -1})), now)
+            assert command.reason == 'path_unknown'
+        runtime.cycle(view(1.20, cells=grid({(.21, 0.): -1, (.51, 0.): -1})), 1.20)
+        assert checked == [1.05, 1.20]
+    finally:
+        assert runtime.close()
 
 
 def test_room_offers_safe_pivots_to_the_model_when_forward_paths_end_at_a_box():
