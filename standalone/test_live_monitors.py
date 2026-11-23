@@ -1,7 +1,11 @@
 """Offline tests with fake ROS, process and device observations only."""
 import copy
 import errno
+import os
+import pty
 import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -195,6 +199,23 @@ def test_serial_monitor_can_accommodate_slow_fuser_without_relaxing_ros_monitor(
         mod.RosCallerMonitor(Backend(None), clock, driver_pid=11139, max_age=0.31)
 
 
+def test_proc_serial_holder_query_detects_a_second_process_on_a_private_pty():
+    master, slave = pty.openpty()
+    child = None
+    try:
+        backend = module().ProcFdSerialBackend(Clock(), os.getpid(), os.ttyname(slave))
+        assert backend._query_holders() == [os.getpid()]
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                 stdin=subprocess.PIPE, stdout=slave, close_fds=True)
+        assert backend._query_holders() == sorted([os.getpid(), child.pid])
+    finally:
+        if child is not None:
+            child.stdin.close()
+            child.wait()
+        os.close(slave)
+        os.close(master)
+
+
 def test_serial_guard_checks_process_ownership_busy_probe_and_records_limits():
     clock = Clock()
     backend = Backend(serial_sample())
@@ -322,11 +343,13 @@ def test_active_serial_monitor_latches_on_failed_sample_or_pid_reuse(problem):
         if problem == "fuser_timeout":
             bad["fuser_complete"] = False
             bad["fuser_pids"] = None
+            reason = "serial_holder_query_unavailable"
         else:
             bad["before"]["start_ticks"] += 1
             bad["after"]["start_ticks"] += 1
+            reason = "serial_identity_or_exclusivity_unverified"
         backend.set(bad)
-        assert diagnostic_wait(guard, "sample_rejected")["fault_latched"]
+        assert diagnostic_wait(guard, reason)["fault_latched"]
         assert not guard.verify()
         backend.set(serial_sample())
         assert not guard.verify()
@@ -343,7 +366,7 @@ def test_probe_timestamp_must_be_present_and_match_the_original_observation():
         bad = serial_sample()
         bad["probe_at"] = 100.01
         backend.set(bad)
-        assert diagnostic_wait(guard, "sample_rejected")["fault_latched"]
+        assert diagnostic_wait(guard, "serial_identity_or_exclusivity_unverified")["fault_latched"]
         assert not guard.verify()
     finally:
         guard.release()

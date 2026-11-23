@@ -137,6 +137,23 @@ def test_hardware_profile_offers_forward_and_does_not_issue_steering():
     assert command.reason == 'path_tracking_lost' and command.linear == 0.
 
 
+@pytest.mark.parametrize('timed_out', [False, True])
+def test_forward_successor_has_time_to_retry_before_the_first_segment_ends(timed_out):
+    navigation = Navigation(forward_only=True, speed=.014)
+    first = select(navigation, 'forward', 1., view(1.))
+    early = view(9., Pose(.095, 0., 0.))
+    request = navigation.request(early, 9.)
+    assert request is not None and request.predecessor == first.sequence
+    if timed_out:
+        assert not navigation.accept(request, None, view(15., Pose(.164, 0., 0.)), 15.)
+        request = navigation.request(view(16., Pose(.175, 0., 0.)), 16.)
+        assert navigation.accept(request, 'forward', view(20., Pose(.219, 0., 0.)), 20.)
+    else:
+        assert navigation.accept(request, 'forward', early, 9.1)
+    assert navigation.step(view(21., Pose(.231, 0., 0.)), 21.).linear > 0.
+    assert navigation.goal.sequence == request.sequence
+
+
 def test_navigation_trajectory_counts_motion_after_a_pause():
     from run_navigation import summarize_navigation_trajectory
     commands = [(1., .014, 0.), (1.05, .014, 0.), (1.1, 0., 0.),
@@ -217,9 +234,11 @@ def test_hardware_authority_loss_withholds_velocity_and_cannot_hide_relay_fault(
         serial.allowed = False
         actual = actuator.publish(command)
         assert actual.linear == 0. and actual.reason == 'command_authority_unavailable'
+        assert actuator.unavailable_guards == ('serial_authority',)
         assert transport.gate.command(_monotonic()) == (0., 0.)
         serial.allowed = True
         assert actuator.publish(command) == command
+        assert not actuator.unavailable_guards
         transport.status = b'FAULT heartbeat\n'
         with pytest.raises(ActuationError, match='navigation_relay_fault'):
             actuator.publish(command)

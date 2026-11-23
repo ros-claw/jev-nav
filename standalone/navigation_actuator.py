@@ -19,6 +19,7 @@ class NavigationActuator(object):
         self.caller = None
         self.armed = False
         self.stop_line = None
+        self.unavailable_guards = ()
 
     def open(self):
         if not self.ros_guard.acquire() or not self.serial_guard.acquire():
@@ -65,8 +66,12 @@ class NavigationActuator(object):
         if command.angular != 0. or not 0. <= command.linear <= .02:
             self._send(0.)
             raise ActuationError('unexpected_forward_command')
-        if command.linear and (self.ros_guard.cached_command_deadline() is None
-                               or self.serial_guard.cached_command_deadline() is None):
+        self.unavailable_guards = ()
+        if command.linear:
+            self.unavailable_guards = tuple(
+                name for name, guard in (('ros_authority', self.ros_guard), ('serial_authority', self.serial_guard))
+                if guard.cached_command_deadline() is None)
+        if self.unavailable_guards:
             command = Command(0., 0., 'stop', 'command_authority_unavailable')
         self._send(command.linear)
         return command

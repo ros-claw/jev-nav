@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -623,6 +624,28 @@ class SerialOwnershipMonitor(_AsyncMonitor):
         self._start_ticks = None
         self._probe_at = None
 
+    def _diagnostic_details(self, sample):
+        if not isinstance(sample, dict):
+            return {}
+        holders = sample.get('fuser_pids')
+        return {'visible_holder_count': len(holders) if isinstance(holders, list) else None,
+                'expected_holder_only': holders == [self.pid],
+                'holder_query_complete': sample.get('fuser_complete') is True,
+                'exclusive_open_probe': sample.get('open_errno') == errno.EBUSY}
+
+    def _diagnose_assessment(self, sample, now):
+        if not isinstance(sample, dict):
+            return 'serial_sample_missing'
+        if sample.get('before') != sample.get('after'):
+            return 'serial_driver_identity_changed'
+        if sample.get('fuser_complete') is not True:
+            return 'serial_holder_query_unavailable'
+        if sample.get('fuser_pids') != [self.pid]:
+            return 'serial_holder_mismatch'
+        if not _number(sample.get('fuser_at')) or not 0 <= now - sample['fuser_at'] <= 1.2:
+            return 'serial_holder_query_expired'
+        return 'serial_identity_or_exclusivity_unverified'
+
     def _assess(self, sample, now):
         try:
             before, after = sample["before"], sample["after"]
@@ -950,6 +973,9 @@ class ProcSerialBackend(object):
                 return None
             return parse_fuser(code, stdout, stderr, self.device)
 
+    def _query_holders(self):
+        return self.fuser()
+
     def probe(self):
         if self._cancel_event is not None and self._cancel_event.is_set():
             raise ValueError("serial inspection cancelled")
@@ -967,7 +993,7 @@ class ProcSerialBackend(object):
         if not _number(now) or (self._fuser_at is not None and now < self._fuser_at):
             raise ValueError("serial monitor clock invalid")
         if self._fuser_at is None or now - self._fuser_at >= 0.75:
-            self._fuser_pids = self.fuser()
+            self._fuser_pids = self._query_holders()
             self._fuser_at = self.clock.now()
             if not _number(self._fuser_at) or self._fuser_at < now:
                 raise ValueError("serial monitor clock invalid")
@@ -990,3 +1016,40 @@ class ProcSerialBackend(object):
 
     def stop(self):
         return None
+
+
+class ProcFdSerialBackend(ProcSerialBackend):
+    """Inspect visible tty descriptors directly, without starting fuser."""
+
+    def _query_holders(self):
+        device = os.stat(self.device)
+        if not stat.S_ISCHR(device.st_mode):
+            raise ValueError('serial device is not a character device')
+        holders = []
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            directory = '/proc/{}/fd'.format(pid)
+            # Disappearing processes and descriptors are normal. Visibility
+            # of other users' descriptors is limited to the caller's privileges.
+            unavailable = (errno.ENOENT, errno.ESRCH)
+            if pid != self.pid:
+                unavailable += (errno.EACCES, errno.EPERM)
+            try:
+                descriptors = os.listdir(directory)
+            except OSError as error:
+                if error.errno in unavailable:
+                    continue
+                raise
+            for descriptor in descriptors:
+                try:
+                    fd = os.stat(os.path.join(directory, descriptor))
+                except OSError as error:
+                    if error.errno in unavailable:
+                        continue
+                    raise
+                if stat.S_ISCHR(fd.st_mode) and fd.st_rdev == device.st_rdev:
+                    holders.append(pid)
+                    break
+        return sorted(holders)

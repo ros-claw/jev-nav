@@ -1,0 +1,21 @@
+<launch>
+  <include file="$(find limo_base)/launch/limo_base.launch">
+    <arg name="port_name" value="ttyTHS1"/>
+    <arg name="command_watchdog_enabled" value="true"/>
+  </include>
+
+  <include file="$(find ydlidar_ros)/launch/X2L.launch"/>
+  <include file="$(find astra_camera)/launch/dabai_u3.launch">
+    <arg name="depth_align" value="false"/>
+    <arg name="enable_point_cloud" value="false"/>
+    <arg name="enable_ir" value="false"/>
+    <arg name="keep_streaming" value="true"/>
+    <arg name="tf_publish_rate" value="0"/>
+  </include>
+
+  <!-- Fixed mounts are valid at each sensor's acquisition time. -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="base_link_to_camera_link"
+        args="0.105 0 0.1 0 0 0 1 base_link camera_link"/>
+  <node pkg="tf2_ros" type="static_transform_publisher" name="base_link_to_laser_link"
+        args="0.105 0 0.08 0 0 0 1 base_link laser_link"/>
+</launch>

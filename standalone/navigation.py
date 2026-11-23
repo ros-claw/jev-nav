@@ -13,6 +13,7 @@ Command = namedtuple('Command', 'linear angular action reason')
 Segment = namedtuple('Segment', 'sequence action origin')
 
 LENGTH = .24
+FORWARD_SUCCESSOR_LEAD = .15
 CURVATURE = {'forward': 0., 'left': .8, 'right': -.8}
 SPEED = .02
 MAX_RESPONSE_AGE = 8.
@@ -190,7 +191,8 @@ class Navigation(object):
             return None
         if self.goal is not None:
             remaining = _remaining(self.goal, view.pose)
-            if remaining > .09:
+            lead = FORWARD_SUCCESSOR_LEAD if self.forward_only else .09
+            if remaining > lead:
                 return None
             if self.forward_only:
                 # A straight continuation follows the current measured line.
@@ -226,13 +228,16 @@ class Navigation(object):
             return True
         if not ready(view, now) or request.epoch != view.epoch:
             return False
-        if (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) > .10
+        active_predecessor = self.goal is not None and request.predecessor == self.goal.sequence
+        # An early forward response is allowed only for the segment still being followed.
+        anchor_limit = FORWARD_SUCCESSOR_LEAD if self.forward_only and active_predecessor else .10
+        if (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) > anchor_limit
                 or abs(_wrap(view.pose.yaw - request.anchor.yaw)) > .20):
             return False
         if not sweep_clear(view.grid, request.anchor, LENGTH, CURVATURE[choice], view.pose):
             return False
         segment = Segment(request.sequence, choice, request.anchor)
-        if self.goal is not None and request.predecessor == self.goal.sequence:
+        if active_predecessor:
             self.successor = segment
         elif self.goal is None and request.predecessor in (None, self.completed):
             self.goal = segment

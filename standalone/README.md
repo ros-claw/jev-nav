@@ -4,7 +4,15 @@
 
 The default ROS output is an isolated `navigation_command_preview` topic. The entry point reads laser, depth, RGB and odometry. The rolling grid publishes the laser and depth acquisition stamps used for that grid. The ROS depth pipeline decimates images by two on each axis before converting them to point clouds. [ROS image decimation source](https://github.com/ros-perception/image_pipeline/blob/melodic/image_proc/src/nodelets/crop_decimate.cpp)
 
-Build the repository version of [`limo_fresh_layer`](limo_fresh_layer) in a Catkin workspace and source both that workspace and the LIMO driver workspace. A recorded live preview uses:
+Build the repository version of [`limo_fresh_layer`](limo_fresh_layer) in a Catkin workspace and source that workspace and the hardware workspaces. For the tested LIMO with the X2L lidar and DaBai U3 camera, bring up the matching hardware profile once from the repository root.
+
+```sh
+roslaunch standalone/navigation_hardware.launch
+```
+
+This profile expects the [watchdog-capable LIMO driver](../docs/DRIVER_WATCHDOG_CANDIDATE.md), the X2L launch from `ydlidar_ros`, and an `astra_camera` build with the `keep_streaming` and `tf_publish_rate` arguments. The fixed sensor and optical transforms are latched on `/tf_static`; odometry remains time-varying. Depth projection can use each frame's acquisition time as soon as the corresponding odometry transform is available. Verify the mounting coordinates in the launch file before using it on another installation.
+
+Run a recorded live preview in another shell with the same ROS environment.
 
 ```sh
 /usr/bin/python2 standalone/run_navigation.py --decisions --seconds 48 --timeline /tmp/jev-navigation.jsonl

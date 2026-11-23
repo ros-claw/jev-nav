@@ -48,6 +48,7 @@ class RosNavigationInput(object):
         self.last_grid_times = None
         self.latest_color = None
         self.grid_updates = collections.Counter()
+        self.decision_errors = collections.Counter()
         self.subscriptions = [rospy.Subscriber(grid_topic, FreshGrid, self._grid, queue_size=1)]
         if decisions:
             self.subscriptions.append(rospy.Subscriber('/camera/color/image_raw', Image, self._color,
@@ -154,6 +155,8 @@ class RosNavigationInput(object):
                                       evidence, cancelled, _monotonic, diagnostics=True)
         if result and result.get('ok') is True and result.get('captured_at') == stamp:
             return result.get('choice')
+        error = result.get('error_class') if result else None
+        self.decision_errors[error or 'DecisionsUnavailable'] += 1
         return None
 
 
@@ -248,6 +251,8 @@ def main(argv=None):
     counts = collections.Counter()
     ready_ticks = 0
     first_pose = last_pose = None
+    unavailable_guards = ()
+    authority_diagnostics = {}
     travelled = 0.
     reason = 'session_ended'
     started = ended = _monotonic()
@@ -270,7 +275,7 @@ def main(argv=None):
 
         choose = source.choose if args.decisions else lambda request, cancelled: None
         if args.drive_forward:
-            from live_monitors import ProcSerialBackend, SerialOwnershipMonitor
+            from live_monitors import ProcFdSerialBackend, SerialOwnershipMonitor
             from live_trial_adapter import RelayProcessTransport
             from supervised_trial import ObservationRecorder, RealClock, make_ros_monitor
 
@@ -284,7 +289,7 @@ def main(argv=None):
             clock = RealClock()
             ros_guard = make_ros_monitor(clock, args.driver_pid, os.environ.get('ROS_MASTER_URI',
                                                                                  'http://localhost:11311'))
-            serial_backend = ProcSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1', fuser_timeout=.4)
+            serial_backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
             serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                                   args.driver_sha256, max_age=.6, acquire_timeout=1.2,
                                                   ros_monitor=ros_guard)
@@ -313,6 +318,8 @@ def main(argv=None):
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
                       'final_action': command.action, 'clock_domain': 'monotonic'}
+            if command.action != 'stop':
+                fields['decision_id'] = runtime.navigation.goal.sequence
             if view is not None:
                 ready_ticks += int(ready(view, now))
                 fields.update(scan_at=view.scan_at, depth_at=view.depth_at, odom_at=view.odom_at,
@@ -321,6 +328,14 @@ def main(argv=None):
                 first_pose = view.pose if first_pose is None else first_pose
                 last_pose = view.pose
             timeline.record('control', now, fields)
+            if actuator is not None and actuator.unavailable_guards != unavailable_guards:
+                unavailable_guards = actuator.unavailable_guards
+                for stage, guard in (('ros_authority', ros_guard), ('serial_authority', serial_guard)):
+                    if stage in unavailable_guards:
+                        report = guard.diagnostic()
+                        reason_code = report['reason'] if report['reason'] != 'ok' else 'command_deadline_unavailable'
+                        timeline.record('run', now, {'stage': stage, 'reason': reason_code,
+                                                     'status': 'latched' if report['fault_latched'] else 'sampled'})
             if request is not None:
                 timeline.record('decision', now, {'decision_id': request.sequence, 'stage': 'requested',
                                                   'candidate_id': '.'.join(request.choices)})
@@ -350,6 +365,7 @@ def main(argv=None):
             timeline.record('stop', ended, {'reason': reason})
         try:
             if actuator is not None:
+                authority_diagnostics.update(ros=ros_guard.diagnostic(), serial=serial_guard.diagnostic())
                 actuator.close()
         finally:
             try:
@@ -362,12 +378,14 @@ def main(argv=None):
               'preview_topic': None if args.drive_forward else preview, 'control': counts, 'reason': reason,
               'ready_ticks': ready_ticks, 'model_joined': model_joined, 'timeline_complete': timeline_closed,
               'grid_updates': source.grid_updates if source is not None else {},
+              'decision_errors': source.decision_errors if source is not None else {},
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}
     if actuator is not None:
         trajectory = recorder.trial_trajectory(actuator.caller, started, _monotonic())
         result.update(relay_caller=actuator.caller, relay_fault=actuator.stop_line,
                       relay_exited=actuator.transport.exited, path_m=travelled,
+                      authority_diagnostics=authority_diagnostics,
                       observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
     print(json.dumps(result, allow_nan=False))
     complete = ready_ticks and timeline_closed and model_joined
