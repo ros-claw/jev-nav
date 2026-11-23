@@ -469,6 +469,12 @@ class RelayProcessTransport(object):
     def start_arc_navigation(self):
         self._start(["--arc-navigation"])
 
+    def start_reverse_navigation(self):
+        self._start(["--reverse-navigation", "--max-motion-sec", "30"])
+
+    def start_room_navigation(self):
+        self._start(["--arc-navigation", "--room-pivot"])
+
     def _start(self, flags):
         if self.process is not None:
             raise ValueError("invalid relay startup")

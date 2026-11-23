@@ -97,11 +97,17 @@ class _JSONFloat(float):
             raise ValueError('invalid JSON number')
 
 
-def safe_velocity(linear, angular, forward_navigation=False, arc_navigation=False):
+def safe_velocity(linear, angular, forward_navigation=False, arc_navigation=False, reverse_navigation=False,
+                  room_pivot=False):
     if not _number(linear) or not _number(angular):
         return False
     exact_linear = linear.exact if isinstance(linear, _JSONFloat) else linear
     exact_angular = angular.exact if isinstance(angular, _JSONFloat) else angular
+    if reverse_navigation:
+        lower = Decimal('-.018') if isinstance(exact_linear, Decimal) else -.018
+        angular_limit = Decimal('.02') if isinstance(exact_angular, Decimal) else .02
+        return (lower <= exact_linear <= 0 and -angular_limit <= exact_angular <= angular_limit
+                and (exact_linear < 0 or exact_angular == 0))
     if forward_navigation or arc_navigation:
         upper = _MAX_NAV_LINEAR_DECIMAL if isinstance(linear, _JSONFloat) else MAX_NAV_LINEAR
     else:
@@ -111,6 +117,9 @@ def safe_velocity(linear, angular, forward_navigation=False, arc_navigation=Fals
     if not arc_navigation:
         return exact_angular == 0
     if exact_linear == 0:
+        if room_pivot:
+            limit = Decimal('.05') if isinstance(exact_angular, Decimal) else .05
+            return -limit <= exact_angular <= limit
         return exact_angular == 0
     if isinstance(exact_linear, Decimal) or isinstance(exact_angular, Decimal):
         with localcontext() as context:
@@ -130,13 +139,16 @@ def _number(value):
 
 class RelayGate(object):
     def __init__(self, started_at, max_motion_sec=None, require_intent_deadline=False,
-                 forward_navigation=False, arc_navigation=False):
-        continuous_navigation = forward_navigation or arc_navigation
+                 forward_navigation=False, arc_navigation=False, reverse_navigation=False, room_pivot=False):
+        navigation_modes = (forward_navigation, arc_navigation, reverse_navigation)
+        continuous_navigation = any(navigation_modes)
         if (not _number(started_at) or (max_motion_sec is not None
                 and (not _number(max_motion_sec) or not 0 < max_motion_sec <= 30))
-                or type(require_intent_deadline) is not bool or type(forward_navigation) is not bool
-                or type(arc_navigation) is not bool or forward_navigation and arc_navigation
-                or continuous_navigation and (max_motion_sec is not None or require_intent_deadline)):
+                or type(require_intent_deadline) is not bool or any(type(mode) is not bool for mode in navigation_modes)
+                or sum(navigation_modes) > 1 or continuous_navigation and require_intent_deadline
+                or (forward_navigation or arc_navigation) and max_motion_sec is not None
+                or reverse_navigation and max_motion_sec is None or type(room_pivot) is not bool
+                or room_pivot and not arc_navigation):
             raise ValueError('invalid start time')
         self.last_at = float(started_at)
         self.last_stamp = None
@@ -151,6 +163,8 @@ class RelayGate(object):
         self.require_intent_deadline = require_intent_deadline
         self.continuous_navigation = continuous_navigation
         self.arc_navigation = arc_navigation
+        self.reverse_navigation = reverse_navigation
+        self.room_pivot = room_pivot
         self.intent_deadline = None
 
     def stop(self, reason):
@@ -183,7 +197,7 @@ class RelayGate(object):
                      0 <= now - frame['stamp'] < HEARTBEAT_SEC and
                      (self.last_stamp is None or frame['stamp'] > self.last_stamp) and
                      safe_velocity(frame['linear'], frame['angular'], self.continuous_navigation,
-                                   self.arc_navigation))
+                                   self.arc_navigation, self.reverse_navigation, self.room_pivot))
         if valid and self.require_intent_deadline:
             expiry = frame['expires_at']
             valid = (_number(expiry) and frame['stamp'] < expiry <= frame['stamp'] + HEARTBEAT_SEC
@@ -549,11 +563,13 @@ def _emit(fd, line):
         return False
 
 
-def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=False, arc_navigation=False):
+def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=False, arc_navigation=False,
+         reverse_navigation=False, room_pivot=False):
     """Run one session, using inherited pipe stdin and status messages on stdout."""
     global _stopping
     _stopping = False
-    RelayGate(0., max_motion_sec, require_intent_deadline, forward_navigation, arc_navigation)
+    RelayGate(0., max_motion_sec, require_intent_deadline, forward_navigation, arc_navigation, reverse_navigation,
+              room_pivot)
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
     input_fd, output_fd = sys.stdin.fileno(), sys.stdout.fileno()
@@ -625,11 +641,16 @@ def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=
             if not fault and ready and not ready_sent:
                 gate = RelayGate(now, max_motion_sec=max_motion_sec,
                                  require_intent_deadline=require_intent_deadline,
-                                 forward_navigation=forward_navigation, arc_navigation=arc_navigation)
+                                 forward_navigation=forward_navigation, arc_navigation=arc_navigation,
+                                 reverse_navigation=reverse_navigation, room_pivot=room_pivot)
                 shared.arm(now)
                 ready_line = ('READY' if max_motion_sec is None else
                               'READY motion_limit_sec=%.6f' % max_motion_sec)
-                if arc_navigation:
+                if reverse_navigation:
+                    ready_line = 'READY reverse_navigation'
+                elif room_pivot:
+                    ready_line = 'READY room_navigation'
+                elif arc_navigation:
                     ready_line = 'READY arc_navigation'
                 elif forward_navigation:
                     ready_line = 'READY forward_navigation'
@@ -665,9 +686,16 @@ if __name__ == '__main__':
     navigation = parser.add_mutually_exclusive_group()
     navigation.add_argument('--forward-navigation', action='store_true')
     navigation.add_argument('--arc-navigation', action='store_true')
+    navigation.add_argument('--reverse-navigation', action='store_true')
+    parser.add_argument('--room-pivot', action='store_true')
     arguments = parser.parse_args()
     if (arguments.forward_navigation or arguments.arc_navigation) and (
             arguments.require_intent_deadline or arguments.max_motion_sec is not None):
         parser.error('continuous navigation and trial deadline flags are mutually exclusive')
+    if arguments.reverse_navigation and (arguments.require_intent_deadline or arguments.max_motion_sec is None):
+        parser.error('trail retrace requires a maximum motion duration')
+    if arguments.room_pivot and not arguments.arc_navigation:
+        parser.error('room pivots require arc navigation')
     sys.exit(main(arguments.max_motion_sec, arguments.require_intent_deadline,
-                  arguments.forward_navigation, arguments.arc_navigation))
+                  arguments.forward_navigation, arguments.arc_navigation, arguments.reverse_navigation,
+                  arguments.room_pivot))

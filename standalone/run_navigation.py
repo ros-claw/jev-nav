@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 
-from navigation import Grid, LENGTH, Navigation, Pose, View, ready
+from navigation import PIVOTS, Grid, LENGTH, ROOM_LENGTH, Navigation, Pose, View, ready
 from navigation_actuator import ActuationError, NavigationActuator, NavigationHeartbeat
 from navigation_runtime import NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
@@ -148,7 +148,7 @@ class RosNavigationInput(object):
             return None
         jpeg = CvJpegEncoder(observation.bridge, transform=brighten_low_light)(image)
         evidence = {'image_b64': base64.b64encode(jpeg).decode('ascii'), 'captured_at': stamp,
-                    'laser': {'locally_checked_segment_length_m': LENGTH,
+                    'laser': {'locally_checked_segment_length_m': ROOM_LENGTH if self.static_room else LENGTH,
                               'planning_successor': request.predecessor is not None},
                     'base': state, 'navigation_choices': list(request.choices),
                     'operator_clear_front': self.operator_clear_front}
@@ -258,7 +258,7 @@ def summarize_room_loop(trajectory, arc_traces):
     if len(samples) < 2:
         return report
     first = samples[0]
-    direction = 1. if first_arc['action'] == 'left' else -1.
+    direction = 1. if first_arc['action'].endswith('left') else -1.
     heading = 0.
     for previous, current in zip(samples, samples[1:]):
         change = current[4] - previous[4]
@@ -350,7 +350,7 @@ def main(argv=None):
                                                   args.driver_sha256, max_age=.6, acquire_timeout=1.2,
                                                   ros_monitor=ros_guard)
             actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock,
-                                          arc_navigation=args.drive_arcs)
+                                          arc_navigation=args.drive_arcs, room_pivot=args.static_room)
             recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)
             actuator.open()
             if room is not None:
@@ -364,7 +364,7 @@ def main(argv=None):
         if heartbeat is not None:
             publish_command = publish_room
         navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps,
-                                successor_lead=.15 if room is not None else None)
+                                successor_lead=.075 if room is not None else None, static_room=args.static_room)
         runtime = NavigationRuntime(choose, publish_command, navigation,
                                     static_room=args.static_room)
         started = slot = last_process_check = last_block_report = _monotonic()
@@ -402,7 +402,7 @@ def main(argv=None):
                               x=view.pose.x, y=view.pose.y, yaw=view.pose.yaw, epoch=view.epoch)
                 first_pose = view.pose if first_pose is None else first_pose
                 last_pose = view.pose
-                if command.action in ('left', 'right'):
+                if command.action in ('left', 'right') or command.action in PIVOTS:
                     trace = arc_traces.setdefault(fields['decision_id'], {
                         'action': command.action, 'started_at': now, 'start_yaw_rad': view.pose.yaw})
                     trace.update(last_at=now, last_yaw_rad=view.pose.yaw)

@@ -3,7 +3,7 @@ from __future__ import division
 
 import threading
 
-from navigation import Command, LENGTH, MAX_RESPONSE_AGE, Navigation, ready, sweep_clear
+from navigation import PIVOTS, Command, MAX_RESPONSE_AGE, Navigation, ready, sweep_block, sweep_clear
 
 
 ROOM_DIRECTIONS = {'circulate_left': 'left', 'circulate_right': 'right'}
@@ -50,7 +50,7 @@ class NavigationRuntime(object):
             if not waiting_for_sensors:
                 self._result = self._job = None
                 direction = ROOM_DIRECTIONS.get(choice) if self.static_room else None
-                action = self._room_action(request, direction) if direction else choice
+                action = self._room_action(request, direction, view) if direction else choice
                 accepted = self.navigation.accept(request, action, view, now)
                 if self.static_room:
                     self.room_plan = (request.sequence, direction) if accepted and direction else None
@@ -60,8 +60,8 @@ class NavigationRuntime(object):
 
         command = self.navigation.step(view, now)
         survey = (self.room_plan is not None and command.reason == 'path_unknown'
-                  and self.navigation.goal.action in ('left', 'right')
-                  and sweep_clear(view.grid, view.pose, LENGTH, 0.))
+                  and (self.navigation.goal.action in ('left', 'right') or self.navigation.goal.action in PIVOTS)
+                  and sweep_clear(view.grid, view.pose, self.navigation.length, 0.))
         if survey:
             self.navigation.stop('path_unknown')
             self._last_grid = None
@@ -76,9 +76,15 @@ class NavigationRuntime(object):
                 and now >= self._next_request and view.grid_at != self._last_grid):
             self._last_grid = view.grid_at
             offered = self.navigation.request(view, now)
+            if self.room_plan is not None and not survey:
+                source, direction = self.room_plan
+                pivot = self.navigation.prepare_pivot(view, now, direction, offered)
+                if pivot is not None:
+                    self.room_continuation = (self.navigation.sequence, pivot, source)
+                    offered = None
             if offered is not None and self.room_plan is not None:
                 source, direction = self.room_plan
-                action = 'forward' if survey else self._room_action(offered, direction)
+                action = 'forward' if survey else self._room_action(offered, direction, view)
                 if action and self.navigation.accept(offered, action, view, now):
                     self.room_continuation = (offered.sequence, action, source)
                     offered = None
@@ -89,11 +95,19 @@ class NavigationRuntime(object):
                 self._wake.set()
         return command, offered, decision
 
-    def _room_action(self, request, direction):
-        if direction in request.choices:
-            return direction
+    def _room_action(self, request, direction, view):
         blocked = self.navigation.candidate_blocks.get(direction)
         away = 'right' if direction == 'left' else 'left'
+        if direction in request.choices:
+            # Look farther for already observed obstacles. Both executable
+            # choices still require a strict, shorter swept-area check.
+            if (view is not None and away in request.choices
+                    and sweep_block(view.grid, request.anchor, .60, self.navigation.curvature[direction],
+                                    occupied_only=True)
+                    and not sweep_block(view.grid, request.anchor, .60, self.navigation.curvature[away],
+                                        occupied_only=True)):
+                return away
+            return direction
         if blocked and blocked[0] == 'occupied' and away in request.choices:
             return away
         return 'forward' if 'forward' in request.choices else None

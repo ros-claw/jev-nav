@@ -13,8 +13,11 @@ Command = namedtuple('Command', 'linear angular action reason')
 Segment = namedtuple('Segment', 'sequence action origin')
 
 LENGTH = .24
+ROOM_LENGTH = .12
 FORWARD_SUCCESSOR_LEAD = .15
 CURVATURE = {'forward': 0., 'left': .8, 'right': -.8}
+ROOM_CURVATURE = {'forward': 0., 'left': 1.35, 'right': -1.35}
+PIVOTS = {'pivot_left': .70, 'pivot_right': -.70}
 SPEED = .02
 MAX_RESPONSE_AGE = 8.
 HALF_LENGTH, HALF_WIDTH = .16, .11
@@ -93,7 +96,7 @@ def _hull(points):
     return half(ordered) + half(reversed(ordered))
 
 
-def _polygon_block(grid, polygon, known_body):
+def _polygon_block(grid, polygon, known_body, occupied_only=False):
     x_min, x_max = min(p[0] for p in polygon), max(p[0] for p in polygon)
     y_min, y_max = min(p[1] for p in polygon), max(p[1] for p in polygon)
 
@@ -104,7 +107,7 @@ def _polygon_block(grid, polygon, known_body):
         for column in range(to_index(x_min, grid.x), to_index(x_max, grid.x) + 1):
             within = 0 <= row < grid.height and 0 <= column < grid.width
             cell = grid.cells[row * grid.width + column] if within else -1
-            if cell == 0:
+            if cell == 0 or occupied_only and cell == -1:
                 continue
             overlaps, new_space = _overlap(polygon, known_body, grid, column, row)
             if overlaps and (cell != -1 or new_space):
@@ -113,12 +116,12 @@ def _polygon_block(grid, polygon, known_body):
     return None
 
 
-def sweep_block(grid, pose, distance, curvature, known_body=None):
+def sweep_block(grid, pose, distance, curvature, known_body=None, occupied_only=False):
     """Keep unknown outside the already occupied body out of a swept corridor."""
     if known_body is None:
         known_body = pose
     if abs(curvature) < 1e-8:
-        return _polygon_block(grid, _corners(pose, HALF_LENGTH + distance), known_body)
+        return _polygon_block(grid, _corners(pose, HALF_LENGTH + distance), known_body, occupied_only)
     steps = max(1, int(math.ceil(distance / .025)))
     stride = distance / steps
     cx = pose.x - math.sin(pose.yaw) / curvature
@@ -131,7 +134,7 @@ def sweep_block(grid, pose, distance, curvature, known_body=None):
         # Each corner's arc is enclosed by its endpoints and the intersection
         # of their tangents. The convex hull encloses the body between poses.
         outer = [(cx + (x - cx) * scale, cy + (y - cy) * scale) for x, y in middle]
-        blocked = _polygon_block(grid, _hull(start + end + outer), known_body)
+        blocked = _polygon_block(grid, _hull(start + end + outer), known_body, occupied_only)
         if blocked is not None:
             return blocked
         start = end
@@ -140,6 +143,23 @@ def sweep_block(grid, pose, distance, curvature, known_body=None):
 
 def sweep_clear(grid, pose, distance, curvature, known_body=None):
     return sweep_block(grid, pose, distance, curvature, known_body) is None
+
+
+def rotation_block(grid, pose, angle, known_body=None):
+    body = pose if known_body is None else known_body
+    steps = max(1, int(math.ceil(abs(angle) / .05)))
+    stride = angle / steps
+    scale = 1. / math.cos(stride / 2.)
+    start = _corners(pose, HALF_LENGTH)
+    for index in range(steps):
+        middle = _corners(pose._replace(yaw=pose.yaw + (index + .5) * stride), HALF_LENGTH)
+        end = _corners(pose._replace(yaw=pose.yaw + (index + 1) * stride), HALF_LENGTH)
+        outer = [(pose.x + (x - pose.x) * scale, pose.y + (y - pose.y) * scale) for x, y in middle]
+        blocked = _polygon_block(grid, _hull(start + end + outer), body)
+        if blocked is not None:
+            return blocked
+        start = end
+    return None
 
 
 def observation_deadline(view, now):
@@ -156,21 +176,23 @@ def ready(view, now):
     return observation_deadline(view, now) is not None
 
 
-def _remaining(goal, pose):
+def _remaining(goal, pose, length, curvature):
     local = _relative(goal.origin, pose)
-    curvature = CURVATURE[goal.action]
     distance = (math.atan2(curvature * local.x, 1. - curvature * local.y) / curvature
                 if curvature else local.x)
-    return LENGTH - distance
+    return length - distance
 
 
 class Navigation(object):
     """Single-writer task state. Feed immutable observations and finished choices."""
 
-    def __init__(self, forward_only=False, speed=SPEED, successor_lead=None):
+    def __init__(self, forward_only=False, speed=SPEED, successor_lead=None, static_room=False):
         if not 0. < speed <= SPEED:
             raise ValueError('invalid navigation speed')
         self.forward_only, self.max_speed = forward_only, speed
+        self.static_room = static_room
+        self.length = ROOM_LENGTH if static_room else LENGTH
+        self.curvature = ROOM_CURVATURE if static_room else CURVATURE
         self.successor_lead = successor_lead or (FORWARD_SUCCESSOR_LEAD if forward_only else .09)
         self.goal = self.successor = self.pending = None
         self.sequence = 0
@@ -197,7 +219,9 @@ class Navigation(object):
         if self.fault or self.paused or self.successor is not None or not ready(view, now):
             return None
         if self.goal is not None:
-            remaining = _remaining(self.goal, view.pose)
+            if self.goal.action in PIVOTS:
+                return None
+            remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
             if remaining > self.successor_lead:
                 return None
             if self.forward_only:
@@ -205,14 +229,14 @@ class Navigation(object):
                 # The predecessor's original heading may differ slightly.
                 anchor = arc_pose(view.pose, max(0., remaining), 0.)
             else:
-                anchor = arc_pose(self.goal.origin, LENGTH, CURVATURE[self.goal.action])
+                anchor = arc_pose(self.goal.origin, self.length, self.curvature[self.goal.action])
             predecessor = self.goal.sequence
         else:
             anchor, predecessor = view.pose, None
         choices = []
         actions = ('forward',) if self.forward_only else ('forward', 'left', 'right')
         for action in actions:
-            block = sweep_block(view.grid, anchor, LENGTH, CURVATURE[action], view.pose)
+            block = sweep_block(view.grid, anchor, self.length, self.curvature[action], view.pose)
             if block is None:
                 choices.append(action)
             else:
@@ -222,6 +246,34 @@ class Navigation(object):
         self.sequence += 1
         self.pending = Request(self.sequence, now, view.epoch, anchor, tuple(choices) + ('stop',), predecessor)
         return self.pending
+
+    def prepare_pivot(self, view, now, direction, request=None):
+        if (not self.static_room or self.fault or self.paused or self.successor is not None
+                or not ready(view, now) or self.goal is not None and request is None
+                or request is not None and request is not self.pending):
+            return None
+        anchor = view.pose if request is None else request.anchor
+        if not sweep_block(view.grid, anchor, .42, 0., occupied_only=True):
+            return None
+        away = 'right' if direction == 'left' else 'left'
+        for option in (direction, away):
+            action = 'pivot_' + option
+            angle = PIVOTS[action]
+            turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
+            if (rotation_block(view.grid, anchor, angle, view.pose) is not None
+                    or not sweep_clear(view.grid, turned, self.length, 0., view.pose)
+                    or sweep_block(view.grid, turned, .31, 0., occupied_only=True)):
+                continue
+            if request is None:
+                self.sequence += 1
+            self.pending = None
+            pivot = Segment(self.sequence, action, anchor)
+            if self.goal is None:
+                self.goal = pivot
+            else:
+                self.successor = pivot
+            return action
+        return None
 
     def accept(self, request, choice, view, now):
         if (request is None or request is not self.pending or self.fault
@@ -240,7 +292,7 @@ class Navigation(object):
         if (math.hypot(view.pose.x - request.anchor.x, view.pose.y - request.anchor.y) > anchor_limit
                 or abs(_wrap(view.pose.yaw - request.anchor.yaw)) > .20):
             return False
-        if not sweep_clear(view.grid, request.anchor, LENGTH, CURVATURE[choice], view.pose):
+        if not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
             return False
         segment = Segment(request.sequence, choice, request.anchor)
         if active_predecessor:
@@ -265,10 +317,12 @@ class Navigation(object):
         if self.goal is None:
             self.paused = False
             return Command(0., 0., 'stop', 'waiting_for_goal')
+        if self.goal.action in PIVOTS:
+            return self._pivot(view)
 
-        remaining = _remaining(self.goal, view.pose)
+        remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
         if remaining <= STOP_DISTANCE:
-            end = arc_pose(self.goal.origin, LENGTH, CURVATURE[self.goal.action])
+            end = arc_pose(self.goal.origin, self.length, self.curvature[self.goal.action])
             if math.hypot(end.x - view.pose.x, end.y - view.pose.y) > .03:
                 return self.stop('path_tracking_lost')
             self.completed = self.goal.sequence
@@ -276,15 +330,17 @@ class Navigation(object):
             if self.goal is None:
                 self.speed = 0.
                 return Command(0., 0., 'stop', 'goal_reached')
-            remaining = _remaining(self.goal, view.pose)
+            if self.goal.action in PIVOTS:
+                return self._pivot(view)
+            remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
 
-        curvature = CURVATURE[self.goal.action]
-        on_path = arc_pose(self.goal.origin, max(0., LENGTH - remaining), curvature)
+        curvature = self.curvature[self.goal.action]
+        on_path = arc_pose(self.goal.origin, max(0., self.length - remaining), curvature)
         error = _relative(on_path, view.pose)
         lateral_limit, yaw_limit = (.02, .05) if self.forward_only else (.04, .22)
         if abs(error.y) > lateral_limit or abs(error.yaw) > yaw_limit:
             return self.stop('path_tracking_lost')
-        target = arc_pose(self.goal.origin, LENGTH - max(0., remaining - .08), curvature)
+        target = arc_pose(self.goal.origin, self.length - max(0., remaining - .08), curvature)
         lookahead = _relative(view.pose, target)
         if lookahead.x <= 0:
             return self.stop('path_tracking_lost')
@@ -305,3 +361,22 @@ class Navigation(object):
         speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))
         self.speed = min(speed, self.speed + .04 * min(.05, elapsed))
         return Command(self.speed, self.speed * steer, self.goal.action, 'tracking')
+
+    def _pivot(self, view):
+        relative = _relative(self.goal.origin, view.pose)
+        if math.hypot(relative.x, relative.y) > .025:
+            return self.stop('path_tracking_lost')
+        angle = PIVOTS[self.goal.action]
+        sign = 1. if angle > 0. else -1.
+        remaining = (angle - relative.yaw) * sign
+        if remaining <= .012:
+            self.completed, self.goal = self.goal.sequence, None
+            self.speed = 0.
+            return Command(0., 0., 'stop', 'goal_reached')
+        self.blocked_cell = rotation_block(view.grid, view.pose, sign * min(.13, remaining + .025))
+        if self.blocked_cell is not None:
+            if self.blocked_cell[0] == 'occupied':
+                return self.stop('path_occupied')
+            return self._pause('path_unknown')
+        self.paused = False
+        return Command(0., sign * min(.05, remaining * 1.5), self.goal.action, 'tracking')

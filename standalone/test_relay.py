@@ -21,6 +21,16 @@ except ImportError:  # Python 3.12 removed imp; ROS Melodic still uses Python 2.
 
 
 class GateTests(unittest.TestCase):
+    def test_retrace_relay_allows_only_bounded_reverse_with_a_motion_limit(self):
+        gate = relay.RelayGate(10., max_motion_sec=.3, reverse_navigation=True)
+        for sequence, at in enumerate((10., 10.1, 10.2)):
+            self.assertTrue(gate.accept(dict(sequence=sequence, stamp=at, linear=-.018, angular=.01), at))
+        self.assertEqual(gate.command(10.31), (0., 0.))
+        self.assertEqual(gate.reason, 'motion_deadline')
+        for linear, angular in ((.01, 0.), (-.019, 0.), (-.01, .021), (0., .01)):
+            gate = relay.RelayGate(10., max_motion_sec=.3, reverse_navigation=True)
+            self.assertFalse(gate.accept(dict(sequence=0, stamp=10., linear=linear, angular=angular), 10.))
+
     def test_arc_navigation_accepts_both_directions_and_stops_on_disconnect(self):
         gate = relay.RelayGate(10., arc_navigation=True)
         for index, velocities in enumerate(((.014, .0112), (0., 0.), (.014, -.0112))):
@@ -30,6 +40,13 @@ class GateTests(unittest.TestCase):
             self.assertEqual(gate.command(now), velocities)
         self.assertEqual(gate.command(10.31), (0., 0.))
         self.assertEqual(gate.reason, 'heartbeat')
+
+    def test_room_pivot_is_bounded_and_kept_out_of_the_standard_arc_profile(self):
+        frame = dict(sequence=0, stamp=10., linear=0., angular=.05)
+        self.assertFalse(relay.RelayGate(10., arc_navigation=True).accept(frame, 10.))
+        self.assertTrue(relay.RelayGate(10., arc_navigation=True, room_pivot=True).accept(frame, 10.))
+        self.assertFalse(relay.RelayGate(10., arc_navigation=True, room_pivot=True).accept(
+            dict(frame, angular=.051), 10.))
 
     def test_arc_navigation_rejects_pivot_reverse_and_excess_curvature(self):
         for linear, angular in (('0', '0.01'), ('0', '1e-10000000'), ('-0.014', '0'), ('0.02', '0.043'),

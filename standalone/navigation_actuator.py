@@ -64,7 +64,8 @@ class NavigationHeartbeat(object):
 
 
 class NavigationActuator(object):
-    def __init__(self, transport, ros_guard, serial_guard, clock, arc_navigation=False):
+    def __init__(self, transport, ros_guard, serial_guard, clock, arc_navigation=False,
+                 reverse_navigation=False, room_pivot=False):
         self.transport = transport
         self.ros_guard, self.serial_guard, self.clock = ros_guard, serial_guard, clock
         self.sequence = 0
@@ -73,11 +74,19 @@ class NavigationActuator(object):
         self.stop_line = None
         self.unavailable_guards = ()
         self.arc_navigation = arc_navigation
+        self.reverse_navigation = reverse_navigation
+        self.room_pivot = room_pivot
 
     def open(self):
         if not self.ros_guard.acquire() or not self.serial_guard.acquire():
             raise ActuationError('command_authority_unavailable')
-        if self.arc_navigation:
+        if self.reverse_navigation:
+            self.transport.start_reverse_navigation()
+            ready_line = b'READY reverse_navigation\n'
+        elif self.room_pivot:
+            self.transport.start_room_navigation()
+            ready_line = b'READY room_navigation\n'
+        elif self.arc_navigation:
             self.transport.start_arc_navigation()
             ready_line = b'READY arc_navigation\n'
         else:
@@ -122,11 +131,14 @@ class NavigationActuator(object):
         if not self.armed:
             raise ActuationError('navigation_relay_not_armed')
         if not safe_velocity(command.linear, command.angular, forward_navigation=True,
-                             arc_navigation=self.arc_navigation):
+                             arc_navigation=self.arc_navigation, reverse_navigation=self.reverse_navigation,
+                             room_pivot=self.room_pivot):
             self._send(0.)
+            if self.reverse_navigation:
+                raise ActuationError('unexpected_retrace_command')
             raise ActuationError('unexpected_arc_command' if self.arc_navigation else 'unexpected_forward_command')
         self.unavailable_guards = ()
-        if command.linear:
+        if command.linear or command.angular:
             self.unavailable_guards = tuple(
                 name for name, guard in (('ros_authority', self.ros_guard), ('serial_authority', self.serial_guard))
                 if guard.cached_command_deadline() is None)

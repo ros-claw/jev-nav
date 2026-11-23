@@ -403,6 +403,36 @@ def test_room_can_use_an_observed_away_turn_before_driving_toward_an_obstacle():
         assert runtime.close()
 
 
+def test_room_turns_around_an_obstacle_beyond_the_next_valid_segment():
+    navigation = Navigation(successor_lead=.15)
+    runtime = NavigationRuntime(lambda request, cancelled: 'circulate_left', lambda command: None,
+                                navigation, static_room=True)
+    try:
+        cells = grid({(.52, .20): 100, (.62, -.35): -1})
+        runtime.cycle(view(1., cells=cells), 1.)
+        timeout = time.time() + 1.
+        while runtime._result is None and time.time() < timeout:
+            time.sleep(.001)
+        command, _, decision = runtime.cycle(view(1.05, cells=cells), 1.05)
+        assert decision == (1, 'circulate_left', True)
+        assert command.action == 'right' and command.angular < 0.
+    finally:
+        assert runtime.close()
+
+
+def test_room_can_prepare_a_checked_pivot_at_a_close_obstacle():
+    navigation = Navigation(static_room=True)
+    seen = view(1., cells=grid({(.47, 0.): 100}))
+    assert navigation.prepare_pivot(seen, 1., 'left') == 'pivot_left'
+    command = navigation.step(seen, 1.05)
+    assert command.linear == 0. and command.angular > 0.
+    stopped = navigation.step(None, 1.10)
+    assert stopped.linear == stopped.angular == 0.
+
+    blind = Navigation(static_room=True)
+    assert blind.prepare_pivot(view(1., cells=grid({(.47, 0.): 100, (-.18, -.06): -1})), 1., 'left') is None
+
+
 def test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choices():
     release = threading.Event()
     choices = iter(('forward', 'left', 'right', 'forward'))

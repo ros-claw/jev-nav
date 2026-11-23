@@ -32,6 +32,10 @@ In this mode Decisions selects a leftward or rightward route. The local controll
 
 The room output thread sends zero when the latest command has passed its sensor acquisition deadline. It keeps the relay heartbeat alive during a delayed geometry update. Losing the entire navigation process still trips the independent relay watchdog. The relay-attributed `/cmd_vel` trace records what the base received.
 
+The room profile checks 12 cm segments and looks farther for occupied cells when selecting a detour. A point turn is available when the straight route encounters an obstacle, the complete rotational sweep is observed, and a checked forward exit is available. The room relay caps rotation to 0.05 rad/s and enforces the same command and driver watchdogs during a point turn.
+
+`run_trail_recovery.py` checks a recorded straight strip when the robot has stopped close to an obstacle. Its default verifies the recorded wheel odometry and reference without connecting to hardware. The supervised execute mode checks the live forward reference and follows the previously driven strip at bounded reverse speed. A separate reverse relay limits speed, heading corrections, and motion duration. This recovery depends on the strip remaining clear in the attended static room.
+
 ## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;
