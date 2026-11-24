@@ -4,7 +4,7 @@ from collections import namedtuple
 import pytest
 
 from navigation import Pose
-from trail_recovery import (TrailFollower, front_obstruction, front_registration, measured_trail,
+from trail_recovery import (RetraceClearance, TrailFollower, front_obstruction, front_registration, measured_trail,
                             recorded_scan_matches, scan_matches, straight_trail)
 
 
@@ -41,6 +41,15 @@ def test_retrace_joins_recordings_at_an_identical_stopped_pose_without_filling_t
     joined[0] = joined[0][:2] + (.002,) + joined[0][3:]
     with pytest.raises(ValueError, match='same stopped pose'):
         measured_trail(current, reference, .20, start_sequence=540, prior=prior)
+
+
+def test_retrace_can_finish_at_the_end_of_a_short_recorded_strip():
+    rows = [(index * .05, index * .001, 0., .02, 0., 0.) for index in range(89)]
+    trace = {'mode': 'supervised_static_room', 'relay_exited': True,
+             'trajectory': {'clock': 'host_monotonic_receipt', 'odom': rows}}
+    points, report = measured_trail(trace, {'x': .088, 'y': 0., 'yaw': 0.}, .087)
+    assert report['measured_trail_m'] == pytest.approx(.087)
+    assert points[-1] == Pose(-.087, 0., 0.)
 
 
 def test_front_registration_rejects_unrelated_or_insufficient_returns():
@@ -84,6 +93,33 @@ def test_retrace_stops_for_live_front_obstacle_or_no_valid_scan():
     obstruction = front_obstruction(sample._replace(ranges=[.055] * 9), -.05)
     assert obstruction['current_footprint'] and obstruction['range_m'] == .055
     assert front_obstruction(sample._replace(ranges=[float('inf')] * 9), .05) == {'valid_returns': 0}
+
+
+def test_retrace_checks_reverse_translation_along_with_the_turn():
+    scan = namedtuple('Scan', 'angle_min angle_increment range_min range_max ranges')
+    # This front-left return stopped the prior trial when the check treated
+    # the reversing vehicle as rotating in place.
+    sample = scan(math.radians(55.122497), .01, .04, 8., [.1185] + [.6] * 8)
+    angular = -.02756939
+    assert front_obstruction(sample, angular)['current_footprint'] is False
+    assert front_obstruction(sample, angular, linear=-.018) is None
+    close = sample._replace(ranges=[.113] + [.6] * 8)
+    assert front_obstruction(close, angular, linear=-.018)['current_footprint'] is True
+
+
+def test_retrace_resumes_only_after_sustained_fresh_clearance():
+    gate = RetraceClearance()
+    assert gate.observe(1., 1., False) == 'clear'
+    assert gate.observe(1.05, 1.04, True) == 'hold'
+    assert gate.observe(1.20, 1.18, False) == 'hold'
+    assert gate.observe(1.41, 1.18, False) == 'hold'
+    assert gate.observe(1.42, None, False) == 'hold'
+    assert gate.observe(1.65, 1.64, False) == 'hold'
+    assert gate.observe(1.84, 1.82, False) == 'hold'
+    assert gate.observe(1.99, 1.98, False) == 'hold'
+    assert gate.observe(2.04, 2.03, False) == 'clear'
+    assert gate.observe(2.10, 2.10, True) == 'hold'
+    assert gate.observe(4.12, 4.11, True) == 'timed_out'
 
 
 def test_recorded_reference_handles_alternating_invalid_laser_bins():

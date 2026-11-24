@@ -3,7 +3,7 @@ from __future__ import division
 
 import math
 
-from navigation import Command, HALF_LENGTH, HALF_WIDTH, Pose, _relative, _wrap
+from navigation import Command, HALF_LENGTH, HALF_WIDTH, Pose, _corners, _hull, _relative, _wrap
 
 TRAIL_MARGIN_M = .04
 MAX_LATERAL_M = .006
@@ -11,6 +11,10 @@ MAX_HEADING_RAD = .025
 LIDAR_X = .105
 RECORDED_ANCHOR_DISTANCE_M = .005
 RECORDED_ANCHOR_HEADING_RAD = .015
+STOPPING_HORIZON_SEC = .30
+FRONT_PADDING_M = .012
+RETRACE_CLEAR_SEC = .35
+RETRACE_BLOCK_SEC = 2.
 
 
 def _recording_rows(trace):
@@ -45,7 +49,7 @@ def recorded_anchor_matches(anchor, pose):
 
 def measured_trail(trace, reference, distance, start_sequence=None, prior=None):
     """Recover pose-relative keyframes from completed physical recordings."""
-    if not .12 <= distance <= .45:
+    if not .04 <= distance <= .45:
         raise ValueError('invalid curved retrace distance')
     rows = _recording_rows(trace)
     if start_sequence is not None:
@@ -85,7 +89,7 @@ def measured_trail(trace, reference, distance, start_sequence=None, prior=None):
         previous = row[0], pose
         delta = _relative(points[-1], pose)
         linear = math.hypot(delta.x, delta.y)
-        if linear < .015 and abs(delta.yaw) < .039:
+        if linear < .015 and abs(delta.yaw) < .039 and length + linear < distance:
             continue
         if linear > .018 or abs(delta.y) > .005 or abs(delta.yaw) > .055:
             raise ValueError('recorded keyframe is not reachable within its corridor')
@@ -136,10 +140,55 @@ class TrailFollower(object):
         return Command(0., 0., 'stop', 'retrace_distance_reached')
 
 
-def front_obstruction(scan, angular):
+class RetraceClearance(object):
+    """Hold zero for a transient obstruction until fresh scans clear the same trail."""
+    def __init__(self):
+        self.blocked_at = self.clear_since = self.last_clear_at = None
+        self.pauses = self.resumes = 0
+
+    def observe(self, now, scan_at, blocked):
+        if blocked and self.blocked_at is None:
+            self.blocked_at = now
+            self.pauses += 1
+        if self.blocked_at is None:
+            return 'clear'
+        if blocked or scan_at is None:
+            self.clear_since = self.last_clear_at = None
+        else:
+            if self.last_clear_at is None or not 0 <= scan_at - self.last_clear_at < .30:
+                self.clear_since = scan_at
+            self.last_clear_at = scan_at
+            if scan_at - self.clear_since >= RETRACE_CLEAR_SEC:
+                self.blocked_at = self.clear_since = self.last_clear_at = None
+                self.resumes += 1
+                return 'clear'
+        return 'timed_out' if now - self.blocked_at >= RETRACE_BLOCK_SEC else 'hold'
+
+
+def _stopping_footprint(linear, angular, half_length, half_width):
+    def corners(x, y, yaw):
+        return _corners(Pose(x, y, yaw), half_length, half_length, half_width)
+
+    initial = corners(0., 0., 0.)
+    angle = angular * STOPPING_HORIZON_SEC
+    if abs(angle) < 1e-8:
+        return _hull(initial + corners(linear * STOPPING_HORIZON_SEC, 0., 0.))
+
+    radius = linear / angular
+    end = corners(radius * math.sin(angle), radius * (1. - math.cos(angle)), angle)
+    middle = corners(radius * math.sin(angle / 2.), radius * (1. - math.cos(angle / 2.)), angle / 2.)
+    # Include the tangent intersection for every corner to enclose the whole sweep.
+    scale = 1. / math.cos(angle / 2.)
+    outer = [(x * scale, radius + (y - radius) * scale) for x, y in middle]
+    return _hull(initial + end + outer)
+
+
+def front_obstruction(scan, angular, linear=0.):
     """Check live front returns against the footprint over the stopping horizon."""
-    yaw = .30 * angular
-    c, s = math.cos(yaw), math.sin(yaw)
+    half_length, half_width = HALF_LENGTH + FRONT_PADDING_M, HALF_WIDTH + FRONT_PADDING_M
+    polygon = _stopping_footprint(linear, angular, half_length, half_width)
+    edges = list(zip(polygon, polygon[1:] + polygon[:1]))
+    front_limit = max(x for x, _ in polygon)
     valid = 0
     for index, value in enumerate(scan.ranges):
         angle = scan.angle_min + index * scan.angle_increment
@@ -147,9 +196,9 @@ def front_obstruction(scan, angular):
             continue
         valid += 1
         x, y = LIDAR_X + value * math.cos(angle), value * math.sin(angle)
-        current = abs(x) <= HALF_LENGTH + .012 and abs(y) <= HALF_WIDTH + .012
-        if (current or abs(c * x + s * y) <= HALF_LENGTH + .012
-                and abs(-s * x + c * y) <= HALF_WIDTH + .012):
+        current = abs(x) <= half_length and abs(y) <= half_width
+        if (x <= front_limit and all((b[0] - a[0]) * (y - a[1]) >= (b[1] - a[1]) * (x - a[0]) - 1e-10
+                                     for a, b in edges)):
             return {'x_m': x, 'y_m': y, 'bearing_deg': math.degrees(angle), 'range_m': value,
                     'current_footprint': current}
     return {'valid_returns': valid} if valid < 6 else None

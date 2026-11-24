@@ -36,6 +36,8 @@ The room profile checks 12 cm segments and looks farther for occupied cells when
 
 The room controller follows through to the next checked segment as it nears a waypoint. While moving, it periodically checks for measured obstacles up to 36 cm along the current route, including the prepared successor. When its immediate sweep is still clear, it can start a checked detour at the measured pose and retain its forward speed. The nearer detour sweep must have live coverage, and the longer sweep must be clear of measured obstacles. The tracker checks the actual steering before publishing. The timeline records these changes as `early_detour` events.
 
+If the current drive arc becomes occupied, the controller can publish a different arc from the measured pose in the same control cycle. This requires fresh coverage of the replacement segment and no measured obstacle in its longer sweep. The controller keeps its forward speed through that change and records `occupied_detour`. It commands zero when these checks cannot establish a replacement.
+
 After an early turning detour, a checked successor can continue the turn for up to 24 cm or 20 seconds while the model's route stays the same. Each successor needs its own swept-body check. The timeline records these successors as `detour_continuation`. If the active route loses observed clearance, the room controller stops immediately. Resuming the same route requires 0.4 seconds of continuously clear geometry across fresh lidar and depth observations. A newly checked alternative can start sooner.
 
 Curvature changes are gradual when the resulting sweep is clear. A point turn can prepare and hand off to its checked forward exit. If path tracking loses the waypoint, the controller stops the current segment and can prepare a new segment at the measured pose using the accepted route. Clock and odometry faults still cancel the route.
@@ -45,6 +47,8 @@ At a stationary corner with an observed obstruction and no checked start, the co
 `run_trail_recovery.py` checks a recorded trail when the robot has stopped close to an obstacle. Its default verifies the recorded wheel odometry and reference without connecting to hardware. With `--recorded-curve` it can check a trail that includes measured turns. The supervised execute mode matches the live forward reference and tracks the recorded path with wheel odometry. The reverse relay enforces separate limits on speed, turn rate, and motion duration. This recovery depends on the trail remaining clear in the attended static room.
 
 With `--recorded-curve`, `--start-at-seq` selects an odometry sample inside a completed run when recovering from the middle of a track. `--prior-trace` can extend the track through an identical stopped pose from an earlier run on the same driver. The recorder keeps the original timestamps and reports the gap between recordings. The live odometry and current forward scan must match the starting reference before the relay can move.
+
+Recorded recovery accepts measured strips from 4 to 45 cm, including a shorter final span between odometry keyframes. It checks front laser returns against the padded footprint swept by both the commanded translation and rotation over the stopping horizon. A front obstruction commands zero immediately. If fresh scans clear the same trail for 0.35 seconds, the follower can resume from the measured pose. Without renewed clearance within two seconds, recovery ends.
 
 ## Bounded forward trial
 

@@ -498,6 +498,11 @@ def main(argv=None):
                 timeline.record('decision', now, {'stage': 'early_detour', 'reason': 'obstacle_ahead',
                                                    'blocked_action': previous, 'selected_action': command.action,
                                                    'scene_id': runtime.room_plan[0], 'x': x, 'y': y})
+            if runtime.occupied_detour is not None:
+                previous, alternate, (_, x, y) = runtime.occupied_detour
+                timeline.record('decision', now, {'stage': 'occupied_detour', 'reason': 'path_occupied',
+                                                   'blocked_action': previous, 'selected_action': alternate,
+                                                   'scene_id': runtime.room_plan[0], 'x': x, 'y': y})
             if command.reason in ('perception_unavailable', 'clock_or_odometry_reset'):
                 diagnostics = source.observation.diagnostic_status()
                 fault = diagnostics['clock_fault'] or diagnostics['odom_fault'] or runtime.navigation.fault

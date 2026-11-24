@@ -76,11 +76,11 @@ def _overlap(points, base, grid, column, row):
     return bool(points), False
 
 
-def _corners(pose, front):
+def _corners(pose, front, rear=HALF_LENGTH, half_width=HALF_WIDTH):
     c, s = math.cos(pose.yaw), math.sin(pose.yaw)
     return [(pose.x + c * x - s * y, pose.y + s * x + c * y)
-            for x, y in ((-HALF_LENGTH, -HALF_WIDTH), (front, -HALF_WIDTH),
-                         (front, HALF_WIDTH), (-HALF_LENGTH, HALF_WIDTH))]
+            for x, y in ((-rear, -half_width), (front, -half_width),
+                         (front, half_width), (-rear, half_width))]
 
 
 def _hull(points):
@@ -366,18 +366,29 @@ class Navigation(object):
         if block is None:
             return None
         away = 'right' if direction == 'left' else 'left'
-        for action in (direction, away, 'forward'):
+        action = self._checked_detour(view, (direction, away, 'forward'))
+        if action is not None:
+            self._start_detour(view.pose, action)
+            # Reuse the tracker's steering and swept-body gate for the published command.
+            return self._track(view, 0.), block
+        return None
+
+    def _checked_detour(self, view, actions):
+        for action in actions:
             if action == self.goal.action:
                 continue
             candidate = self.curvature[action]
             if (sweep_clear(view.grid, view.pose, self.length, candidate)
                     and not sweep_block(view.grid, view.pose, ROOM_TRACK_LOOKAHEAD, candidate, occupied_only=True)):
-                self.sequence += 1
-                self.goal = Segment(self.sequence, action, view.pose, None)
-                self.successor = self.pending = self.completed = None
-                # Reuse the tracker's steering and swept-body gate for the published command.
-                return self._track(view, 0.), block
+                return action
         return None
+
+    def _start_detour(self, pose, action):
+        self.sequence += 1
+        self.goal = Segment(self.sequence, action, pose, None)
+        self.successor = self.pending = self.completed = None
+        self.paused = self._recovering_unknown = False
+        self._path_clear_since = None
 
     def _pivot_clear(self, view, anchor, action, turn=None):
         angle = PIVOTS[action] if turn is None else turn
@@ -423,7 +434,7 @@ class Navigation(object):
             return False
         return True
 
-    def step(self, view, now):
+    def step(self, view, now, room_direction=None):
         self.blocked_cell = self.blocked_action = None
         elapsed = .05 if self.last_at is None else now - self.last_at
         if elapsed < 0 or (view is not None and self.epoch is not None and view.epoch != self.epoch):
@@ -454,9 +465,9 @@ class Navigation(object):
                 return Command(0., 0., 'stop', 'goal_reached')
             if self.goal.action in PIVOTS:
                 return self._pivot(view, elapsed)
-        return self._track(view, elapsed)
+        return self._track(view, elapsed, room_direction)
 
-    def _track(self, view, elapsed):
+    def _track(self, view, elapsed, room_direction=None):
         curvature = self.curvature[self.goal.action]
         remaining = _remaining(self.goal, view.pose, self.length, curvature)
         on_path = arc_pose(self.goal.origin, max(0., self.length - remaining), curvature)
@@ -493,6 +504,14 @@ class Navigation(object):
         if self.blocked_cell is not None:
             self.blocked_action = self.goal.action
             if self.blocked_cell[0] == 'occupied':
+                if self.static_room and room_direction in ('left', 'right') and self.speed > 0.:
+                    away = 'right' if room_direction == 'left' else 'left'
+                    alternate = self._checked_detour(view, ('forward', room_direction, away))
+                    if alternate is not None:
+                        # Command the same nominal arc that passed the fresh sweep.
+                        self._start_detour(view.pose, alternate)
+                        self.steer = self.curvature[alternate]
+                        return Command(self.speed, self.speed * self.steer, alternate, 'occupied_detour')
                 return self.stop('path_occupied')
             return self._pause('path_unknown')
         if self._path_reacquiring(view):

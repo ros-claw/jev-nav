@@ -588,6 +588,28 @@ def test_room_slew_limiting_never_holds_an_occupied_sweep():
     assert stopped.reason == 'path_occupied' and stopped.linear == stopped.angular == 0.
 
 
+def test_room_can_replace_an_occupied_arc_without_publishing_an_intermediate_stop():
+    navigation = Navigation(static_room=True)
+    select(navigation, 'left', 1., view(1.))
+    navigation.speed, navigation.steer = .02, navigation.curvature['left']
+    sent = []
+    runtime = NavigationRuntime(lambda request, cancelled: None, sent.append, navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    pose = arc_pose(Pose(0., 0., 0.), .015, navigation.curvature['left'])
+    try:
+        command, offered, decision = runtime.cycle(view(1.05, pose, grid({(.23, .12): 100})), 1.05)
+        assert sent == [command]
+        assert command == Command(.02, 0., 'forward', 'occupied_detour')
+        assert navigation.goal.origin == pose and runtime.room_plan == (1, 'left')
+        assert runtime.occupied_detour[:2] == ('left', 'forward')
+        assert offered is decision is None
+
+        stopped, _, _ = runtime.cycle(view(1.10, pose, grid({(.23, 0.): 100})), 1.10)
+        assert stopped == Command(0., 0., 'stop', 'path_occupied')
+    finally:
+        assert runtime.close()
+
+
 def test_room_pivot_hands_off_to_checked_forward_without_a_zero_setpoint():
     nav = Navigation(static_room=True)
     cells = grid({(.47, 0.): 100})

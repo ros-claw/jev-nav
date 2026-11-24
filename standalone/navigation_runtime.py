@@ -40,6 +40,7 @@ class NavigationRuntime(object):
         self._predict_after = 0.
         self._prediction_grid = None
         self.early_detour = None
+        self.occupied_detour = None
         self._detour = None
         self.detour_continuation = False
         self._settling = None
@@ -67,6 +68,7 @@ class NavigationRuntime(object):
         self.room_continuation = None
         self.room_replacement = False
         self.early_detour = None
+        self.occupied_detour = None
         self.detour_continuation = False
         if result is not None:
             request, choice = result
@@ -100,7 +102,13 @@ class NavigationRuntime(object):
                 if (not accepted and not reviewing) or (accepted and choice == 'stop'):
                     self._next_request = now + 1.
 
-        command = self.navigation.step(view, now)
+        direction = self.room_plan[1] if self.room_plan is not None else None
+        command = self.navigation.step(view, now, direction)
+        if command.reason == 'occupied_detour':
+            self.occupied_detour = self.navigation.blocked_action, command.action, self.navigation.blocked_cell
+            self._predict_after = now + ROOM_DETOUR_COOLDOWN
+            self._detour = ((command.action, direction, view.pose, now)
+                            if command.action in ('left', 'right') else None)
         if (self.room_plan is not None and command.linear > 0. and now >= self._predict_after
                 and view.grid_at != self._prediction_grid):
             until = observation_deadline(view, now)

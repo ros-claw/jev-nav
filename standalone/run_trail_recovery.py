@@ -11,9 +11,10 @@ import sys
 import time
 
 from navigation import Command, Pose, _relative
-from trail_recovery import (MAX_LATERAL_M, TrailFollower, continued_offset, front_obstruction, front_registration,
-                            measured_trail, predicted_front, prior_retrace_offset, recorded_anchor_matches,
-                            recorded_scan_matches, recording_driver, scan_matches, straight_trail)
+from trail_recovery import (MAX_LATERAL_M, RetraceClearance, TrailFollower, continued_offset, front_obstruction,
+                            front_registration, measured_trail, predicted_front, prior_retrace_offset,
+                            recorded_anchor_matches, recorded_scan_matches, recording_driver, scan_matches,
+                            straight_trail)
 
 
 def main(argv=None):
@@ -127,6 +128,7 @@ def execute(args, reference, report, origin, follower):
     zero = Command(0., 0., 'stop', 'retrace_wait')
     matches_reference = recorded_scan_matches if follower is not None else scan_matches
     anchor = report['recorded_anchor'] if follower is not None else None
+    clearance = RetraceClearance() if follower is not None else None
 
     def check_anchor(seconds, armed=False):
         until = clock.now() + seconds
@@ -167,6 +169,8 @@ def execute(args, reference, report, origin, follower):
             now = clock.now()
             sample = snapshot(now)
             if sample is None and now - last_ready < .3:
+                if clearance is not None:
+                    clearance.observe(now, None, False)
                 actuator.publish(zero)
                 time.sleep(.04)
                 continue
@@ -181,12 +185,18 @@ def execute(args, reference, report, origin, follower):
                 if not (requested.linear or requested.angular):
                     reason = requested.reason
                     break
-                obstruction = front_obstruction(sample[2], requested.angular)
+                obstruction = front_obstruction(sample[2], requested.angular, linear=requested.linear)
                 if obstruction is not None:
-                    reason = 'retrace_live_obstacle_or_missing_returns'
                     report['front_obstruction'] = dict(obstruction, linear_mps=requested.linear,
                                                        angular_radps=requested.angular)
+                clear_state = clearance.observe(now, sample[2].header.stamp.to_sec(), obstruction is not None)
+                if clear_state == 'timed_out':
+                    reason = 'retrace_live_obstacle_or_missing_returns'
                     break
+                if clear_state == 'hold':
+                    actuator.publish(zero)
+                    time.sleep(.04)
+                    continue
                 command = actuator.publish(requested)
                 if not (command.linear or command.angular):
                     reason = command.reason
@@ -217,6 +227,7 @@ def execute(args, reference, report, origin, follower):
                   observation_diagnostics=observation.diagnostic_status(), last_sample_issue=sample_issue[0])
     if follower is not None:
         report['last_completed_keyframe'] = follower.index
+        report.update(front_pauses=clearance.pauses, front_resumes=clearance.resumes)
     print(json.dumps(report, allow_nan=False))
     return 0 if reason == 'retrace_distance_reached' and actuator.transport.exited else 2
 
