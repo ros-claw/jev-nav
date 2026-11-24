@@ -29,7 +29,7 @@ import time
 
 import forward_trial as checks
 from async_safety_sampler import WAITING_REPLACEMENT
-from relay import _monotonic
+from relay import NAVIGATION_STARTUP_TIMEOUT_SEC, _monotonic
 from split_sensor_validation import PENDING_PROOF
 
 _INITIAL_COVERAGE_PENDING = object()
@@ -493,7 +493,8 @@ class RelayProcessTransport(object):
             fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
     def read_line(self, timeout):
-        if self.process is None or not checks._finite(timeout) or not 0 <= timeout <= 3.5:
+        if (self.process is None or not checks._finite(timeout)
+                or not 0 <= timeout <= NAVIGATION_STARTUP_TIMEOUT_SEC + .5):
             raise ValueError("invalid relay read")
         deadline = self.clock.now() + timeout
         fd = self.process.stdout.fileno()

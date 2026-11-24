@@ -8,6 +8,9 @@ from navigation import HALF_LENGTH, HALF_WIDTH, ready
 
 class RoomPerception(object):
     MAX_AGE_SEC = 30.
+    ISOLATED_OCCUPANCY_AGE_SEC = 1.5
+    OCCUPANCY_CONFIRM_SEC = .30
+    OCCUPANCY_SAMPLE_GAP_SEC = .15
     REAR_LIMIT = HALF_LENGTH + .12
     SIDE_LIMIT = HALF_WIDTH + .12
     LIDAR_X = .105
@@ -66,12 +69,21 @@ class RoomPerception(object):
                 if observe and value >= 0:
                     acquired = view.scan_at if value == 0 else view.grid_at
                     if remembered is None or acquired >= remembered[1]:
-                        remembered = self.cells[key] = (value, acquired)
+                        occupied_since, confirmed = acquired, False
+                        if value > 0 and remembered is not None and remembered[0] > 0:
+                            _, last_seen, previous_since, confirmed = remembered
+                            if acquired - last_seen <= self.OCCUPANCY_SAMPLE_GAP_SEC:
+                                occupied_since = previous_since
+                            confirmed = (confirmed and acquired - last_seen <= self.MAX_AGE_SEC
+                                         or acquired - occupied_since >= self.OCCUPANCY_CONFIRM_SEC)
+                        remembered = self.cells[key] = (value, acquired, occupied_since, confirmed)
                 if remembered is None or value > 0:
                     continue
-                old_value, acquired = remembered
+                old_value, acquired, _, confirmed = remembered
                 age = now - acquired
-                if not 0 <= age <= self.MAX_AGE_SEC:
+                retention = self.ISOLATED_OCCUPANCY_AGE_SEC if old_value > 0 and not confirmed else self.MAX_AGE_SEC
+                # Lost evidence returns to the live grid's state. It never restores older free space.
+                if not 0 <= age <= retention:
                     continue
                 delta_x = (column + .5 - center_x) * resolution
                 x, y = c * delta_x + s * delta_y, -s * delta_x + c * delta_y

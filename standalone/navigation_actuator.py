@@ -5,7 +5,7 @@ import json
 import threading
 
 from navigation import Command, observation_deadline
-from relay import safe_velocity
+from relay import NAVIGATION_STARTUP_TIMEOUT_SEC, safe_velocity
 
 
 class ActuationError(RuntimeError):
@@ -97,7 +97,7 @@ class NavigationActuator(object):
         else:
             self.transport.start_forward_navigation()
             ready_line = b'READY forward_navigation\n'
-        self.stop_line = self.transport.read_line(3.5)
+        self.stop_line = self.transport.read_line(NAVIGATION_STARTUP_TIMEOUT_SEC + .5)
         if self.stop_line != ready_line:
             raise ActuationError('navigation_relay_not_ready')
         self.stop_line = None

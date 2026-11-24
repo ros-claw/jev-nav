@@ -358,6 +358,8 @@ class Publisher(object):
 def init_node(*args, **kwargs):
     if mode == 'hang_init':
         time.sleep(4.0)
+    if mode == 'slow_room_init':
+        time.sleep(1.05)
 rospy.init_node = init_node
 rospy.get_name = lambda: '/relay_test'
 rospy.Publisher = Publisher
@@ -372,7 +374,9 @@ sys.modules.update({'rospy': rospy, 'geometry_msgs': geometry,
                     'geometry_msgs.msg': geometry_msg, 'std_msgs': std,
                     'std_msgs.msg': std_msg})
 sys.exit(relay.main(0.3 if mode == 'absolute_deadline' else None,
-                   forward_navigation=mode == 'forward_navigation', arc_navigation=mode == 'arc_navigation'))
+                   forward_navigation=mode == 'forward_navigation',
+                   arc_navigation=mode in ('arc_navigation', 'slow_room_init'),
+                   room_pivot=mode == 'slow_room_init'))
 """
 
 
@@ -579,6 +583,16 @@ class SubprocessTests(unittest.TestCase):
         self.assertNotIn('READY', self.lines[1])
         self.assertTrue(self.lines[2])
         self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in self.lines[2]))
+
+    def test_slow_navigation_startup_verifies_new_driver_zeros_before_ready(self):
+        self.start('slow_room_init')
+        self.await_line(1, 'READY room_navigation', timeout=3.)
+        self.assertTrue(self.lines[2])
+        self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in self.lines[2]))
+        self.send(1, .014, .01)
+        self.await_line(2, 'CMD 0.0140 0.0100')
+        self.await_line(1, 'FAULT heartbeat')
+        self.assertEqual(self.lines[2][-1], 'CMD 0.0000 0.0000')
 
     def test_no_driver_status_never_becomes_ready(self):
         self.start('no_status')

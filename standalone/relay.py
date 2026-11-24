@@ -360,6 +360,7 @@ class DriverStatus(object):
 
 PERIOD_SEC = 0.05
 STARTUP_TIMEOUT_SEC = 3.0
+NAVIGATION_STARTUP_TIMEOUT_SEC = 8.0
 CONNECTION_STABLE_SEC = 0.2
 WORKER_STALL_SEC = 0.2
 SHUTDOWN_ZEROS_SEC = 0.5
@@ -586,6 +587,8 @@ def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=
     if parent_pid <= 1:
         return 1
     started_at = _monotonic()
+    startup_timeout = (NAVIGATION_STARTUP_TIMEOUT_SEC if forward_navigation or arc_navigation or reverse_navigation
+                       else STARTUP_TIMEOUT_SEC)
     shared = _Shared()
     worker = threading.Thread(target=_ros_worker, args=(shared, parent_pid))
     worker.daemon = True
@@ -634,7 +637,7 @@ def main(max_motion_sec=None, require_intent_deadline=False, forward_navigation=
             if os.getppid() != parent_pid:
                 shared.stop('parent_lost')
             fault, ready, armed, _, _, progress, _ = shared.snapshot()
-            if not ready_sent and not fault and now - started_at >= STARTUP_TIMEOUT_SEC:
+            if not ready_sent and not fault and now - started_at >= startup_timeout:
                 shared.stop('startup_timeout')
             elif ready_sent and not fault:
                 gate.command(now)

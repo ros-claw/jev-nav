@@ -32,6 +32,26 @@ def test_recent_obstacle_and_sensor_loss_veto_historical_clearance():
     assert memory.view(new_epoch, 5.).grid.cells[5] == -1
 
 
+def test_isolated_occupied_cell_expires_to_unknown_instead_of_restoring_older_free_space():
+    memory = RoomPerception()
+    memory.view(observation(1., [0] * 12, x=0.), 1.)
+    occupied = [-1] * 12
+    occupied[5] = 100
+    assert memory.view(observation(2., occupied), 2.).grid.cells[5] == 100
+    assert memory.view(observation(2.3, [-1] * 12), 2.3).grid.cells[5] == 100
+    assert memory.view(observation(3.6, [-1] * 12), 3.6).grid.cells[5] == -1
+
+
+def test_repeatedly_observed_obstacle_is_retained_across_later_occlusion():
+    memory = RoomPerception()
+    occupied = [-1] * 12
+    occupied[5] = 100
+    for at in (2., 2.09, 2.18, 2.27, 2.36):
+        assert memory.view(observation(at, occupied), at).grid.cells[5] == 100
+    assert memory.view(observation(18., [-1] * 12), 18.).grid.cells[5] == 100
+    assert memory.view(observation(34., [-1] * 12), 34.).grid.cells[5] == -1
+
+
 def test_history_stays_aligned_with_rolling_grid_origin():
     memory = RoomPerception()
     values = [-1] * 12
