@@ -9,25 +9,71 @@ TRAIL_MARGIN_M = .04
 MAX_LATERAL_M = .006
 MAX_HEADING_RAD = .025
 LIDAR_X = .105
+RECORDED_ANCHOR_DISTANCE_M = .005
+RECORDED_ANCHOR_HEADING_RAD = .015
 
 
-def measured_trail(trace, reference, distance):
-    """Recover terminal-relative keyframes from a completed physical recording."""
+def _recording_rows(trace):
     trajectory = trace['trajectory']
     if (trace['mode'] != 'supervised_static_room' or trace['relay_exited'] is not True
-            or trajectory['clock'] != 'host_monotonic_receipt' or not .12 <= distance <= .45):
+            or trace.get('relay_fault') is not None or trajectory['clock'] != 'host_monotonic_receipt'):
         raise ValueError('curved retrace needs a completed supervised static-room recording')
     rows = trajectory['odom']
     if not rows:
         raise ValueError('missing recorded odometry')
+    return rows
+
+
+def recording_driver(trace):
+    return trace.get('authority_diagnostics', {}).get('ros', {}).get('driver_pid_expected')
+
+
+def _reverse_rows(current, prior):
+    for row in reversed(current):
+        yield row
+    if prior:
+        yield None  # There was no recorded motion across this stationary join.
+        for row in reversed(prior):
+            yield row
+
+
+def recorded_anchor_matches(anchor, pose):
+    offset = _relative(anchor, pose)
+    return (math.hypot(offset.x, offset.y) <= RECORDED_ANCHOR_DISTANCE_M
+            and abs(offset.yaw) <= RECORDED_ANCHOR_HEADING_RAD)
+
+
+def measured_trail(trace, reference, distance, start_sequence=None, prior=None):
+    """Recover pose-relative keyframes from completed physical recordings."""
+    if not .12 <= distance <= .45:
+        raise ValueError('invalid curved retrace distance')
+    rows = _recording_rows(trace)
+    if start_sequence is not None:
+        matches = [index for index, row in enumerate(rows) if len(row) >= 8 and row[7] == start_sequence]
+        if len(matches) != 1:
+            raise ValueError('recorded start sequence must identify exactly one odometry sample')
+        rows = rows[:matches[0] + 1]
     end = Pose(rows[-1][1], rows[-1][2], rows[-1][4])
-    anchor = _relative(end, Pose(reference['x'], reference['y'], reference['yaw']))
-    if math.hypot(anchor.x, anchor.y) > .005 or abs(anchor.yaw) > .015:
-        raise ValueError('front reference must match the end of the recorded path')
+    if not recorded_anchor_matches(end, Pose(reference['x'], reference['y'], reference['yaw'])):
+        raise ValueError('front reference must match the recorded start pose')
+    report = {'retreat_distance_m': distance, 'recorded_anchor': end}
+    prior_rows = None
+    if prior is not None:
+        prior_rows = _recording_rows(prior)
+        old, new = prior_rows[-1], rows[0]
+        if (recording_driver(trace) is None or recording_driver(trace) != recording_driver(prior)
+                or min(len(old), len(new)) < 8 or old[1:6] != new[1:6]
+                or new[3] != 0. or new[5] != 0. or not old[0] < new[0]
+                or not old[6] < new[6] or not old[7] < new[7]):
+            raise ValueError('recordings must join at the same stopped pose with the same driver')
+        report['recording_join_gap_sec'] = new[0] - old[0]
     points = [Pose(0., 0., 0.)]
     length, turn = 0., 0.
     previous = None
-    for row in reversed(rows):
+    for row in _reverse_rows(rows, prior_rows):
+        if row is None:
+            previous = None
+            continue
         if not all(not math.isnan(value) and not math.isinf(value) for value in row[:6]):
             raise ValueError('invalid recorded odometry')
         pose = _relative(end, Pose(row[1], row[2], row[4]))
@@ -49,8 +95,8 @@ def measured_trail(trace, reference, distance):
             raise ValueError('recorded trail exceeds the recovery rotation budget')
         points.append(pose)
         if length >= distance:
-            return points, {'measured_trail_m': length, 'retreat_distance_m': distance,
-                            'measured_turn_rad': turn, 'keyframes': points}
+            report.update(measured_trail_m=length, measured_turn_rad=turn, keyframes=points)
+            return points, report
     raise ValueError('recorded trail is too short')
 
 
@@ -90,7 +136,7 @@ class TrailFollower(object):
         return Command(0., 0., 'stop', 'retrace_distance_reached')
 
 
-def front_obstacle(scan, angular):
+def front_obstruction(scan, angular):
     """Check live front returns against the footprint over the stopping horizon."""
     yaw = .30 * angular
     c, s = math.cos(yaw), math.sin(yaw)
@@ -101,11 +147,12 @@ def front_obstacle(scan, angular):
             continue
         valid += 1
         x, y = LIDAR_X + value * math.cos(angle), value * math.sin(angle)
-        if (abs(x) <= HALF_LENGTH + .012 and abs(y) <= HALF_WIDTH + .012
-                or abs(c * x + s * y) <= HALF_LENGTH + .012
+        current = abs(x) <= HALF_LENGTH + .012 and abs(y) <= HALF_WIDTH + .012
+        if (current or abs(c * x + s * y) <= HALF_LENGTH + .012
                 and abs(-s * x + c * y) <= HALF_WIDTH + .012):
-            return True
-    return valid < 6
+            return {'x_m': x, 'y_m': y, 'bearing_deg': math.degrees(angle), 'range_m': value,
+                    'current_footprint': current}
+    return {'valid_returns': valid} if valid < 6 else None
 
 
 def straight_trail(trace, reference, distance):

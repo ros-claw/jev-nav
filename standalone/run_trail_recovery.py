@@ -11,9 +11,9 @@ import sys
 import time
 
 from navigation import Command, Pose, _relative
-from trail_recovery import (MAX_LATERAL_M, TrailFollower, continued_offset, front_obstacle, front_registration,
-                            measured_trail, predicted_front, prior_retrace_offset, recorded_scan_matches,
-                            scan_matches, straight_trail)
+from trail_recovery import (MAX_LATERAL_M, TrailFollower, continued_offset, front_obstruction, front_registration,
+                            measured_trail, predicted_front, prior_retrace_offset, recorded_anchor_matches,
+                            recorded_scan_matches, recording_driver, scan_matches, straight_trail)
 
 
 def main(argv=None):
@@ -23,6 +23,8 @@ def main(argv=None):
     parser.add_argument('--distance-m', type=float, default=.32)
     parser.add_argument('--resume', help='recording of a partial retrace on this strip')
     parser.add_argument('--recorded-curve', action='store_true', help='follow recorded turns and reverse segments')
+    parser.add_argument('--start-at-seq', type=int, help='start at this recorded odometry sequence')
+    parser.add_argument('--prior-trace', help='earlier recording joined at an identical stopped pose')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--static-room-clear', action='store_true')
     parser.add_argument('--driver-pid', type=int)
@@ -31,6 +33,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.recorded_curve and args.resume:
         parser.error('partial straight-trail registration is only available for a straight retreat')
+    if not args.recorded_curve and (args.start_at_seq is not None or args.prior_trace):
+        parser.error('a recorded start or an earlier recording requires --recorded-curve')
     if args.execute and (not args.static_room_clear or not args.driver_pid or args.driver_pid <= 1
                          or not args.driver_exe or not os.path.isabs(args.driver_exe)
                          or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
@@ -41,7 +45,14 @@ def main(argv=None):
         reference = json.load(stream)
     follower = None
     if args.recorded_curve:
-        points, report = measured_trail(trace, reference, args.distance_m)
+        prior = None
+        if args.prior_trace:
+            with open(args.prior_trace) as stream:
+                prior = json.load(stream)
+        if (args.execute and (args.start_at_seq is not None or prior is not None)
+                and recording_driver(trace) != args.driver_pid):
+            parser.error('the recorded driver must match the running driver')
+        points, report = measured_trail(trace, reference, args.distance_m, args.start_at_seq, prior)
         follower = TrailFollower(points)
     else:
         report = straight_trail(trace, reference, args.distance_m)
@@ -71,6 +82,7 @@ def execute(args, reference, report, origin, follower):
         raise ActuationError('wall_time_required')
     observation = RosObservation(sensor_names=('odom', 'status'))
     scan = [None]
+    sample_issue = [None]
 
     def receive(message):
         pair = sample_clocks(clock.now, lambda: rospy.Time.now().to_sec())
@@ -86,13 +98,18 @@ def execute(args, reference, report, origin, follower):
             odom, status = observation.latest.get('odom'), observation.latest.get('status')
             epoch = observation.epoch
             guarded = observation.clock_guard.faulted or observation.odom_guard.faulted
+        ages = (None if record is None else now - record[1],
+                None if odom is None else now - odom['stamp'],
+                None if status is None else now - status['stamp'])
         if (guarded or not record or not odom or not status or odom['epoch'] != epoch
-                or not (0 <= now - record[1] < .30 and 0 <= now - odom['stamp'] < .15
-                        and 0 <= now - status['stamp'] < 1.)):
+                or not all(0 <= age < limit for age, limit in zip(ages, (.30, .15, 1.)))):
+            sample_issue[0] = {'stage': 'observations', 'ages_sec': dict(zip(('scan', 'odom', 'status'), ages)),
+                               'guarded': guarded}
             return None
         base = base_state(odom['message'], status['message'], status['stamp'])
         if (base is None or base['control_mode'] != 1 or base['motion_mode'] != 0
                 or base['vehicle_state'] != 0 or base['error_code'] != 0 or base['battery_voltage'] < 10.):
+            sample_issue[0] = {'stage': 'base_state'}
             return None
         return Pose(*odom['pose']), epoch, record[0]
 
@@ -109,6 +126,7 @@ def execute(args, reference, report, origin, follower):
     reason = 'observation_unavailable'
     zero = Command(0., 0., 'stop', 'retrace_wait')
     matches_reference = recorded_scan_matches if follower is not None else scan_matches
+    anchor = report['recorded_anchor'] if follower is not None else None
 
     def check_anchor(seconds, armed=False):
         until = clock.now() + seconds
@@ -120,7 +138,7 @@ def execute(args, reference, report, origin, follower):
                 seen = sample[2].header.stamp
                 match = (front_registration(sample[2], reference) if args.resume else
                          0. if matches_reference(sample[2], reference) else None)
-                if match is None:
+                if match is None or anchor is not None and not recorded_anchor_matches(anchor, sample[0]):
                     matches = []
                 else:
                     matches = matches[-1:] + [match]
@@ -139,7 +157,7 @@ def execute(args, reference, report, origin, follower):
         if checked is None:
             raise ActuationError('recorded_front_reference_changed')
         initial, shift = checked
-        origin = origin._replace(x=origin.x - shift)
+        origin = (_relative(anchor, initial[0]) if anchor is not None else origin._replace(x=origin.x - shift))
         report['front_registration_delta_m'] = shift
         pose, epoch = initial[:2]
         start = last_ready = clock.now()
@@ -163,8 +181,11 @@ def execute(args, reference, report, origin, follower):
                 if not (requested.linear or requested.angular):
                     reason = requested.reason
                     break
-                if front_obstacle(sample[2], requested.angular):
+                obstruction = front_obstruction(sample[2], requested.angular)
+                if obstruction is not None:
                     reason = 'retrace_live_obstacle_or_missing_returns'
+                    report['front_obstruction'] = dict(obstruction, linear_mps=requested.linear,
+                                                       angular_radps=requested.angular)
                     break
                 command = actuator.publish(requested)
                 if not (command.linear or command.angular):
@@ -192,7 +213,8 @@ def execute(args, reference, report, origin, follower):
         subscription.unregister()
     data = recorder.trial_trajectory(actuator.caller, start, clock.now())
     report.update(reason=reason, displacement_m=distance, final_offset=offset, trajectory=data,
-                  relay_fault=actuator.stop_line, relay_exited=actuator.transport.exited)
+                  relay_fault=actuator.stop_line, relay_exited=actuator.transport.exited,
+                  observation_diagnostics=observation.diagnostic_status(), last_sample_issue=sample_issue[0])
     if follower is not None:
         report['last_completed_keyframe'] = follower.index
     print(json.dumps(report, allow_nan=False))

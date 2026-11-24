@@ -44,6 +44,8 @@ At a stationary corner with an observed obstruction and no checked start, the co
 
 `run_trail_recovery.py` checks a recorded trail when the robot has stopped close to an obstacle. Its default verifies the recorded wheel odometry and reference without connecting to hardware. With `--recorded-curve` it can check a trail that includes measured turns. The supervised execute mode matches the live forward reference and tracks the recorded path with wheel odometry. The reverse relay enforces separate limits on speed, turn rate, and motion duration. This recovery depends on the trail remaining clear in the attended static room.
 
+With `--recorded-curve`, `--start-at-seq` selects an odometry sample inside a completed run when recovering from the middle of a track. `--prior-trace` can extend the track through an identical stopped pose from an earlier run on the same driver. The recorder keeps the original timestamps and reports the gap between recordings. The live odometry and current forward scan must match the starting reference before the relay can move.
+
 ## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;

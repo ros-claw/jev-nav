@@ -4,7 +4,7 @@ from collections import namedtuple
 import pytest
 
 from navigation import Pose
-from trail_recovery import (TrailFollower, front_obstacle, front_registration, measured_trail,
+from trail_recovery import (TrailFollower, front_obstruction, front_registration, measured_trail,
                             recorded_scan_matches, scan_matches, straight_trail)
 
 
@@ -19,6 +19,28 @@ def test_retrace_requires_bounded_measured_travel_ending_at_the_reference():
     odom[250] = (12.5, .25, .03, .02, 0., 0.)
     with pytest.raises(ValueError, match='straight'):
         straight_trail(trace, reference, .32)
+
+
+def test_retrace_joins_recordings_at_an_identical_stopped_pose_without_filling_time():
+    def recording(first, last, paused_at):
+        rows = [(index * .05, (index - paused_at) * .001, 0.,
+                 0. if index in (first, last) else .02, 0., 0., index * .05 + 1000., index)
+                for index in range(first, last + 1)]
+        return {'mode': 'supervised_static_room', 'relay_exited': True, 'relay_fault': None,
+                'authority_diagnostics': {'ros': {'driver_pid_expected': 99}},
+                'trajectory': {'clock': 'host_monotonic_receipt', 'odom': rows}}
+
+    prior = recording(100, 400, 400)
+    current = recording(500, 560, 500)
+    reference = {'x': .04, 'y': 0., 'yaw': 0.}
+    _, report = measured_trail(current, reference, .20, start_sequence=540, prior=prior)
+    assert report['recorded_anchor'] == Pose(.04, 0., 0.)
+    assert report['recording_join_gap_sec'] == 5.
+
+    joined = current['trajectory']['odom']
+    joined[0] = joined[0][:2] + (.002,) + joined[0][3:]
+    with pytest.raises(ValueError, match='same stopped pose'):
+        measured_trail(current, reference, .20, start_sequence=540, prior=prior)
 
 
 def test_front_registration_rejects_unrelated_or_insufficient_returns():
@@ -58,9 +80,10 @@ def test_retrace_tracks_measured_translation_and_pivot_in_sequence():
 def test_retrace_stops_for_live_front_obstacle_or_no_valid_scan():
     scan = namedtuple('Scan', 'angle_min angle_increment range_min range_max ranges')
     sample = scan(-.1, .025, .04, 8., [.3] * 9)
-    assert not front_obstacle(sample, .05)
-    assert front_obstacle(sample._replace(ranges=[.055] * 9), -.05)
-    assert front_obstacle(sample._replace(ranges=[float('inf')] * 9), .05)
+    assert front_obstruction(sample, .05) is None
+    obstruction = front_obstruction(sample._replace(ranges=[.055] * 9), -.05)
+    assert obstruction['current_footprint'] and obstruction['range_m'] == .055
+    assert front_obstruction(sample._replace(ranges=[float('inf')] * 9), .05) == {'valid_returns': 0}
 
 
 def test_recorded_reference_handles_alternating_invalid_laser_bins():
