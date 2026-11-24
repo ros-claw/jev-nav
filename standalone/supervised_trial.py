@@ -252,6 +252,16 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
             return summarize_observations([item[:4] for item in self.odometry],
                                           [item[:3] for item in self.commands])
 
+    def commands_after(self, caller, after):
+        selected = []
+        with self.lock:
+            for at, linear, angular, source in reversed(self.commands):
+                if at <= after:
+                    break
+                if caller is not None and caller == source:
+                    selected.append((at, linear, angular))
+        return list(reversed(selected))
+
     def trial_summary(self, caller, started, ended):
         with self.lock:
             return summarize_trial_observations([item[:4] for item in self.odometry], list(self.commands),

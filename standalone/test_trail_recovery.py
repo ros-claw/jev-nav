@@ -52,6 +52,16 @@ def test_retrace_can_finish_at_the_end_of_a_short_recorded_strip():
     assert points[-1] == Pose(-.087, 0., 0.)
 
 
+def test_a_run_that_reported_slip_cannot_prove_a_retrace():
+    trace = {'mode': 'supervised_static_room', 'relay_exited': True, 'reason': 'slip',
+             'trajectory': {'clock': 'host_monotonic_receipt', 'odom': []}}
+    reference = {'x': 1., 'y': 0., 'yaw': 0.}
+    with pytest.raises(ValueError, match='physical progress'):
+        measured_trail(trace, reference, .2)
+    with pytest.raises(ValueError, match='physical progress'):
+        straight_trail(trace, reference, .2)
+
+
 def test_front_registration_rejects_unrelated_or_insufficient_returns():
     scan = namedtuple('Scan', 'angle_min angle_increment range_min range_max ranges')
     reference = {'closest_rays': [(angle, .30) for angle in range(-4, 5)]}

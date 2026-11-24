@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(limo_fresh_layer)
 find_package(catkin REQUIRED COMPONENTS costmap_2d message_generation nav_msgs pluginlib roscpp sensor_msgs std_msgs)
-add_message_files(FILES FreshGrid.msg)
+add_message_files(FILES DepthCell.msg FreshGrid.msg)
 generate_messages(DEPENDENCIES nav_msgs std_msgs)
 catkin_package(LIBRARIES limo_fresh_layer CATKIN_DEPENDS costmap_2d message_runtime nav_msgs pluginlib roscpp sensor_msgs std_msgs)
 include_directories(${catkin_INCLUDE_DIRS})

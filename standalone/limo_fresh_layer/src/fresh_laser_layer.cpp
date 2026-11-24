@@ -10,6 +10,7 @@
 #include <pluginlib/class_list_macros.h>
 #include <ros/ros.h>
 #include <sensor_msgs/TimeReference.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <limo_fresh_layer/FreshGrid.h>
 
 namespace limo_fresh_layer {
@@ -176,6 +177,7 @@ class FreshDepthLayer : public costmap_2d::ObstacleLayer {
     if (stamp.isZero() || stamp < accepted_depth_stamp_ || !(age >= 0. && age < max_age_)) return;
     accepted_depth_stamp_ = stamp;
     costmap_2d::ObstacleLayer::updateBounds(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
+    depth_observation_.swap(observations);
   }
 
   void updateCosts(costmap_2d::Costmap2D& master, int min_i, int min_j, int max_i, int max_j) override {
@@ -193,9 +195,55 @@ class FreshDepthLayer : public costmap_2d::ObstacleLayer {
     return fresh;
   }
 
+  const std::vector<DepthCell>& depthHits(costmap_2d::Costmap2D& master, const ros::Time& stamp) {
+    if (stamp == hits_stamp_ && master.getOriginX() == hits_x_ && master.getOriginY() == hits_y_
+        && master.getSizeInCellsX() == hits_width_ && master.getSizeInCellsY() == hits_height_) return hits_;
+    hits_stamp_ = stamp;
+    hits_x_ = master.getOriginX();
+    hits_y_ = master.getOriginY();
+    hits_width_ = master.getSizeInCellsX();
+    hits_height_ = master.getSizeInCellsY();
+    hits_.clear();
+    if (depth_observation_.size() != 1) return hits_;
+    const auto& observation = depth_observation_.front();
+    const auto& cloud = *observation.cloud_;
+    if (cloud.header.stamp != stamp || cloud.data.empty()) return hits_;
+    std::vector<int> positions(static_cast<size_t>(hits_width_) * hits_height_, -1);
+    const double range_sq = observation.obstacle_range_ * observation.obstacle_range_;
+    sensor_msgs::PointCloud2ConstIterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
+    for (; x != x.end(); ++x, ++y, ++z) {
+      if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z) || *z > max_obstacle_height_) continue;
+      const double dx = *x - observation.origin_.x, dy = *y - observation.origin_.y;
+      const double dz = *z - observation.origin_.z;
+      if (dx * dx + dy * dy + dz * dz >= range_sq) continue;
+      unsigned int col, row, layer_col, layer_row;
+      if (!master.worldToMap(*x, *y, col, row) || !worldToMap(*x, *y, layer_col, layer_row)
+          || getCost(layer_col, layer_row) != costmap_2d::LETHAL_OBSTACLE) continue;
+      const unsigned int index = row * hits_width_ + col;
+      int& slot = positions[index];
+      if (slot < 0) {
+        slot = static_cast<int>(hits_.size());
+        DepthCell hit;
+        hit.index = index;
+        hit.min_z = hit.max_z = *z;
+        hits_.push_back(hit);
+      } else {
+        DepthCell& hit = hits_[slot];
+        hit.min_z = std::min(hit.min_z, *z);
+        hit.max_z = std::max(hit.max_z, *z);
+      }
+    }
+    return hits_;
+  }
+
  private:
   const double max_age_ = 0.20;
   ros::Time accepted_depth_stamp_;
+  std::vector<costmap_2d::Observation> depth_observation_;
+  std::vector<DepthCell> hits_;
+  ros::Time hits_stamp_;
+  double hits_x_ = 0., hits_y_ = 0.;
+  unsigned int hits_width_ = 0, hits_height_ = 0;
 };
 
 // Must be the last layer: publishes the complete grid and sensor stamps
@@ -231,6 +279,8 @@ class FreshGridSnapshotLayer : public costmap_2d::Layer {
     snapshot.scan_fresh = last && count == 1 && laser && laser->scanFreshAt(now, &snapshot.scan_stamp);
     snapshot.depth_fresh = last && depth_count == 1 && depth && depth->depthFreshAt(now, &snapshot.depth_stamp);
     if (!snapshot.scan_fresh) snapshot.scan_stamp = ros::Time(0);
+    if (snapshot.depth_fresh) snapshot.depth_hits = depth->depthHits(master, snapshot.depth_stamp);
+    else snapshot.depth_stamp = ros::Time(0);
     snapshot.grid.header = snapshot.header;
     snapshot.grid.info.map_load_time = now;
     snapshot.grid.info.resolution = master.getResolution();

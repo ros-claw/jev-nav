@@ -34,6 +34,9 @@ _FIELDS = frozenset(('sensor_acquired_at', 'sensor_received_at', 'perception_sta
                      'depth_count', 'front_count', 'status', 'clock_domain',
                      'invalid_count', 'unknown_count', 'unobserved_space', 'sampled_candidate', 'pending',
                      'callback_at', 'sensor_age_sec', 'rear_memory_cells', 'rear_memory_age_sec',
+                     'map_status', 'map_revision', 'wait_stage', 'block_kind', 'block_x', 'block_y',
+                     'evidence_id', 'history_status', 'memory_artifact', 'memory_revision', 'target_id',
+                     'progress_axis', 'expected_progress', 'wheel_progress', 'independent_progress',
                      'raw_front_count', 'raw_valid_count',
                      'fused_front_count', 'fused_valid_count'))
 

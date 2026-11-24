@@ -26,7 +26,7 @@ The timeline path must be new. Omitting `--seconds` runs the preview until shutd
 
 `--drive-arcs` selects the hardware profile for forward segments and shallow turns. It requires Decisions, the same driver identity and a finite duration. Each direction must pass the current grid's swept-body check. The relay bounds forward speed and steering curvature and stops on lost heartbeat. The run records angular commands and the measured heading change of each model-selected arc by decision ID. Turn validation needs observed side and rear clearance. Use the private preview to check which directions the installed sensors support.
 
-`--static-room` enables an opt-in route for a supervised room with a clear activity area and fixed surroundings. The controller builds a short-range odometry-frame record from the live sensor grids as it moves. Free observations up to 30 seconds old can fill an occluded cell next to or behind the chassis. The leading corridor still needs live observations, and newly observed obstacles override earlier free cells. Isolated occupied readings are retained for up to 1.5 seconds. Repeatedly observed obstacles can be retained for up to 30 seconds. When an occupied reading expires, the live grid determines the cell's state. Sensor loss commands zero. When a turn loses coverage, a newly checked straight segment can collect more of the room before another turn. The option works with private preview and with `--drive-arcs`.
+`--static-room` enables an opt-in route for a supervised room with fixed surroundings. Free observations up to 30 seconds old can fill an occluded cell next to or behind the chassis. The leading corridor needs live observations. Isolated occupied readings can remain for 1.5 seconds. Confirmed depth hits keep their height interval after laser free, occlusion or age and are cleared only by fresh matching depth volume evidence. The current native snapshot produces positive depth evidence. Its heights are in the odom frame, and producing a clearing volume requires a calibrated depth path. Build and source the same `FreshGrid` message on both the publisher and subscriber.
 
 In this mode Decisions selects a leftward or rightward route. The local controller checks each short segment before continuing on that route. When a turn is occupied, the controller can take a separately checked turn away from it or a checked straight segment. At a blocked start, Decisions can choose a pivot if both the rotation and its exit pass the swept-body checks. The controller reviews an active route asynchronously on a newly checked segment after 45 seconds and keeps tracking while the request is pending. Timeline entries with `stage=local_continuation` link a locally checked segment to its source model decision. The result reports wheel-odometry heading change, return distance and continuous command coverage for a measured lap.
 
@@ -38,7 +38,7 @@ The room controller follows through to the next checked segment as it nears a wa
 
 If the current drive arc becomes occupied, the controller can publish a different arc from the measured pose in the same control cycle. This requires fresh coverage of the replacement segment and no measured obstacle in its longer sweep. The controller keeps its forward speed through that change and records `occupied_detour`. It commands zero when these checks cannot establish a replacement.
 
-After an early turning detour, a checked successor can continue the turn for up to 24 cm or 20 seconds while the model's route stays the same. Each successor needs its own swept-body check. The timeline records these successors as `detour_continuation`. If the active route loses observed clearance, the room controller stops immediately. Resuming the same route requires 0.4 seconds of continuously clear geometry across fresh lidar and depth observations. A newly checked alternative can start sooner.
+After an early turning detour, a checked successor can continue the turn for up to 24 cm or 20 seconds while the model's route stays the same. Each successor needs its own swept-body check. The timeline records these successors as `detour_continuation`. On lost coverage the controller checks an alternative and its steering transition before publishing its single command for that cycle. It records `unknown_detour` for an accepted replacement and sends zero if clearance remains unverified. Resuming the original route requires 0.4 seconds of continually clear geometry across fresh lidar and depth observations.
 
 Curvature changes are gradual when the resulting sweep is clear. A point turn can prepare and hand off to its checked forward exit. If path tracking loses the waypoint, the controller stops the current segment and can prepare a new segment at the measured pose using the accepted route. Clock and odometry faults still cancel the route.
 
@@ -49,6 +49,29 @@ At a stationary corner with an observed obstruction and no checked start, the co
 With `--recorded-curve`, `--start-at-seq` selects an odometry sample inside a completed run when recovering from the middle of a track. `--prior-trace` can extend the track through an identical stopped pose from an earlier run on the same driver. The recorder keeps the original timestamps and reports the gap between recordings. The live odometry and current forward scan must match the starting reference before the relay can move.
 
 Recorded recovery accepts measured strips from 4 to 45 cm, including a shorter final span between odometry keyframes. It checks front laser returns against the padded footprint swept by both the commanded translation and rotation over the stopping horizon. A front obstruction commands zero immediately. If fresh scans clear the same trail for 0.35 seconds, the follower can resume from the measured pose. Without renewed clearance within two seconds, recovery ends.
+
+## Exploration memory preview
+
+Launch the ROS Melodic RTAB-Map profile once, using a database paired with a new map ID and a new memory file for the first session. Store all three in the same session directory. An existing map needs the original pair and confirmed relocalization before its saved locations are projected into odom.
+
+```sh
+mkdir -p "$HOME/jev-room-map"
+roslaunch standalone/exploration_mapping.launch database_path:="$HOME/jev-room-map/room.db"
+```
+
+With the native sensing overlay sourced, preview the combined pipeline in another shell.
+
+```sh
+/usr/bin/python2 standalone/run_navigation.py --static-room --decisions --seconds 60 \
+  --map-id room-a --spatial-memory "$HOME/jev-room-map/room.json" \
+  --timeline "$HOME/jev-room-map/preview.jsonl"
+```
+
+The mapper uses wheel odometry and the fixed forward laser. RGB-D remains on the existing local obstacle path. The controller stays in continuous odom and reprojects keyframe-anchored obstacles after map corrections. The Decisions worker receives IDs for currently checked endpoints, visit counts and a short-range frontier estimate. The preview publishes on its private command topic. After moving the robot by hand, treat the new start as a new session. If the old map cannot be matched, choose a new database, map ID and memory file.
+
+An optional qualified vision or scan-matching `nav_msgs/Odometry` feed can be passed with `--independent-odom-topic` during supervised driving. The progress monitor integrates relay-attributed output, checks wheel and independent movement, and stops on insufficient progress or inconsistent localization. Recorded recovery refuses faulted trails and runs with recorded low-obstacle or map-backed hazards until it can check those hazards itself.
+
+To include long-term notes, add `--powercontext-url` and `--powercontext-scope` for the room's PowerContext service. The optional `POWERCONTEXT_TOKEN` is read from the process environment. The navigation worker requests scoped history asynchronously. The event writer records selected outcomes and proposes Experience entries for measured, map-anchored no-progress reports. Candidate review uses the source and candidate IDs in the logs. PowerContext availability does not gate local motion checks.
 
 ## Bounded forward trial
 

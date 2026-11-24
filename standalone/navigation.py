@@ -7,7 +7,8 @@ import math
 
 Pose = namedtuple('Pose', 'x y yaw')
 Grid = namedtuple('Grid', 'x y resolution width height cells')
-View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready')
+View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready depth_evidence')
+View.__new__.__defaults__ = (None,)
 Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks')
 Command = namedtuple('Command', 'linear angular action reason')
 Segment = namedtuple('Segment', 'sequence action origin turn')
@@ -321,33 +322,40 @@ class Navigation(object):
             self._blocked_corner = corner
         return None
 
-    def replace_unknown_path(self, view, now, direction):
-        """Replace a paused path only with a fresh sweep from the measured pose."""
+    def replace_unknown_path(self, view, now, direction, motion):
+        """Replace a paused path only when its actual starting curvature is observed."""
         if (self.fault or self.forward_only or not self.paused or self.goal is None
                 or self.blocked_cell is None or self.blocked_cell[0] != 'unknown' or not ready(view, now)
                 or view.epoch != self.epoch):
             return None
         self.candidate_blocks = {}
+        speed, previous_steer, elapsed = motion
+        slew = 5. * min(.05, elapsed)
         away = 'right' if direction == 'left' else 'left'
         for action in ('forward', direction, away):
             if action == self.goal.action:
                 continue
-            block = sweep_block(view.grid, view.pose, self.length, self.curvature[action])
+            curvature = self.curvature[action]
+            block = sweep_block(view.grid, view.pose, self.length, curvature)
             if block is None:
-                break
+                steer = max(previous_steer - slew, min(previous_steer + slew, curvature))
+                block = sweep_block(view.grid, view.pose, .10, steer)
+                if block is not None and speed == 0.:
+                    steer, block = curvature, None  # The full nominal arc already passed from this pose.
+                if block is None:
+                    self._start_detour(view.pose, action)
+                    self.speed = min(self.max_speed, speed + .04 * min(.05, elapsed))
+                    self.steer = steer
+                    return Command(self.speed, self.speed * steer, action, 'unknown_detour')
             self.candidate_blocks[action] = block
-        else:
-            if not self.static_room or not sweep_block(view.grid, view.pose, .42, 0., occupied_only=True):
-                return None
+        if (not speed and self.static_room
+                and sweep_block(view.grid, view.pose, .42, 0., occupied_only=True)):
             for action in ('pivot_' + direction, 'pivot_' + away):
                 if action != self.goal.action and self._pivot_clear(view, view.pose, action):
-                    break
-            else:
-                return None
-        self.stop('path_unknown')
-        self.sequence += 1
-        self.goal = Segment(self.sequence, action, view.pose, PIVOTS.get(action))
-        return action
+                    self._start_detour(view.pose, action)
+                    self.goal = self.goal._replace(turn=PIVOTS[action])
+                    return self._pivot(view, elapsed)
+        return None
 
     def anticipate_obstacle(self, view, now, command, direction):
         """Start a checked detour while the current setpoint still passes its sweep."""

@@ -1,5 +1,5 @@
 from navigation import Grid, Pose, View
-from room_perception import RoomPerception
+from room_perception import DepthEvidence, RoomPerception
 
 
 def observation(at, cells, x=.3, epoch=0, scan_at=None, origin=-.25):
@@ -50,6 +50,51 @@ def test_repeatedly_observed_obstacle_is_retained_across_later_occlusion():
         assert memory.view(observation(at, occupied), at).grid.cells[5] == 100
     assert memory.view(observation(18., [-1] * 12), 18.).grid.cells[5] == 100
     assert memory.view(observation(34., [-1] * 12), 34.).grid.cells[5] == -1
+
+
+def test_confirmed_depth_hit_survives_laser_free_and_age_until_depth_volume_is_cleared():
+    memory = RoomPerception()
+    occupied = [-1] * 12
+    occupied[5] = 100
+    for seq, at in enumerate((2., 2.10, 2.20, 2.31)):
+        hit = DepthEvidence(seq, 'camera_depth_optical_frame', {5: (.018, .041)}, {})
+        memory.view(observation(at, occupied)._replace(depth_evidence=hit), at)
+    for at in (2.40, 38.):
+        assert memory.view(observation(at, [0] * 12), at).grid.cells[5] == 100
+    too_high = DepthEvidence(4, 'camera_depth_optical_frame', {}, {5: (.06, .12)})
+    assert memory.view(observation(38.1, [0] * 12)._replace(depth_evidence=too_high), 38.1).grid.cells[5] == 100
+    for seq, at in enumerate((38.2, 38.3, 38.4, 38.51), 5):
+        clear = DepthEvidence(seq, 'camera_depth_optical_frame', {}, {5: (.0, .07)})
+        view = memory.view(observation(at, [0] * 12)._replace(depth_evidence=clear), at)
+    assert view.grid.cells[5] == 0
+
+
+def test_republished_depth_frame_counts_once_and_old_epoch_does_not_restore_hazards():
+    memory = RoomPerception()
+    occupied = [-1] * 12
+    occupied[5] = 100
+    hit = DepthEvidence(7, 'camera_depth_optical_frame', {5: (.02, .04)}, {})
+    for at in (2., 2.10, 2.20, 2.31):
+        memory.view(observation(at, occupied)._replace(depth_evidence=hit), at)
+    assert memory.view(observation(4., [0] * 12), 4.).grid.cells[5] == 0
+    for seq, at in enumerate((4.10, 4.20, 4.30, 4.42), 8):
+        fresh = hit._replace(sequence=seq)
+        memory.view(observation(at, occupied)._replace(depth_evidence=fresh), at)
+    assert memory.view(observation(4.5, [0] * 12), 4.5).grid.cells[5] == 100
+    assert memory.view(observation(4.6, [0] * 12, epoch=1), 4.6).grid.cells[5] == 0
+
+
+def test_only_newly_confirmed_or_changed_depth_evidence_is_exported_to_the_mapper():
+    memory = RoomPerception()
+    occupied = [-1] * 12
+    occupied[5] = 100
+    for seq, at in enumerate((2., 2.10, 2.20, 2.31)):
+        hit = DepthEvidence(seq, 'fixed_depth', {5: (.02, .04)}, {})
+        memory.view(observation(at, occupied)._replace(depth_evidence=hit), at)
+    assert len(list(memory.confirmed_depth(only_changed=True))) == 1
+    memory.view(observation(2.41, occupied)._replace(depth_evidence=hit._replace(sequence=4)), 2.41)
+    assert list(memory.confirmed_depth(only_changed=True)) == []
+    assert len(list(memory.confirmed_depth())) == 1
 
 
 def test_history_stays_aligned_with_rolling_grid_origin():

@@ -14,9 +14,9 @@ import sys
 import time
 import uuid
 
-from navigation import PIVOTS, Grid, LENGTH, ROOM_LENGTH, Navigation, Pose, View, ready
+from navigation import PIVOTS, Command, Grid, LENGTH, ROOM_LENGTH, Navigation, Pose, View, ready
 from navigation_actuator import ActuationError, NavigationActuator, NavigationHeartbeat
-from navigation_runtime import NavigationRuntime
+from navigation_runtime import MappedChoice, NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
 from relay import _monotonic
 
@@ -36,7 +36,8 @@ def brighten_low_light(image):
 
 
 class RosNavigationInput(object):
-    def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False):
+    def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False,
+                 independent_odom_topic=None):
         from explore import RosObservation
         from limo_fresh_layer.msg import FreshGrid
         from sensor_msgs.msg import Image, LaserScan
@@ -49,10 +50,20 @@ class RosNavigationInput(object):
         self.last_grid_times = None
         self.latest_color = None
         self.latest_scan = None
+        self.latest_independent = None
+        self.spatial = None
+        self.history = None
+        self.last_context = None
         self.grid_updates = collections.Counter()
         self.decision_errors = collections.Counter()
         self.decision_scan_counts = collections.Counter()
         self.subscriptions = [rospy.Subscriber(grid_topic, FreshGrid, self._grid, queue_size=1)]
+        if independent_odom_topic:
+            from nav_msgs.msg import Odometry
+            if rospy.resolve_name(independent_odom_topic) == '/odom':
+                raise ValueError('progress odometry must be independent of wheel odometry')
+            self.subscriptions.append(rospy.Subscriber(independent_odom_topic, Odometry,
+                                                        self._independent, queue_size=1))
         if decisions:
             import tf2_ros
             self.sensor_tf = tf2_ros.Buffer()
@@ -66,6 +77,31 @@ class RosNavigationInput(object):
 
     def _scan(self, message):
         self.latest_scan = message
+
+    def _independent(self, message):
+        from explore import sample_clocks, source_time
+
+        pair = sample_clocks(_monotonic, lambda: self.rospy.Time.now().to_sec())
+        if pair is None:
+            return
+        stamp = source_time(pair[0], pair[1], message.header.stamp.to_sec(), .20)
+        frame = message.header.frame_id.lstrip('/')
+        base = message.child_frame_id.lstrip('/')
+        pose = message.pose.pose
+        covariance = message.pose.covariance
+        x, y, yaw = pose.position.x, pose.position.y, _yaw(pose.orientation)
+        if (stamp is None or not frame or base not in ('base_link', 'base_footprint')
+                or any(math.isnan(v) or math.isinf(v) for v in (x, y, yaw))
+                or not all(0. < covariance[i] <= maximum for i, maximum in
+                           ((0, .0004), (7, .0004), (35, .01)))):
+            self.latest_independent = None
+            return
+        self.latest_independent = stamp, frame, Pose(x, y, yaw)
+
+    def independent_pose(self, now):
+        sample = self.latest_independent
+        if sample is not None and 0 <= now - sample[0] < .20:
+            return sample[1:]
 
     def decision_scan(self, image_at, clocks):
         import tf2_ros
@@ -87,6 +123,7 @@ class RosNavigationInput(object):
 
     def _grid(self, message):
         from explore import sample_clocks, source_time
+        from room_perception import DepthEvidence
 
         try:
             pair = sample_clocks(_monotonic, lambda: self.rospy.Time.now().to_sec())
@@ -123,8 +160,18 @@ class RosNavigationInput(object):
                 self.grid_updates['grid_regression'] += 1
                 self.latest_grid = None
                 return
+            cells = tuple(grid.data)
+            hits = {}
+            for cell in message.depth_hits:
+                index, low, high = cell.index, cell.min_z, cell.max_z
+                if (not 0 <= index < len(cells) or cells[index] <= 0 or index in hits
+                        or any(math.isnan(value) or math.isinf(value) for value in (low, high))
+                        or low > high):
+                    raise ValueError('invalid depth evidence')
+                hits[index] = (low, high)
+            evidence = DepthEvidence(message.depth_stamp.to_nsec(), message.header.frame_id, hits, {})
             self.last_grid_times = raw_times
-            self.latest_grid = times, Grid(x, y, info.resolution, info.width, info.height, tuple(grid.data))
+            self.latest_grid = times, Grid(x, y, info.resolution, info.width, info.height, cells), evidence
             self.grid_updates['ready'] += 1
         except (AttributeError, ArithmeticError, ValueError, TypeError):
             self.grid_updates['invalid_grid'] += 1
@@ -146,9 +193,9 @@ class RosNavigationInput(object):
                  and state['control_mode'] == 1 and state['motion_mode'] == 0
                  and state['error_code'] == 0 and state['vehicle_state'] == 0
                  and state['battery_voltage'] >= 10.)
-        times, grid = snapshot
+        times, grid, evidence = snapshot
         return View(times[0], times[1], times[2], odom['stamp'], status['stamp'], epoch,
-                    Pose(*odom['pose']), grid, ready)
+                    Pose(*odom['pose']), grid, ready, evidence)
 
     def choose(self, request, cancelled):
         from explore import WORKER, base_state, run_decision_process, sample_clocks, source_time
@@ -187,9 +234,25 @@ class RosNavigationInput(object):
                     'operator_clear_front': self.operator_clear_front}
         if self.static_room:
             evidence['exploration_goal'] = 'circulate_room'
+        if self.spatial is not None:
+            evidence['exploration_targets'] = self.spatial.context(request)
+        if self.history is not None:
+            targets = evidence.get('exploration_targets', [])
+            places = ' '.join('room %s anchor %d' % (t['map_id'], t['anchor']) for t in targets)
+            recall = self.history.prepare(places + ' floor obstacle stalled approach safe exploration detour')
+            self.last_context = request.sequence, recall['status'], recall.get('references', [])
+            if recall['status'] == 'ready':
+                evidence['historical_context'] = recall['content']
+            if cancelled():
+                return None
         result = run_decision_process(['/usr/bin/python3', os.path.join(WORKER, 'limo_mapless_decision.py')],
                                       evidence, cancelled, _monotonic, diagnostics=True)
         if result and result.get('ok') is True and result.get('captured_at') == stamp:
+            if result.get('target_id'):
+                for target in evidence.get('exploration_targets', []):
+                    if target['id'] == result['target_id'] and target['action'] == result.get('choice'):
+                        return MappedChoice(target['action'], target['id'])
+                return None
             return result.get('choice')
         error = result.get('error_class') if result else None
         self.decision_errors[error or 'DecisionsUnavailable'] += 1
@@ -206,6 +269,11 @@ def parse_args(argv=None):
     output.add_argument('--drive-arcs', action='store_true', help='execute currently observed forward and arc paths')
     parser.add_argument('--static-room', action='store_true', help='use nearby rear history in a supervised static room')
     parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
+    parser.add_argument('--independent-odom-topic', help='qualified visual or scan odometry for physical progress')
+    parser.add_argument('--spatial-memory', help='atomic per-map spatial-memory JSON file')
+    parser.add_argument('--map-id', help='stable identifier of the running RTAB-Map database')
+    parser.add_argument('--powercontext-url', help='PowerContext service origin')
+    parser.add_argument('--powercontext-scope', help='existing PowerContext room scope ID')
     parser.add_argument('--driver-pid', type=int)
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
@@ -221,6 +289,12 @@ def parse_args(argv=None):
         parser.error('invalid supervised motion bounds')
     if args.static_room and args.drive_forward:
         parser.error('static room exploration uses the arc or private preview output')
+    if bool(args.spatial_memory) != bool(args.map_id) or args.map_id and (
+            not args.static_room or not re.match(r'\A[A-Za-z0-9_.-]{1,64}\Z', args.map_id)):
+        parser.error('--spatial-memory and a stable --map-id require --static-room')
+    if bool(args.powercontext_url) != bool(args.powercontext_scope) or args.powercontext_url and (
+            not args.decisions or not args.static_room):
+        parser.error('PowerContext origin and scope require --decisions and --static-room')
     if args.drive and (not args.decisions or args.seconds is None or args.driver_pid is None or args.driver_pid <= 1
                        or not args.driver_exe or not os.path.isabs(args.driver_exe)
                        or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
@@ -353,7 +427,7 @@ def main(argv=None):
     from geometry_msgs.msg import Twist
     from limo_fresh_layer.msg import FreshGrid
     from nav_timeline import Timeline
-    if 'depth_stamp' not in FreshGrid.__slots__:
+    if 'depth_hits' not in FreshGrid.__slots__:
         parser.error('build and source the repository version of limo_fresh_layer')
     if args.decisions:
         os.environ.setdefault('ROSCLAW_LIMO_DECISIONS_KEY_FILE', os.path.expanduser('~/rosclaw/jev/.env'))
@@ -371,6 +445,7 @@ def main(argv=None):
     children = []
     runtime = timeline = source = actuator = recorder = None
     heartbeat = view = None
+    progress = spatial = history = None
     counts = collections.Counter()
     ready_ticks = 0
     room = None
@@ -394,9 +469,44 @@ def main(argv=None):
         rospy.init_node('jev_navigation', anonymous=True)
         if rospy.get_param('/use_sim_time', False):
             raise RuntimeError('ROS wall time required for live acquisition')
-        source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front, args.static_room)
+        source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front, args.static_room,
+                                    args.independent_odom_topic)
+        if args.spatial_memory:
+            from spatial_runtime import SpatialRuntime
+            spatial = source.spatial = SpatialRuntime(rospy, args.spatial_memory, args.map_id)
+        if args.powercontext_url:
+            from memory_bridge import MemoryBridge
+            history = source.history = MemoryBridge(args.powercontext_url, args.powercontext_scope,
+                                                     os.environ.get('POWERCONTEXT_TOKEN'))
         publisher = rospy.Publisher(preview, Twist, queue_size=1)
         timeline = Timeline(args.timeline, namespace)
+
+        def remember_event(at, stage, sequence, pose, summary, remember=False, measurements=None):
+            if not args.drive or history is None:
+                return
+            place = spatial.location(pose) if spatial is not None else {'pose_valid': False}
+            label = ('Room %s anchor %d. ' % (place['map_id'], place['anchor_keyframe_id'])
+                     if place['pose_valid'] else '')
+            content = label + summary
+            event = '%s-%s-%d' % (namespace, stage, sequence)
+            metadata = dict(place, event_type=stage, session_id=namespace, robot_id='limo',
+                            evidence_ids=[event])
+            experience = None
+            if measurements is not None:
+                metadata['motion_progress'] = measurements
+                if place['pose_valid'] and measurements.get('reason') in ('no_progress', 'slip'):
+                    unit = 'rad' if measurements['axis'] == 'yaw' else 'm'
+                    experience = {'situation': label + 'Sustained relay output on the recorded approach.',
+                                  'action': 'The local progress monitor stopped this approach.',
+                                  'outcome': '%s Expected %.3f %s, wheel progress %.3f %s, independent progress %s.'
+                                             % (summary, measurements['expected'], unit, measurements['wheel'], unit,
+                                                measurements['independent']),
+                                  'lesson': 'Consider another checked approach and re-observe this area.'}
+            queued = history.record(event, content, metadata,
+                                    remember=content if remember and place['pose_valid'] else None,
+                                    experience=experience)
+            timeline.record('run', at, {'stage': 'memory_write', 'evidence_id': event,
+                                        'status': 'queued' if queued else 'dropped'})
 
         def publish(command):
             packet = Twist()
@@ -429,6 +539,8 @@ def main(argv=None):
                                           arc_navigation=args.drive_arcs, room_pivot=args.static_room)
             recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)
             actuator.open()
+            from progress_monitor import ProgressMonitor
+            progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
             if room is not None:
                 heartbeat = NavigationHeartbeat(actuator, clock)
                 heartbeat.start()
@@ -457,6 +569,32 @@ def main(argv=None):
             if room is not None:
                 view = room.view(view, now)
                 now = _monotonic()
+            if spatial is not None:
+                view = spatial.apply(view, room, now)
+                now = _monotonic()
+            if progress is not None:
+                evidence = recorder.commands_after(actuator.caller, progress.command_at)
+                # Callbacks may have received a newer command after the frame was read.
+                now = _monotonic()
+                valid = ready(view, now)
+                previous_progress = progress.diagnostics
+                failure = progress.update(now, evidence, view.pose if valid else None,
+                                          view.epoch if valid else None, source.independent_pose(now))
+                if failure:
+                    publish_command(Command(0., 0., 'stop', failure))
+                    reason = failure
+                if progress.diagnostics is not previous_progress:
+                    measurement = progress.diagnostics
+                    timeline.record('run', now, {'stage': 'progress', 'status': 'latched' if failure else 'measured',
+                                                'reason': failure, 'progress_axis': measurement['axis'],
+                                                'expected_progress': measurement['expected'],
+                                                'wheel_progress': measurement['wheel'],
+                                                'independent_progress': measurement['independent']})
+                if failure:
+                    remember_event(now, 'progress_fault', runtime.navigation.sequence, view.pose if valid else None,
+                                   'The relay was stopped after measured motion reported %s.' % failure,
+                                   remember=True, measurements=progress.diagnostics)
+                    break
             if args.drive and view is not None and last_pose is not None:
                 travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
                 if travelled >= args.max_travel_m:
@@ -466,6 +604,16 @@ def main(argv=None):
             counts[command.reason] += 1
             fields = {'reason': command.reason, 'linear': command.linear, 'angular': command.angular,
                       'final_action': command.action, 'clock_domain': 'monotonic'}
+            if command.reason == 'waiting_for_goal':
+                fields['wait_stage'] = runtime.wait_stage(decision)
+            blockage = runtime.navigation.blocked_cell
+            if blockage is not None:
+                fields.update(block_kind=blockage[0], block_x=blockage[1], block_y=blockage[2])
+            if spatial is not None:
+                fields['map_status'] = spatial.status
+                fixed = spatial.memory.fixed
+                if fixed is not None:
+                    fields['map_revision'] = fixed.revision
             if runtime.navigation.blocked_action is not None:
                 fields['blocked_action'] = runtime.navigation.blocked_action
             applied = heartbeat.applied if heartbeat is not None else None
@@ -503,6 +651,9 @@ def main(argv=None):
                 timeline.record('decision', now, {'stage': 'occupied_detour', 'reason': 'path_occupied',
                                                    'blocked_action': previous, 'selected_action': alternate,
                                                    'scene_id': runtime.room_plan[0], 'x': x, 'y': y})
+                remember_event(now, 'occupied_detour', runtime.navigation.sequence, view.pose,
+                               'A %s path became occupied. The local controller checked and selected %s.'
+                               % (previous, alternate))
             if command.reason in ('perception_unavailable', 'clock_or_odometry_reset'):
                 diagnostics = source.observation.diagnostic_status()
                 fault = diagnostics['clock_fault'] or diagnostics['odom_fault'] or runtime.navigation.fault
@@ -532,8 +683,18 @@ def main(argv=None):
                                                   'status': 'route_review' if runtime.review_origin is not None
                                                   else 'initial_route'})
             if decision is not None:
-                timeline.record('decision', now, {'decision_id': decision[0], 'selected_action': decision[1],
-                                                  'status': 'accepted' if decision[2] else 'rejected'})
+                decision_fields = {'decision_id': decision[0], 'selected_action': decision[1],
+                                   'status': 'accepted' if decision[2] else 'rejected'}
+                if runtime.selected_target_id is not None:
+                    decision_fields['target_id'] = runtime.selected_target_id
+                    decision_fields['stage'] = runtime.selected_target_stage
+                context = source.last_context
+                if context is not None and context[0] == decision[0]:
+                    decision_fields['history_status'] = context[1]
+                    for artifact, revision in context[2]:
+                        timeline.record('decision', now, {'decision_id': decision[0], 'stage': 'memory_reference',
+                                                          'memory_artifact': artifact, 'memory_revision': revision})
+                timeline.record('decision', now, decision_fields)
             if runtime.room_continuation is not None:
                 segment, action, origin_decision = runtime.room_continuation
                 stage = 'local_continuation'
@@ -543,6 +704,10 @@ def main(argv=None):
                     stage = 'detour_continuation'
                 timeline.record('decision', now, {'decision_id': segment, 'selected_action': action,
                                                   'scene_id': origin_decision, 'stage': stage})
+                if runtime.room_replacement and view is not None:
+                    remember_event(now, 'unknown_detour', segment, view.pose,
+                                   'Coverage of the previous segment was lost. The local controller checked and selected %s.'
+                                   % action)
             if now - last_block_report >= 1.:
                 last_block_report = now
                 blocks = dict(runtime.navigation.candidate_blocks)
@@ -576,6 +741,15 @@ def main(argv=None):
             try:
                 model_joined = runtime.close(publish_stop=actuator is None) if runtime is not None else None
             finally:
+                if spatial is not None:
+                    spatial.close()
+                if history is not None:
+                    history_joined = history.close()
+                    if timeline is not None and history_joined:
+                        for event, candidate, revision in history.pending_candidates:
+                            timeline.record('run', _monotonic(), {'stage': 'experience_pending',
+                                                                'evidence_id': event, 'memory_artifact': candidate,
+                                                                'memory_revision': revision})
                 timeline_closed = timeline.close() if timeline is not None else None
                 for child in reversed(children):
                     _stop_group(child)
@@ -595,6 +769,12 @@ def main(argv=None):
               'decision_errors': source.decision_errors if source is not None else {},
               'decision_scan_counts': source.decision_scan_counts if source is not None else {},
               'early_detours': early_detours,
+              'progress': progress.diagnostics if progress is not None else {},
+              'remembered_depth_hazards': sum(1 for _ in room.confirmed_depth()) if room is not None else 0,
+              'powercontext': dict(history.counters) if history is not None else None,
+              'spatial_memory': ({'map_id': args.map_id, 'status': spatial.status,
+                                  'hazards': len(spatial.memory.hazards), 'visits': len(spatial.memory.visits),
+                                  'write_error': spatial.write_error} if spatial is not None else None),
               'arc_traces': arc_traces,
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}
@@ -607,7 +787,7 @@ def main(argv=None):
         if room is not None:
             result['room_loop'] = summarize_room_loop(trajectory, arc_traces)
     print(json.dumps(result, allow_nan=False))
-    complete = ready_ticks and timeline_closed and model_joined
+    complete = ready_ticks and timeline_closed and model_joined and (progress is None or progress.fault is None)
     if args.drive:
         complete = complete and actuator is not None and actuator.transport.exited and travelled >= .20
     if args.drive_arcs and room is not None and complete:

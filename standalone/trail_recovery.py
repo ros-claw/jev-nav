@@ -4,6 +4,7 @@ from __future__ import division
 import math
 
 from navigation import Command, HALF_LENGTH, HALF_WIDTH, Pose, _corners, _hull, _relative, _wrap
+from progress_monitor import PROGRESS_FAULTS
 
 TRAIL_MARGIN_M = .04
 MAX_LATERAL_M = .006
@@ -19,6 +20,10 @@ RETRACE_BLOCK_SEC = 2.
 
 def _recording_rows(trace):
     trajectory = trace['trajectory']
+    if trace.get('reason') in PROGRESS_FAULTS:
+        raise ValueError('recorded trail lacks trustworthy physical progress')
+    if trace.get('spatial_memory') or trace.get('remembered_depth_hazards'):
+        raise ValueError('recovery requires a current registered hazard check for this recording')
     if (trace['mode'] != 'supervised_static_room' or trace['relay_exited'] is not True
             or trace.get('relay_fault') is not None or trajectory['clock'] != 'host_monotonic_receipt'):
         raise ValueError('curved retrace needs a completed supervised static-room recording')
@@ -209,7 +214,7 @@ def straight_trail(trace, reference, distance):
     if (trace['mode'] != 'supervised_static_room' or trace['relay_exited'] is not True
             or trajectory['clock'] != 'host_monotonic_receipt' or not .10 <= distance <= .35):
         raise ValueError('retrace needs a completed supervised static-room recording')
-    rows = trajectory['odom']
+    rows = _recording_rows(trace)
     if not rows:
         raise ValueError('missing recorded odometry')
     end = Pose(rows[-1][1], rows[-1][2], rows[-1][4])

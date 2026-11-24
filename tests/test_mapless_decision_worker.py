@@ -154,6 +154,36 @@ def test_room_model_can_select_only_the_verified_pivot_side():
     assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_right"
 
 
+def test_confirmed_map_targets_are_choices_and_recalled_experience_stays_context():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0, "laser": {}, "base": {},
+        "navigation_choices": ["left", "right", "stop"], "exploration_goal": "circulate_room",
+        "exploration_targets": [
+            {"id": "8-left", "action": "left", "map_id": "room", "revision": 3,
+             "anchor": 8, "x": .1, "y": .4, "visits": 1},
+            {"id": "8-right", "action": "right", "map_id": "room", "revision": 3,
+             "anchor": 8, "x": .1, "y": -.4, "visits": 0},
+        ],
+    }
+
+    def transport(payload, key, timeout):
+        assert [item["value"] for item in payload["questions"][0]["choices"]] == ["8-left", "8-right", "stop"]
+        context = payload["input"][0]["content"][2]["data"]
+        assert context["exploration_targets"] == request["exploration_targets"]
+        side = "8-right" if context.get("historical_context") else "8-left"
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": side}]}
+
+    def decide():
+        return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
+
+    assert decide()["target_id"] == "8-left"
+    request["historical_context"] = "Room anchor 8. The left approach previously stalled."
+    assert decide()["target_id"] == "8-right" and decide()["choice"] == "right"
+    request["exploration_targets"][1]["action"] = "forward"
+    assert not decide()["ok"]
+
+
 def test_transport_failures_return_only_sanitized_classification():
     request = {
         "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),

@@ -9,7 +9,7 @@ import time
 import pytest
 
 from navigation import Command, Grid, Navigation, Pose, View, arc_pose, sweep_clear
-from navigation_runtime import NavigationRuntime
+from navigation_runtime import MappedChoice, NavigationRuntime
 
 
 def grid(markings=None):
@@ -392,6 +392,9 @@ def test_room_reobserves_straight_when_a_turn_is_blocked(markings, stop_reason):
         assert runtime.cycle(view(1.05), 1.05)[0].action == 'left'
         cells = grid(markings)
         assert runtime.cycle(view(1.10, cells=cells), 1.10)[0].reason == stop_reason
+        if stop_reason == 'path_unknown':
+            assert runtime.room_continuation is None
+            assert runtime.cycle(view(1.15, cells=cells), 1.15)[0].action == 'forward'
         assert runtime.room_continuation == (2, 'forward', 1)
         command, _, _ = runtime.cycle(view(1.15, cells=cells), 1.15)
         assert command.linear > 0. and command.angular == 0.
@@ -459,14 +462,13 @@ def test_room_reanchors_a_paused_forward_segment_only_if_an_alternative_is_obser
                                 navigation, static_room=True)
     runtime.room_plan = (1, 'left')
     try:
-        stopped, _, _ = runtime.cycle(view(1.05, cells=observed), 1.05)
-        assert stopped.linear == stopped.angular == 0.
-        command, _, _ = runtime.cycle(view(1.10, cells=observed), 1.10)
+        command, _, _ = runtime.cycle(view(1.05, cells=observed), 1.05)
         if front_cell:
             assert command.linear == command.angular == 0.
         else:
-            assert stopped.reason == 'path_unknown'
             assert command.action == 'left' and command.linear > 0. and command.angular > 0.
+            assert sweep_clear(observed, Pose(0., 0., 0.), .10, command.angular / command.linear)
+            assert runtime.room_replacement
             assert runtime.room_plan == (1, 'left')
     finally:
         assert runtime.close()
@@ -481,9 +483,9 @@ def test_room_rechecks_failed_alternatives_after_geometry_changes(monkeypatch):
     checked = []
     replace = navigation.replace_unknown_path
 
-    def count_checks(observation, now, direction):
+    def count_checks(observation, now, direction, *args):
         checked.append(now)
-        return replace(observation, now, direction)
+        return replace(observation, now, direction, *args)
 
     monkeypatch.setattr(navigation, 'replace_unknown_path', count_checks)
     try:
@@ -492,6 +494,37 @@ def test_room_rechecks_failed_alternatives_after_geometry_changes(monkeypatch):
             assert command.reason == 'path_unknown'
         runtime.cycle(view(1.20, cells=grid({(.21, 0.): -1, (.51, 0.): -1})), 1.20)
         assert checked == [1.05, 1.20]
+    finally:
+        assert runtime.close()
+
+
+def test_unknown_detour_keeps_speed_with_a_verified_slewed_transition():
+    navigation = Navigation(static_room=True)
+    select(navigation, 'left', 1., view(1.))
+    navigation.speed, navigation.steer = .02, .40
+    sent = []
+    runtime = NavigationRuntime(None, sent.append, navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        cells = grid({(.23, .12): -1})
+        command, _, _ = runtime.cycle(view(1.05, cells=cells), 1.05)
+        assert sent == [command]
+        assert command.action == 'forward' and command.reason == 'unknown_detour'
+        assert command.linear == .02
+        assert command.angular / command.linear == pytest.approx(.15)
+        assert sweep_clear(cells, Pose(0., 0., 0.), .10, command.angular / command.linear)
+    finally:
+        assert runtime.close()
+
+
+def test_room_prefers_the_fully_observed_exit_when_the_requested_arc_loses_coverage_early():
+    navigation = Navigation(static_room=True)
+    runtime = NavigationRuntime(None, lambda command: None, navigation, static_room=True)
+    try:
+        observation = view(1., cells=grid({(.35, .16): -1}))
+        request = navigation.request(observation, 1.)
+        assert {'forward', 'left'}.issubset(request.choices)
+        assert runtime._room_action(request, 'left', observation) == 'forward'
     finally:
         assert runtime.close()
 
@@ -846,6 +879,70 @@ def test_room_reuses_a_fresh_direction_when_the_offered_arc_becomes_blocked():
         assert runtime.close()
 
 
+def test_mapped_choice_keeps_target_and_cannot_substitute_a_blocked_model_action():
+    for cells in (grid(), grid({(.25, .015): 100})):
+        sent = []
+        runtime = NavigationRuntime(lambda request, cancelled: MappedChoice('left', '%s-left' % request.sequence),
+                                    sent.append, Navigation(static_room=True), static_room=True)
+        try:
+            _, request, _ = runtime.cycle(view(1.), 1.)
+            assert 'left' in request.choices
+            until = time.time() + 2.
+            while runtime._result is None and time.time() < until:
+                time.sleep(.001)
+            assert runtime._result is not None
+            command, _, decision = runtime.cycle(view(1.05, cells=cells), 1.05)
+            assert runtime.selected_target_id == '%s-left' % request.sequence
+            accepted = not any(cell > 0 for cell in cells.cells)
+            assert decision == (request.sequence, 'left', accepted)
+            assert len(sent) == 2 and sent[-1] == command
+            if accepted:
+                assert command.action == 'left' and command.linear > 0.
+            else:
+                assert command.linear == command.angular == 0.
+                assert runtime.room_plan is None
+        finally:
+            assert runtime.close()
+
+
+def test_unknown_during_a_pivot_allows_a_replacement_only_after_fresh_settled_odometry(monkeypatch):
+    import navigation as tracker
+
+    observe = view(1.)
+    navigation = Navigation(static_room=True)
+    navigation.epoch = 0
+    navigation.goal = tracker.Segment(1, 'pivot_left', observe.pose, .70)
+    runtime = NavigationRuntime(None, lambda command: None, navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        turning, _, _ = runtime.cycle(observe, 1.)
+        assert turning.linear == 0. and turning.angular > 0.
+        monkeypatch.setattr(tracker, 'rotation_block', lambda *args: ('unknown', .15, .10))
+        for at in (1.05, 1.10, 1.20, 1.29):
+            stopped, _, _ = runtime.cycle(view(at), at)
+            assert stopped.linear == stopped.angular == 0. and stopped.reason == 'path_unknown'
+        command, _, _ = runtime.cycle(view(1.31), 1.31)
+        assert command.linear > 0. and command.reason == 'unknown_detour'
+    finally:
+        assert runtime.close()
+
+
+def test_initial_mapped_forward_can_continue_with_locally_checked_successors():
+    runtime = NavigationRuntime(lambda request, cancelled: MappedChoice('forward', '%d-forward' % request.sequence),
+                                lambda command: None, Navigation(static_room=True), static_room=True)
+    try:
+        _, request, _ = runtime.cycle(view(1.), 1.)
+        until = time.time() + 2.
+        while runtime._result is None and time.time() < until:
+            time.sleep(.001)
+        assert runtime._result is not None
+        command, _, decision = runtime.cycle(view(1.05), 1.05)
+        assert (command.action, decision[2], runtime.selected_target_stage) == ('forward', True, 'mapped_target')
+        assert runtime.room_plan[0] == request.sequence
+    finally:
+        assert runtime.close()
+
+
 def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_sequences(monkeypatch):
     import explore
     from run_navigation import RosNavigationInput
@@ -854,7 +951,7 @@ def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_se
         return type('Message', (object,), fields)()
 
     def stamp(value):
-        return message(to_sec=lambda self: value)
+        return message(to_sec=lambda self: value, to_nsec=lambda self: int(round(value * 1e9)))
 
     source = RosNavigationInput.__new__(RosNavigationInput)
     source.latest_grid = source.last_grid_times = None
@@ -869,11 +966,13 @@ def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_se
     info = message(origin=origin, width=2, height=2, resolution=.05)
     local = message(header=grid_header, info=info, data=(-1, 0, 100, 0))
     packet = message(grid=local, header=header, scan_fresh=True, depth_fresh=True,
-                     scan_stamp=stamp(100.85), depth_stamp=stamp(100.92))
+                     scan_stamp=stamp(100.85), depth_stamp=stamp(100.92),
+                     depth_hits=(message(index=2, min_z=.01, max_z=.04),))
     source._grid(packet)
-    times, accepted = source.latest_grid
+    times, accepted, depth = source.latest_grid
     assert times == pytest.approx((10.98, 10.85, 10.92))
     assert accepted.cells == (-1, 0, 100, 0)
+    assert depth.sequence == 100920000000 and depth.frame == 'odom' and depth.hits == {2: (.01, .04)}
     assert source.grid_updates['ready'] == 1
     packet.depth_fresh = False
     source._grid(packet)

@@ -3,6 +3,7 @@ from __future__ import division
 
 import math
 import threading
+from collections import namedtuple
 
 from navigation import (ROOM_OBSTACLE_LOOKAHEAD, ROOM_TRACK_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
                         _relative, observation_deadline, ready, sweep_block)
@@ -15,6 +16,8 @@ ROOM_PREDICTION_BUDGET = .055
 ROOM_DETOUR_COOLDOWN = 1.
 ROOM_DETOUR_HOLD_M = .24
 ROOM_DETOUR_HOLD_SEC = 20.
+ROOM_EXIT_COVERAGE_M = .20
+MappedChoice = namedtuple('MappedChoice', 'action target_id')
 
 
 def offered_direction(request, direction):
@@ -43,6 +46,8 @@ class NavigationRuntime(object):
         self.occupied_detour = None
         self._detour = None
         self.detour_continuation = False
+        self.selected_target_id = None
+        self.selected_target_stage = None
         self._settling = None
         self._worker = threading.Thread(target=self._work, name='navigation-decisions')
         self._worker.daemon = True
@@ -70,20 +75,35 @@ class NavigationRuntime(object):
         self.early_detour = None
         self.occupied_detour = None
         self.detour_continuation = False
+        self.selected_target_id = None
+        self.selected_target_stage = None
         if result is not None:
             request, choice = result
+            mapped = choice if isinstance(choice, MappedChoice) else None
+            if mapped is not None:
+                choice = mapped.action
             current_request = request is self.navigation.pending or self.review_origin is not None
             waiting_for_sensors = (choice not in (None, 'stop') and current_request
                                    and 0 <= now - request.at < MAX_RESPONSE_AGE and not ready(view, now))
             if not waiting_for_sensors:
                 self._result = self._job = None
                 direction = ROOM_DIRECTIONS.get(choice) if self.static_room else None
+                if mapped is not None and self.static_room:
+                    self.selected_target_id = mapped.target_id
+                    if choice in ('left', 'right', 'pivot_left', 'pivot_right'):
+                        direction = choice.rsplit('_', 1)[-1]
+                    elif choice == 'forward':
+                        direction = (self.room_plan[1] if self.room_plan is not None else
+                                     'right' if 'right' in request.choices and 'left' not in request.choices else 'left')
                 reviewing = self.review_origin is not None
+                if mapped is not None:
+                    self.selected_target_stage = 'mapped_route_preference' if reviewing else 'mapped_target'
                 if reviewing:
-                    accepted = self._review_route(request, choice, direction, view, now)
+                    accepted = (mapped is None or self._target_current(request, choice, view, now))
+                    accepted = accepted and self._review_route(request, choice, direction, view, now)
                     self.review_origin = None
                 else:
-                    action = self._room_action(request, direction, view) if direction else choice
+                    action = self._room_action(request, direction, view) if direction and mapped is None else choice
                     accepted = self.navigation.accept(request, action, view, now)
                     if self.static_room:
                         # A current route preference can select a new segment when its original sweep changed.
@@ -91,7 +111,7 @@ class NavigationRuntime(object):
                                           and 0 <= now - request.at < MAX_RESPONSE_AGE
                                           and self.navigation.anchor_current(request, view, now)
                                           and offered_direction(request, direction))
-                        if direction and (accepted or keep_direction):
+                        if direction and (accepted or mapped is None and keep_direction):
                             self.room_plan = request.sequence, direction
                             accepted = True
                         elif accepted and choice == 'stop':
@@ -102,6 +122,8 @@ class NavigationRuntime(object):
                 if (not accepted and not reviewing) or (accepted and choice == 'stop'):
                     self._next_request = now + 1.
 
+        last_at = self.navigation.last_at
+        motion = self.navigation.speed, self.navigation.steer, .05 if last_at is None else max(0., now - last_at)
         direction = self.room_plan[1] if self.room_plan is not None else None
         command = self.navigation.step(view, now, direction)
         if command.reason == 'occupied_detour':
@@ -125,8 +147,11 @@ class NavigationRuntime(object):
                                     if command.linear > 0. and command.action in ('left', 'right') else None)
         if command.reason not in ('path_unknown', 'path_reacquiring'):
             self._blocked_replacement = None
-        settled = command.reason == 'waiting_for_goal' and self.room_plan is not None and self._settled(view, now)
-        if command.reason != 'waiting_for_goal' or self.room_plan is None:
+        replacing = (not self._closed.is_set() and self.room_plan is not None and command.reason == 'path_unknown')
+        settling_pivot = replacing and self.navigation.goal.action.startswith('pivot_')
+        can_settle = self.room_plan is not None and (command.reason == 'waiting_for_goal' or settling_pivot)
+        settled = can_settle and self._settled(view, now)
+        if not can_settle:
             self._settling = None
         if command.reason == 'clock_or_odometry_reset':
             self.room_plan = None
@@ -134,27 +159,29 @@ class NavigationRuntime(object):
             self._last_grid = None
         if self.room_plan is None:
             self._detour = None
+        if replacing and (not settling_pivot or settled):
+            source, direction = self.room_plan
+            geometry = (self.navigation.goal.sequence, view.epoch, view.pose, view.grid, direction, motion[:2])
+            if geometry != self._blocked_replacement:
+                replacement = self.navigation.replace_unknown_path(view, now, direction, motion)
+                if replacement is not None:
+                    command = replacement
+                    self.room_continuation = (self.navigation.sequence, self.navigation.goal.action, source)
+                    self.room_replacement = True
+                    self._blocked_replacement = None
+                else:
+                    self._blocked_replacement = geometry
         published = self.publish(command)
         if published is not None:
             command = published
             self.navigation.speed = command.linear
+        if replacing:
+            return command, None, decision
         offered = None
         if (not self._closed.is_set() and not self.navigation.fault and view is not None
                 and (self._job is None or self.review_origin is not None and self.room_plan is not None)
                 and now >= self._next_request and view.grid_at != self._last_grid):
             self._last_grid = view.grid_at
-            if self.room_plan is not None and command.reason == 'path_unknown':
-                source, direction = self.room_plan
-                geometry = (self.navigation.goal.sequence, view.epoch, view.pose, view.grid, direction)
-                if geometry == self._blocked_replacement:
-                    return command, None, decision
-                action = self.navigation.replace_unknown_path(view, now, direction)
-                if action is not None:
-                    self.room_continuation = (self.navigation.sequence, action, source)
-                    self.room_replacement = True
-                else:
-                    self._blocked_replacement = geometry
-                return command, None, decision
             offered = self.navigation.request(view, now)
             held = None
             if self.room_plan is not None:
@@ -185,6 +212,25 @@ class NavigationRuntime(object):
             elif offered is not None:
                 offered = None
         return command, offered, decision
+
+    def _target_current(self, request, action, view, now):
+        if action not in request.choices or not self.navigation.anchor_current(request, view, now):
+            return False
+        if action.startswith('pivot_'):
+            return self.navigation._pivot_clear(view, request.anchor, action)
+        return (action in self.navigation.curvature and sweep_block(
+            view.grid, request.anchor, self.navigation.length, self.navigation.curvature[action], view.pose) is None)
+
+    def wait_stage(self, decision):
+        if self.navigation.goal is not None:
+            return 'starting_segment'
+        if self._job is not None:
+            return 'model_pending'
+        if decision is not None and not decision[2]:
+            return 'model_rejected'
+        if self.navigation.completed is not None:
+            return 'successor_unavailable'
+        return 'no_geometry'
 
     def _held_detour(self, request, direction, view, now):
         """Carry a safe turn through an occlusion while keeping the model's route."""
@@ -239,6 +285,15 @@ class NavigationRuntime(object):
                     and not sweep_block(view.grid, request.anchor, ROOM_OBSTACLE_LOOKAHEAD, self.navigation.curvature[away],
                                         occupied_only=True)):
                 return away
+            if view is not None and self.navigation.static_room:
+                missing = sweep_block(view.grid, request.anchor, ROOM_EXIT_COVERAGE_M,
+                                      self.navigation.curvature[direction], view.pose)
+                if missing is not None and missing[0] == 'unknown':
+                    for option in ('forward', away):
+                        if option in request.choices and sweep_block(
+                                view.grid, request.anchor, ROOM_EXIT_COVERAGE_M,
+                                self.navigation.curvature[option], view.pose) is None:
+                            return option
             return direction
         if away in request.choices and ('forward' not in request.choices or blocked and blocked[0] == 'occupied'):
             return away
