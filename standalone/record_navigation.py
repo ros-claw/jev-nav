@@ -32,6 +32,13 @@ def recording_topics(namespace, extra):
     return list(dict.fromkeys(topics)), cameras
 
 
+def bag_command(directory, topics):
+    # rosrun execs the writer so its exit is the writer's, including bag finalization.
+    return ['rosrun', 'rosbag', 'record', '--lz4', '--split', '--size', '64', '--buffsize', '32',
+            '--min-space', '{}M'.format(MIN_FREE // MIB), '--tcpnodelay',
+            '-O', str(directory / 'sensors')] + topics
+
+
 def bag_bytes(directory):
     size = 0
     for path in directory.glob('sensors_*.bag*'):
@@ -136,9 +143,7 @@ def main():
         signal.signal(event, interrupt)
     reason = None
     try:
-        bag = launch(directory, 'rosbag',
-                     ['rosbag', 'record', '--lz4', '--split', '--size=64', '--buffsize=32', '--tcpnodelay',
-                      '-O', str(directory / 'sensors')] + topics)
+        bag = launch(directory, 'rosbag', bag_command(directory, topics))
         for index, (source, rate, destination) in enumerate(cameras):
             samplers.append(launch(directory, 'camera-{}'.format(index),
                                    ['rosrun', 'topic_tools', 'throttle', 'messages', source, rate, destination]))

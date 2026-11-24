@@ -41,6 +41,12 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual(recorder.storage_problem(path, budget_bytes=10), "bag_budget_reached")
             self.assertEqual(len(list(path.iterdir())), 3)
 
+    def test_recorder_process_is_the_bag_writer_so_wait_includes_file_closure(self):
+        command = recorder.bag_command(Path("/runs/session"), ["/odom", "/cmd_vel"])
+        self.assertEqual(command[:3], ["rosrun", "rosbag", "record"])
+        self.assertEqual(command[command.index("-O") + 1], "/runs/session/sensors")
+        self.assertEqual(command[-2:], ["/odom", "/cmd_vel"])
+
 
 if __name__ == "__main__":
     unittest.main()
