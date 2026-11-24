@@ -18,6 +18,19 @@ class RecordingTest(unittest.TestCase):
         self.assertNotIn("/camera/depth/image_raw", topics)
         self.assertTrue(all(destination in topics for _, _, destination in cameras))
 
+    def test_compact_recording_keeps_motion_and_sparse_depth(self):
+        namespace = "limo_native_probe_000000000001"
+        topics, cameras = recorder.recording_topics(namespace, [])
+        required = {"/cmd_vel", "/odom", "/scan", "/limo_status", "/rosclaw_limo/command_watchdog",
+                    "/tf_static", "/rtabmap/mapGraph", "/camera/depth/camera_info",
+                    "/" + namespace + "/tf", "/" + namespace + "/recording/depth"}
+        self.assertTrue(required.issubset(topics))
+        self.assertFalse({"/imu", "/camera/color/camera_info", "/rtabmap/grid_map",
+                          "/" + namespace + "/recording/color"}.intersection(topics))
+        self.assertEqual(cameras, (("/camera/depth/image_raw", "0.5",
+                                    "/" + namespace + "/recording/depth"),))
+        self.assertIn("/imu", recorder.recording_topics(namespace, ["/imu"])[0])
+
     def test_budget_counts_open_and_finalized_segments_without_deleting_either(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)

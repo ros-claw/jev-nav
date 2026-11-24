@@ -20,14 +20,11 @@ DIRECTORY = Path(__file__).resolve().parent
 
 def recording_topics(namespace, extra):
     prefix = '/' + namespace
-    cameras = (
-        ('/camera/color/image_raw', '0.5', prefix + '/recording/color'),
-        ('/camera/depth/image_raw', '1.0', prefix + '/recording/depth'),
-    )
+    cameras = (('/camera/depth/image_raw', '0.5', prefix + '/recording/depth'),)
     topics = [
-        '/cmd_vel', '/odom', '/imu', '/scan', '/limo_status', '/rosclaw_limo/command_watchdog',
-        '/tf', '/tf_static', '/camera/color/camera_info', '/camera/depth/camera_info',
-        '/rtabmap/info', '/rtabmap/mapGraph', '/rtabmap/grid_map',
+        '/cmd_vel', '/odom', '/scan', '/limo_status', '/rosclaw_limo/command_watchdog',
+        '/tf', '/tf_static', '/camera/depth/camera_info',
+        '/rtabmap/info', '/rtabmap/mapGraph',
         prefix + '/tf',
         prefix + '/rolling_costmap/costmap/snapshot/fresh_grid',
         prefix + '/navigation_command_preview',
