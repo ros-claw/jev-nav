@@ -73,6 +73,20 @@ An optional qualified vision or scan-matching `nav_msgs/Odometry` feed can be pa
 
 To include long-term notes, add `--powercontext-url` and `--powercontext-scope` for the room's PowerContext service. The optional `POWERCONTEXT_TOKEN` is read from the process environment. The navigation worker requests scoped history asynchronously. The event writer records selected outcomes and proposes Experience entries for measured, map-anchored no-progress reports. Candidate review uses the source and candidate IDs in the logs. PowerContext availability does not gate local motion checks.
 
+## Recorded sessions
+
+Use the recording entry point with any standalone preview or supervised navigation arguments. The output filesystem needs room for the configured bag budget plus 256 MiB of reserve.
+
+```sh
+mkdir -p /path/to/session-recordings
+/usr/bin/python3 standalone/record_navigation.py --output-root /path/to/session-recordings -- \
+  --static-room --decisions --seconds 30
+```
+
+Each invocation prints a new recording directory. It contains `timeline.jsonl`, the `navigation.json` result with wheel motion and relay attribution for driving runs, and segmented LZ4 ROS bags. The bags record actual `/cmd_vel`, odometry, scan, camera calibration, transforms, the control grid and available RTAB-Map output. Color and depth are sampled at 0.5 Hz and 1 Hz to limit camera load and storage. Add `--extra-topic` before `--` to include a separate measured pose feed or other auxiliary evidence. The manifest stores a shared namespace, revision, wall and monotonic clock anchors, and both process exit statuses. The recorder retains completed segments and stops navigation if recording fails or exhausts its budget.
+
+Add `--map-database /path/to/room.db` before `--` on platforms whose wheel driver leaves global TF unpublished. This starts RTAB-Map on the navigation session's private odometry TF stream. Pass the matching `--map-id` and `--spatial-memory` after `--`.
+
 ## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;

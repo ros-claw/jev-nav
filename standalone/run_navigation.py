@@ -262,6 +262,7 @@ class RosNavigationInput(object):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--timeline', required=True)
+    parser.add_argument('--session-namespace', help=argparse.SUPPRESS)
     parser.add_argument('--seconds', type=float, help='end a recorded validation run after this many seconds')
     parser.add_argument('--decisions', action='store_true', help='enable Decisions API calls for checked candidates')
     output = parser.add_mutually_exclusive_group()
@@ -280,6 +281,9 @@ def parse_args(argv=None):
     parser.add_argument('--speed-mps', type=float)
     parser.add_argument('--max-travel-m', type=float, default=.40)
     args = parser.parse_args(argv)
+    if args.session_namespace is not None and not re.match(r'\Alimo_native_probe_[a-f0-9]{12}\Z',
+                                                          args.session_namespace):
+        parser.error('invalid session namespace')
     args.drive = args.drive_forward or args.drive_arcs
     if args.speed_mps is None:
         args.speed_mps = .014 if args.drive else .02
@@ -431,7 +435,7 @@ def main(argv=None):
         parser.error('build and source the repository version of limo_fresh_layer')
     if args.decisions:
         os.environ.setdefault('ROSCLAW_LIMO_DECISIONS_KEY_FILE', os.path.expanduser('~/rosclaw/jev/.env'))
-    namespace = 'limo_native_probe_' + uuid.uuid4().hex[:12]
+    namespace = args.session_namespace or 'limo_native_probe_' + uuid.uuid4().hex[:12]
     directory = os.path.dirname(os.path.abspath(__file__))
     costmap = '/' + namespace + '/rolling_costmap/costmap/snapshot/fresh_grid'
     preview = '/' + namespace + '/navigation_command_preview'
@@ -514,6 +518,14 @@ def main(argv=None):
             if not rospy.is_shutdown():
                 publisher.publish(packet)
 
+        def current_view():
+            value = source.view()
+            if room is not None:
+                value = room.view(value, _monotonic())
+            if spatial is not None:
+                value = spatial.apply(value, room, _monotonic())
+            return value
+
         choose = source.choose if args.decisions else lambda request, cancelled: None
         if args.drive:
             from live_monitors import ProcFdSerialBackend, SerialOwnershipMonitor
@@ -522,10 +534,12 @@ def main(argv=None):
 
             # Warm the live sensor pipeline before claiming the chassis. This
             # also keeps depth-nodelet initialization out of relay startup.
-            warm_until = _monotonic() + 5.
-            while not ready(source.view(), _monotonic()):
+            warm_until = _monotonic() + 30.
+            while not ready(current_view(), _monotonic()):
                 if rospy.is_shutdown() or _monotonic() >= warm_until:
-                    raise ActuationError('navigation_perception_not_ready')
+                    cause = (spatial.status if spatial is not None and spatial.status != 'registered'
+                             else 'perception_not_ready')
+                    raise ActuationError('navigation_' + cause)
                 time.sleep(.05)
             clock = RealClock()
             ros_guard = make_ros_monitor(clock, args.driver_pid,
@@ -564,14 +578,8 @@ def main(argv=None):
                 last_process_check = now
                 if any(child.poll() is not None for child in children):
                     raise ActuationError('navigation_perception_process_exited')
-            view = source.view()
+            view = current_view()
             now = _monotonic()
-            if room is not None:
-                view = room.view(view, now)
-                now = _monotonic()
-            if spatial is not None:
-                view = spatial.apply(view, room, now)
-                now = _monotonic()
             if progress is not None:
                 evidence = recorder.commands_after(actuator.caller, progress.command_at)
                 # Callbacks may have received a newer command after the frame was read.

@@ -1,12 +1,16 @@
 <launch>
   <arg name="database_path"/>
   <arg name="localization" default="false"/>
+  <arg name="tf_topic" default="/tf"/>
+  <remap from="/tf" to="$(arg tf_topic)"/>
   <!-- The fixed camera's unregistered depth remains on the separate hazard path. -->
   <include file="$(find rtabmap_ros)/launch/rtabmap.launch">
     <arg name="database_path" value="$(arg database_path)"/>
     <arg name="localization" value="$(arg localization)"/>
     <arg name="frame_id" value="base_link"/>
     <arg name="odom_topic" value="/odom"/>
+    <!-- The wheel driver and lidar use independent acquisition timestamps. -->
+    <arg name="approx_sync" value="true"/>
     <arg name="depth" value="false"/>
     <arg name="subscribe_rgb" value="false"/>
     <arg name="subscribe_scan" value="true"/>
