@@ -25,6 +25,7 @@ SPEED = .02
 MAX_RESPONSE_AGE = 8.
 HALF_LENGTH, HALF_WIDTH = .16, .11
 STOP_DISTANCE = .01
+ROOM_PATH_CLEAR_SEC = .40
 
 
 def _wrap(angle):
@@ -207,17 +208,37 @@ class Navigation(object):
         self.blocked_cell = self.blocked_action = None
         self.candidate_blocks = {}
         self._blocked_corner = None
+        self._recovering_unknown = False
+        self._path_clear_since = None
 
     def stop(self, reason):
         self.goal = self.successor = self.pending = self.completed = None
         self.paused = False
+        self._recovering_unknown = False
+        self._path_clear_since = None
         self.speed = self.steer = 0.
         return Command(0., 0., 'stop', reason)
 
     def _pause(self, reason):
         self.speed = self.steer = 0.
         self.paused = True
+        if self.static_room:
+            self._recovering_unknown = self._recovering_unknown or reason == 'path_unknown'
+            self._path_clear_since = None
         return Command(0., 0., 'stop', reason)
+
+    def _path_reacquiring(self, view):
+        if not self._recovering_unknown:
+            return False
+        # Rechecking the same frame at the control rate adds no evidence.
+        observed_at = min(view.scan_at, view.depth_at)
+        if self._path_clear_since is None:
+            self._path_clear_since = observed_at
+        if observed_at - self._path_clear_since < ROOM_PATH_CLEAR_SEC:
+            return True
+        self._recovering_unknown = False
+        self._path_clear_since = None
+        return False
 
     def request(self, view, now):
         self.candidate_blocks = {}
@@ -415,6 +436,8 @@ class Navigation(object):
         self.epoch = view.epoch
         if self.goal is None:
             self.paused = False
+            self._recovering_unknown = False
+            self._path_clear_since = None
             return Command(0., 0., 'stop', 'waiting_for_goal')
         if self.goal.action in PIVOTS:
             return self._pivot(view, elapsed)
@@ -472,6 +495,8 @@ class Navigation(object):
             if self.blocked_cell[0] == 'occupied':
                 return self.stop('path_occupied')
             return self._pause('path_unknown')
+        if self._path_reacquiring(view):
+            return Command(0., 0., 'stop', 'path_reacquiring')
         self.paused = False
         speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))
         self.speed = min(speed, self.speed + .04 * min(.05, elapsed))
@@ -499,5 +524,7 @@ class Navigation(object):
             if self.blocked_cell[0] == 'occupied':
                 return self.stop('path_occupied')
             return self._pause('path_unknown')
+        if self._path_reacquiring(view):
+            return Command(0., 0., 'stop', 'path_reacquiring')
         self.paused = False
         return Command(0., sign * min(.05, remaining * 1.5), self.goal.action, 'tracking')

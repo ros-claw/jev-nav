@@ -4,7 +4,7 @@ from __future__ import division
 import math
 import threading
 
-from navigation import (ROOM_OBSTACLE_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
+from navigation import (ROOM_OBSTACLE_LOOKAHEAD, ROOM_TRACK_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
                         _relative, observation_deadline, ready, sweep_block)
 
 
@@ -13,6 +13,8 @@ ROOM_ROUTE_REVIEW_SEC = 45.
 ROOM_PREDICTION_PERIOD = .25
 ROOM_PREDICTION_BUDGET = .055
 ROOM_DETOUR_COOLDOWN = 1.
+ROOM_DETOUR_HOLD_M = .24
+ROOM_DETOUR_HOLD_SEC = 20.
 
 
 def offered_direction(request, direction):
@@ -38,6 +40,8 @@ class NavigationRuntime(object):
         self._predict_after = 0.
         self._prediction_grid = None
         self.early_detour = None
+        self._detour = None
+        self.detour_continuation = False
         self._settling = None
         self._worker = threading.Thread(target=self._work, name='navigation-decisions')
         self._worker.daemon = True
@@ -63,6 +67,7 @@ class NavigationRuntime(object):
         self.room_continuation = None
         self.room_replacement = False
         self.early_detour = None
+        self.detour_continuation = False
         if result is not None:
             request, choice = result
             current_request = request is self.navigation.pending or self.review_origin is not None
@@ -108,7 +113,9 @@ class NavigationRuntime(object):
                     command, block = detour
                     self.early_detour = previous, block
                     self._predict_after = now + ROOM_DETOUR_COOLDOWN
-        if command.reason != 'path_unknown':
+                    self._detour = ((command.action, self.room_plan[1], view.pose, now)
+                                    if command.linear > 0. and command.action in ('left', 'right') else None)
+        if command.reason not in ('path_unknown', 'path_reacquiring'):
             self._blocked_replacement = None
         settled = command.reason == 'waiting_for_goal' and self.room_plan is not None and self._settled(view, now)
         if command.reason != 'waiting_for_goal' or self.room_plan is None:
@@ -117,6 +124,8 @@ class NavigationRuntime(object):
             self.room_plan = None
         elif command.reason == 'path_tracking_lost' and self.room_plan is not None:
             self._last_grid = None
+        if self.room_plan is None:
+            self._detour = None
         published = self.publish(command)
         if published is not None:
             command = published
@@ -139,17 +148,22 @@ class NavigationRuntime(object):
                     self._blocked_replacement = geometry
                 return command, None, decision
             offered = self.navigation.request(view, now)
+            held = None
             if self.room_plan is not None:
                 source, direction = self.room_plan
-                pivot = self.navigation.prepare_pivot(view, now, direction, offered, allow_wide=settled)
-                if pivot is not None:
-                    self.room_continuation = (self.navigation.sequence, pivot, source)
-                    offered = None
+                if offered is not None:
+                    held = self._held_detour(offered, direction, view, now)
+                if held is None:
+                    pivot = self.navigation.prepare_pivot(view, now, direction, offered, allow_wide=settled)
+                    if pivot is not None:
+                        self.room_continuation = (self.navigation.sequence, pivot, source)
+                        offered = None
             if offered is not None and self.room_plan is not None:
                 source, direction = self.room_plan
-                action = self._room_action(offered, direction, view)
+                action = held or self._room_action(offered, direction, view)
                 if action and self.navigation.accept(offered, action, view, now):
                     self.room_continuation = (offered.sequence, action, source)
+                    self.detour_continuation = held is not None
                     if self._job is None and now >= self._review_after:
                         self.review_origin = source
                         self._review_after = now + ROOM_ROUTE_REVIEW_SEC
@@ -163,6 +177,20 @@ class NavigationRuntime(object):
             elif offered is not None:
                 offered = None
         return command, offered, decision
+
+    def _held_detour(self, request, direction, view, now):
+        """Carry a safe turn through an occlusion while keeping the model's route."""
+        if self._detour is None:
+            return None
+        action, model_direction, start, started_at = self._detour
+        if (direction != model_direction or not 0 <= now - started_at < ROOM_DETOUR_HOLD_SEC
+                or math.hypot(view.pose.x - start.x, view.pose.y - start.y) >= ROOM_DETOUR_HOLD_M
+                or action not in request.choices
+                or sweep_block(view.grid, request.anchor, ROOM_TRACK_LOOKAHEAD,
+                               self.navigation.curvature[action], view.pose, occupied_only=True)):
+            self._detour = None
+            return None
+        return action
 
     def _settled(self, view, now):
         if self._settling is not None:

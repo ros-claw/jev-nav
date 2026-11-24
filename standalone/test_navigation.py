@@ -496,6 +496,24 @@ def test_room_rechecks_failed_alternatives_after_geometry_changes(monkeypatch):
         assert runtime.close()
 
 
+def test_room_waits_for_sustained_fresh_geometry_before_resuming_the_same_path():
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    obscured = grid({(.21, 0.): -1})
+    assert navigation.step(view(1.05, cells=obscured), 1.05).reason == 'path_unknown'
+    clear_frame = view(1.10)
+    for now in (1.10, 1.25):
+        command = navigation.step(clear_frame, now)
+        assert command.reason == 'path_reacquiring' and command.linear == command.angular == 0.
+    assert navigation.step(view(1.30, cells=obscured), 1.30).reason == 'path_unknown'
+    for now in (1.35, 1.48, 1.60, 1.70):
+        command = navigation.step(view(now), now)
+        assert command.reason == 'path_reacquiring' and command.linear == command.angular == 0.
+    assert navigation.step(view(1.78), 1.78).linear > 0.
+    blocked = navigation.step(view(1.82, cells=grid({(.21, 0.): 100})), 1.82)
+    assert blocked.reason == 'path_occupied' and blocked.linear == blocked.angular == 0.
+
+
 def test_room_offers_safe_pivots_to_the_model_when_forward_paths_end_at_a_box():
     navigation = Navigation(static_room=True)
     cells = grid({(.25, .015): 100})
@@ -656,6 +674,31 @@ def test_room_preempts_a_new_obstacle_before_the_immediate_sweep_is_blocked(scen
             else:
                 assert command.action == 'forward' and command.linear > 0.
                 assert navigation.successor.action == successor
+    finally:
+        assert runtime.close()
+
+
+@pytest.mark.parametrize('elapsed, marks, expected', [(2.7, {}, 'right'), (21., {}, 'left'),
+                                                     (2.7, {(.51, -.22): 100}, 'left')])
+def test_room_keeps_a_checked_detour_through_a_brief_loss_of_the_obstacle(elapsed, marks, expected):
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    pose = Pose(.06, 0., 0.)
+    navigation.step(view(1.05, pose), 1.05)
+    select(navigation, 'forward', 1.05, view(1.05, pose))
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    try:
+        command, _, _ = runtime.cycle(view(1.10, pose, cells=grid({(.45, .095): 100})), 1.10)
+        assert command.action == 'right' and command.linear > 0.
+        later = 1.10 + elapsed
+        on_detour = arc_pose(pose, .06, -1.35)
+        command, _, _ = runtime.cycle(view(later, on_detour, grid(marks)), later)
+        assert command.linear > 0.
+        assert (navigation.successor or navigation.goal).action == expected
+        assert runtime.detour_continuation == (expected == 'right')
+        assert runtime.room_plan == (1, 'left')
     finally:
         assert runtime.close()
 

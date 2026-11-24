@@ -531,10 +531,13 @@ def main(argv=None):
                                                   'status': 'accepted' if decision[2] else 'rejected'})
             if runtime.room_continuation is not None:
                 segment, action, origin_decision = runtime.room_continuation
+                stage = 'local_continuation'
+                if runtime.room_replacement:
+                    stage = 'local_replacement'
+                elif runtime.detour_continuation:
+                    stage = 'detour_continuation'
                 timeline.record('decision', now, {'decision_id': segment, 'selected_action': action,
-                                                  'scene_id': origin_decision,
-                                                  'stage': 'local_replacement' if runtime.room_replacement
-                                                  else 'local_continuation'})
+                                                  'scene_id': origin_decision, 'stage': stage})
             if now - last_block_report >= 1.:
                 last_block_report = now
                 blocks = dict(runtime.navigation.candidate_blocks)
