@@ -1113,6 +1113,7 @@ def test_a_mismatched_old_room_view_leaves_current_local_perception_ready():
 
     class Unregistered(object):
         attempts = 0
+        hazard_discs = ()
 
         def registered_cells(self, view, scan, now, ros_now):
             self.attempts += 1
@@ -1120,6 +1121,7 @@ def test_a_mismatched_old_room_view_leaves_current_local_perception_ready():
 
     source = RosNavigationInput.__new__(RosNavigationInput)
     source.revisit, source.revisit_scan = Unregistered(), None
+    source.revisit_hazards = None
     source.latest_scan = object()
     source.rospy = type('Ros', (), {'Time': type('Time', (), {
         'now': staticmethod(lambda: type('Stamp', (), {'to_sec': lambda self: 100.})()),

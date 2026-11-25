@@ -158,7 +158,7 @@ class SpatialMemory(object):
             return view._replace(ready=False)
         grid = view.grid
         if continuous:
-            return view._replace(grid=grid._replace(hazard_discs=discs))
+            return view._replace(grid=grid._replace(hazard_discs=grid.hazard_discs + discs))
         cells = None
         for x, y, radius in discs:
             col0 = max(0, int(math.floor((x - radius - grid.x) / grid.resolution)))

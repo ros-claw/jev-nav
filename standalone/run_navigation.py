@@ -76,6 +76,7 @@ class RosNavigationInput(object):
         self.revisit = None
         self.revisit_scan = None
         self.revisit_registered = 0
+        self.revisit_hazards = None
         self.last_context = None
         self.grid_updates = collections.Counter()
         self.decision_errors = collections.Counter()
@@ -233,15 +234,29 @@ class RosNavigationInput(object):
                     Pose(*odom['pose']), grid, ready, evidence)
 
     def register_revisit(self, room, view, now):
-        scan = self.latest_scan
-        if self.revisit is None or not ready(view, now) or scan is None or scan is self.revisit_scan:
+        if view is None:
             return view
-        self.revisit_scan = scan
-        cells = self.revisit.registered_cells(view, scan, now, self.rospy.Time.now().to_sec())
-        if cells:
-            self.revisit_registered = room.retain_revisit(view, cells, now)
-            if self.revisit_registered:
-                self.revisit = None
+        revisit, scan = self.revisit, self.latest_scan
+        if revisit is not None:
+            if ready(view, now) and scan is not None and scan is not self.revisit_scan:
+                self.revisit_scan = scan
+                cells = revisit.registered_cells(view, scan, now, self.rospy.Time.now().to_sec())
+                if cells:
+                    self.revisit_registered = room.retain_revisit(view, cells, now)
+                    if self.revisit_registered:
+                        self.revisit = None
+                        if revisit.hazard_discs:
+                            self.revisit_hazards = view.epoch, revisit.hazard_discs
+            # Start this continuation only after the old obstacles and its
+            # observed clearance have both been tied to the current scene.
+            if self.revisit is not None and revisit.hazard_discs:
+                return view._replace(ready=False)
+        if self.revisit_hazards is not None:
+            epoch, discs = self.revisit_hazards
+            if epoch != view.epoch:
+                self.revisit_hazards = None
+            else:
+                view = view._replace(grid=view.grid._replace(hazard_discs=view.grid.hazard_discs + discs))
         return view
 
     def choose(self, request, cancelled):
@@ -593,11 +608,14 @@ def main(argv=None):
         def current_view():
             value = source.view()
             if room is not None:
-                if source.revisit is not None:
+                if source.revisit is not None or source.revisit_hazards is not None:
+                    previous = source.revisit_registered
                     value = source.register_revisit(room, value, _monotonic())
-                    if source.revisit_registered:
+                    if source.revisit_registered != previous:
                         timeline.record('run', _monotonic(), {'stage': 'room_revisit', 'status': 'registered',
-                                                              'rear_revisit_cells': source.revisit_registered})
+                                                              'rear_revisit_cells': source.revisit_registered,
+                                                              'retained_hazards': len(source.revisit_hazards[1])
+                                                              if source.revisit_hazards is not None else 0})
                 value = room.view(value, _monotonic())
             if spatial is not None:
                 value = spatial.apply(value, room, _monotonic())

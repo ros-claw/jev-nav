@@ -12,6 +12,8 @@ from trail_recovery import recorded_anchor_matches, recorded_scan_matches
 
 MAX_HISTORY_SEC = RoomPerception.REVISIT_HISTORY_SEC
 MAX_PIVOT_HISTORY_SEC = 600.
+MAX_HAZARD_DISTANCE_M = 1.
+MAX_REVISIT_HAZARDS = 1024
 SECTORS = (-65., -45., -30., -12., 8., 30., 55., 70.)
 
 
@@ -61,6 +63,7 @@ class RoomRevisit(object):
         self.pose = Pose(*state['pose'])
         self.at, self.resolution = state['recorded_stop'], state['resolution']
         self.cells = [tuple(row) for row in state['cells']]
+        self.hazard_discs = tuple(tuple(row) for row in state.get('hazard_discs', ()))
         self.closest = state['closest_rays']
         self.sectors = state['sectors']
         pid = state['driver_pid']
@@ -74,6 +77,11 @@ class RoomRevisit(object):
                 or any(not all(_finite(v) for v in (x, y, at)) or not 0 <= self.at - at < MAX_HISTORY_SEC
                        or math.hypot(x - self.pose.x, y - self.pose.y) > .44 for x, y, at in self.cells)):
             raise ValueError('invalid room revisit evidence')
+        if len(self.hazard_discs) > MAX_REVISIT_HAZARDS or any(
+                not all(_finite(v) for v in (x, y, radius)) or not 0. < radius <= .20
+                or math.hypot(x - self.pose.x, y - self.pose.y) > MAX_HAZARD_DISTANCE_M
+                for x, y, radius in self.hazard_discs):
+            raise ValueError('invalid room revisit obstacles')
         if driver_generation(pid) != state['driver_generation']:
             raise ValueError('room revisit driver generation changed')
         self.body_cells = []
