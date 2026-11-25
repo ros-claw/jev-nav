@@ -980,3 +980,43 @@ def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_se
     packet.depth_fresh, packet.depth_stamp = True, stamp(100.90)
     source._grid(packet)
     assert source.latest_grid is None and source.grid_updates['grid_regression'] == 1
+
+
+def test_room_model_can_select_the_exact_checked_shallow_pivot(monkeypatch):
+    tracker = Navigation(static_room=True)
+    monkeypatch.setattr(tracker, '_pivot_clear', lambda local, anchor, action, turn=None:
+                        action == 'pivot_left' and turn == .25)
+    local = view(1., cells=grid({(.25, .015): 100}))
+    request = tracker.request(local, 1.)
+    assert request.choices == ('pivot_left', 'stop')
+    assert dict(request.pivot_turns) == {'pivot_left': .25}
+    assert tracker.accept(request, 'pivot_left', local, 1.)
+    assert tracker.goal.turn == .25
+
+
+def test_room_offers_a_checked_pivot_over_arcs_that_lead_to_a_measured_obstacle(monkeypatch):
+    tracker = Navigation(static_room=True)
+    monkeypatch.setattr(tracker, '_pivot_clear', lambda local, anchor, action, turn=None:
+                        action == 'pivot_left' and turn == .25)
+    local = view(1., cells=grid({(.40, .015): 100}))
+    request = tracker.request(local, 1.)
+    assert request.choices == ('pivot_left', 'stop')
+    assert request.pivot_turns == (('pivot_left', .25),)
+
+
+def test_room_observation_pivot_rechecks_only_the_rotation_and_does_not_repeat_in_place(monkeypatch):
+    import navigation as tracker
+
+    nav = Navigation(static_room=True)
+    monkeypatch.setattr(nav, '_pivot_clear', lambda *args: False)
+    monkeypatch.setattr(tracker, 'rotation_block',
+                        lambda cells, origin, angle, body=None: None if angle == .25 else ('unknown', 0., 0.))
+    local = view(1., cells=grid({(.35, -.05): 100, (.30, .30): -1}))
+    request = nav.request(local, 1.)
+    assert request.observation_turns == ('pivot_left',)
+    assert request.choices == ('pivot_left', 'stop')
+    assert nav.accept(request, 'pivot_left', local, 1.)
+    assert nav.goal.turn == .25
+    nav.stop('ended')
+    again = nav.request(view(1.1, cells=local.grid), 1.1)
+    assert again is None or not again.observation_turns

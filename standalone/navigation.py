@@ -9,7 +9,8 @@ Pose = namedtuple('Pose', 'x y yaw')
 Grid = namedtuple('Grid', 'x y resolution width height cells')
 View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready depth_evidence')
 View.__new__.__defaults__ = (None,)
-Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks')
+Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks pivot_turns observation_turns')
+Request.__new__.__defaults__ = ((), ())
 Command = namedtuple('Command', 'linear angular action reason')
 Segment = namedtuple('Segment', 'sequence action origin turn')
 
@@ -22,6 +23,8 @@ CURVATURE = {'forward': 0., 'left': .8, 'right': -.8}
 ROOM_CURVATURE = {'forward': 0., 'left': 1.35, 'right': -1.35}
 PIVOTS = {'pivot_left': .70, 'pivot_right': -.70}
 ROOM_CORNER_TURNS = (.70, 1.40, 2.10, 2.45)
+ROOM_SHALLOW_TURNS = (.45, .25)
+ROOM_OBSERVATION_TURN = .25
 SPEED = .02
 MAX_RESPONSE_AGE = 8.
 HALF_LENGTH, HALF_WIDTH = .16, .11
@@ -192,6 +195,7 @@ class Navigation(object):
     """Single-writer task state. Feed immutable observations and finished choices."""
 
     def __init__(self, forward_only=False, speed=SPEED, successor_lead=None, static_room=False):
+        self.last_observation_turn = None
         if not 0. < speed <= SPEED:
             raise ValueError('invalid navigation speed')
         self.forward_only, self.max_speed = forward_only, speed
@@ -272,17 +276,46 @@ class Navigation(object):
                 choices.append(action)
             else:
                 self.candidate_blocks[action] = block
-        if (not choices and self.static_room and self.goal is None
-                and any(block[0] == 'occupied' for block in self.candidate_blocks.values())):
-            choices = [action for action in ('pivot_left', 'pivot_right') if self._pivot_clear(view, anchor, action)]
+        pivot_turns, observation_turns = (), ()
+        if self.static_room and self.goal is None:
+            pivot_turns, observation_turns = self._room_turns(view, anchor, choices)
+            if pivot_turns:
+                choices = [action for action, _ in pivot_turns]
         if not choices:
             return None
         self.sequence += 1
         blocks = tuple((action,) + self.candidate_blocks[action] for action in actions
                        if action in self.candidate_blocks)
         self.pending = Request(self.sequence, now, view.epoch, anchor, tuple(choices) + ('stop',), predecessor,
-                               blocks)
+                               blocks, pivot_turns, observation_turns)
         return self.pending
+
+    def _room_turns(self, view, anchor, choices):
+        obstacle = sweep_block(view.grid, anchor, .42, 0., occupied_only=True)
+        if obstacle is None or any(sweep_block(view.grid, anchor, .31, self.curvature[action],
+                                               view.pose, occupied_only=True) is None for action in choices):
+            return (), ()
+        pivots = []
+        for action in ('pivot_left', 'pivot_right'):
+            for magnitude in (.70,) + ROOM_SHALLOW_TURNS:
+                angle = math.copysign(magnitude, PIVOTS[action])
+                if self._pivot_clear(view, anchor, action, angle):
+                    pivots.append((action, angle))
+                    break
+        if pivots:
+            return tuple(pivots), ()
+        last = self.last_observation_turn
+        if (-1 not in view.grid.cells
+                or last is not None and math.hypot(anchor.x - last.x, anchor.y - last.y) < .12):
+            return (), ()
+        side = _relative(anchor, Pose(obstacle[1], obstacle[2], anchor.yaw)).y
+        directions = ('pivot_left',) if side < -.025 else ('pivot_right',) if side > .025 else (
+            'pivot_left', 'pivot_right')
+        for action in directions:
+            angle = math.copysign(ROOM_OBSERVATION_TURN, PIVOTS[action])
+            if rotation_block(view.grid, anchor, angle, view.pose) is None:
+                pivots.append((action, angle))
+        return tuple(pivots), tuple(action for action, _ in pivots)
 
     def prepare_pivot(self, view, now, direction, request=None, allow_wide=False):
         if (not self.static_room or self.fault or self.paused or self.successor is not None
@@ -303,7 +336,10 @@ class Navigation(object):
                   if allow_wide and self.goal is None and request is None else None)
         if corner is not None and corner == self._blocked_corner:
             return None
-        for angle in ROOM_CORNER_TURNS if corner is not None else (.70,):
+        turns = ROOM_CORNER_TURNS if corner is not None else (.70,)
+        if self.goal is None:
+            turns += ROOM_SHALLOW_TURNS
+        for angle in turns:
             for option in (direction, away):
                 action = 'pivot_' + option
                 turn = math.copysign(angle, PIVOTS[action])
@@ -405,6 +441,12 @@ class Navigation(object):
                 and sweep_block(view.grid, turned, .31, 0., occupied_only=True) is None
                 and rotation_block(view.grid, anchor, angle, view.pose) is None)
 
+    def pivot_request_clear(self, request, action, view):
+        angle = dict(request.pivot_turns).get(action, PIVOTS[action])
+        if action in request.observation_turns:
+            return rotation_block(view.grid, request.anchor, angle, view.pose) is None
+        return self._pivot_clear(view, request.anchor, action, angle)
+
     def anchor_current(self, request, view, now):
         if not ready(view, now) or request.epoch != view.epoch:
             return False
@@ -426,18 +468,21 @@ class Navigation(object):
         # An early response remains tied to the segment still being followed.
         if not self.anchor_current(request, view, now):
             return False
+        turn = dict(request.pivot_turns).get(choice, PIVOTS.get(choice))
         if choice in PIVOTS:
             offset = _relative(request.anchor, view.pose)
             if (math.hypot(offset.x, offset.y) > .015 or abs(offset.yaw) > .05
-                    or not self._pivot_clear(view, request.anchor, choice)):
+                    or not self.pivot_request_clear(request, choice, view)):
                 return False
         elif not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
             return False
-        segment = Segment(request.sequence, choice, request.anchor, PIVOTS.get(choice))
+        segment = Segment(request.sequence, choice, request.anchor, turn)
         if active_predecessor:
             self.successor = segment
         elif self.goal is None and request.predecessor in (None, self.completed):
             self.goal = segment
+            if choice in request.observation_turns:
+                self.last_observation_turn = request.anchor
         else:
             return False
         return True

@@ -87,6 +87,8 @@ Each invocation prints a new recording directory. It contains `timeline.jsonl`, 
 
 Add `--map-database /path/to/room.db` before `--` on platforms whose wheel driver leaves global TF unpublished. This starts RTAB-Map on the navigation session's private odometry TF stream. Pass the matching `--map-id` and `--spatial-memory` after `--`.
 
+For an attended restart in the same static room, `--room-revisit` accepts a recorded blind-side observation mask with its stop pose, laser reference and driver generation. It is registered against live odometry and laser observations before movement. Current occupancy invalidates the relevant cell. The mask retires after 90 seconds or 30 cm of travel. Near a measured obstacle, a stationary observation turn may be offered if its complete rotation is clear. The controller checks translation after the turn.
+
 ## Bounded forward trial
 
 This is a diagnostic implementation that communicates with ROS 1 directly;

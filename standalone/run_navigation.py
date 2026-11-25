@@ -53,6 +53,8 @@ class RosNavigationInput(object):
         self.latest_independent = None
         self.spatial = None
         self.history = None
+        self.revisit = None
+        self.revisit_registered = 0
         self.last_context = None
         self.grid_updates = collections.Counter()
         self.decision_errors = collections.Counter()
@@ -197,6 +199,17 @@ class RosNavigationInput(object):
         return View(times[0], times[1], times[2], odom['stamp'], status['stamp'], epoch,
                     Pose(*odom['pose']), grid, ready, evidence)
 
+    def register_revisit(self, room, view, now):
+        if self.revisit is None or view is None:
+            return view
+        cells = self.revisit.registered_cells(view, self.latest_scan, now, self.rospy.Time.now().to_sec())
+        if cells:
+            self.revisit_registered = room.retain_revisit(view, cells, now)
+            if self.revisit_registered:
+                self.revisit = None
+                return view
+        return view._replace(ready=False)
+
     def choose(self, request, cancelled):
         from explore import WORKER, base_state, run_decision_process, sample_clocks, source_time
         from live_trial_adapter import CvJpegEncoder
@@ -226,6 +239,10 @@ class RosNavigationInput(object):
         laser = {'locally_checked_segment_length_m': ROOM_LENGTH if self.static_room else LENGTH,
                  'planning_successor': request.predecessor is not None,
                  'blocked_segments': {action: reason for action, reason, _, _ in request.blocks}}
+        if request.pivot_turns:
+            laser['checked_pivot_angles_rad'] = dict(request.pivot_turns)
+        if request.observation_turns:
+            laser['observation_only_pivots'] = list(request.observation_turns)
         if scan is not None:
             laser['forward_view'] = scan
         evidence = {'image_b64': base64.b64encode(jpeg).decode('ascii'), 'captured_at': stamp,
@@ -272,6 +289,7 @@ def parse_args(argv=None):
     parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
     parser.add_argument('--independent-odom-topic', help='qualified visual or scan odometry for physical progress')
     parser.add_argument('--spatial-memory', help='atomic per-map spatial-memory JSON file')
+    parser.add_argument('--room-revisit', help='registered observation record for a supervised room restart')
     parser.add_argument('--map-id', help='stable identifier of the running RTAB-Map database')
     parser.add_argument('--powercontext-url', help='PowerContext service origin')
     parser.add_argument('--powercontext-scope', help='existing PowerContext room scope ID')
@@ -293,6 +311,8 @@ def parse_args(argv=None):
         parser.error('invalid supervised motion bounds')
     if args.static_room and args.drive_forward:
         parser.error('static room exploration uses the arc or private preview output')
+    if args.room_revisit and not (args.static_room and args.decisions):
+        parser.error('a room revisit requires the static room and live Decisions inputs')
     if bool(args.spatial_memory) != bool(args.map_id) or args.map_id and (
             not args.static_room or not re.match(r'\A[A-Za-z0-9_.-]{1,64}\Z', args.map_id)):
         parser.error('--spatial-memory and a stable --map-id require --static-room')
@@ -475,6 +495,12 @@ def main(argv=None):
             raise RuntimeError('ROS wall time required for live acquisition')
         source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front, args.static_room,
                                     args.independent_odom_topic)
+        if args.room_revisit:
+            from room_revisit import RoomRevisit
+            try:
+                source.revisit = RoomRevisit.load(args.room_revisit)
+            except (IOError, OSError, ValueError, AttributeError, KeyError, IndexError, TypeError):
+                raise ActuationError('room_revisit_evidence_invalid')
         if args.spatial_memory:
             from spatial_runtime import SpatialRuntime
             spatial = source.spatial = SpatialRuntime(rospy, args.spatial_memory, args.map_id)
@@ -521,6 +547,11 @@ def main(argv=None):
         def current_view():
             value = source.view()
             if room is not None:
+                if source.revisit is not None:
+                    value = source.register_revisit(room, value, _monotonic())
+                    if source.revisit_registered:
+                        timeline.record('run', _monotonic(), {'stage': 'room_revisit', 'status': 'registered',
+                                                              'rear_revisit_cells': source.revisit_registered})
                 value = room.view(value, _monotonic())
             if spatial is not None:
                 value = spatial.apply(value, room, _monotonic())
@@ -537,7 +568,8 @@ def main(argv=None):
             warm_until = _monotonic() + 30.
             while not ready(current_view(), _monotonic()):
                 if rospy.is_shutdown() or _monotonic() >= warm_until:
-                    cause = (spatial.status if spatial is not None and spatial.status != 'registered'
+                    cause = ('room_revisit_unregistered' if source.revisit is not None else
+                             spatial.status if spatial is not None and spatial.status != 'registered'
                              else 'perception_not_ready')
                     raise ActuationError('navigation_' + cause)
                 time.sleep(.05)
@@ -632,6 +664,8 @@ def main(argv=None):
             if room is not None:
                 fields['rear_memory_cells'] = room.reused_cells
                 fields['rear_memory_age_sec'] = room.oldest_age
+                if room.revisited_cells:
+                    fields['rear_revisit_cells'] = room.revisited_cells
             if command.action != 'stop':
                 fields['decision_id'] = runtime.navigation.goal.sequence
                 if command.action in PIVOTS:
@@ -779,6 +813,7 @@ def main(argv=None):
               'early_detours': early_detours,
               'progress': progress.diagnostics if progress is not None else {},
               'remembered_depth_hazards': sum(1 for _ in room.confirmed_depth()) if room is not None else 0,
+              'room_revisit_cells': source.revisit_registered if source is not None else 0,
               'powercontext': dict(history.counters) if history is not None else None,
               'spatial_memory': ({'map_id': args.map_id, 'status': spatial.status,
                                   'hazards': len(spatial.memory.hazards), 'visits': len(spatial.memory.visits),

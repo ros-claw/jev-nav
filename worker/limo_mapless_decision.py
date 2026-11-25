@@ -68,6 +68,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         circulate = False
         has_history = False
         context = {"laser": observation["laser"], "base": observation["base"]}
+        descriptions = DESCRIPTIONS
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
         if "navigation_choices" in observation:
             available = observation["navigation_choices"]
@@ -106,6 +107,14 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         "are relative to the laser and hit bearings are relative to the robot base. "
                         "Blocked segments give the local planner's occupied or unknown reason. Missing "
                         "returns, gaps and zero rear coverage give no clearance evidence.")
+                observing = observation["laser"].get("observation_only_pivots")
+                if isinstance(observing, list) and any(action in observing for action in ("pivot_left", "pivot_right")):
+                    descriptions = dict(DESCRIPTIONS)
+                    for action, side in (("pivot_left", "left"), ("pivot_right", "right")):
+                        if action in observing:
+                            descriptions[action] = "Turn {} in place along the checked rotation to gather a new view".format(side)
+                    task += (" An observation-only pivot gathers a new view when the route ahead is blocked. "
+                             "The local planner has checked the rotation and will check translation after turning.")
                 targets = observation.get("exploration_targets", [])
                 if not isinstance(targets, list) or len(targets) > len(ROOM_STARTS) - 1:
                     return rejected
@@ -197,7 +206,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         "is zero the rear is unknown. Missing returns and nulls are unknown. "
                         "The local controller checks obstacles independently."
                     ),
-                    "choices": [{"value": value, "description": DESCRIPTIONS[mapped.get(value, value)]}
+                    "choices": [{"value": value, "description": descriptions[mapped.get(value, value)]}
                                 for value in choices],
                 }
             ],

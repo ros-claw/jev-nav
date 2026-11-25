@@ -32,6 +32,21 @@ def test_recent_obstacle_and_sensor_loss_veto_historical_clearance():
     assert memory.view(new_epoch, 5.).grid.cells[5] == -1
 
 
+def test_registered_revisit_only_fills_blind_unknown_and_live_hits_invalidate_it():
+    memory = RoomPerception()
+    unknown = [-1] * 12
+    initial = observation(120., unknown, x=.15)
+    assert memory.retain_revisit(initial, [(.025, 0., 25.), (.325, 0., 26.)], 120.) == 2
+    projected = memory.view(initial, 120.)
+    assert projected.grid.cells[5] == 0 and projected.grid.cells[11] == -1
+    assert memory.revisited_cells == 1 and memory.oldest_age == 95.
+    occupied = list(unknown)
+    occupied[5] = 100
+    assert memory.view(observation(121., occupied, x=.15), 121.).grid.cells[5] == 100
+    assert memory.view(observation(125., unknown, x=.15), 125.).grid.cells[5] == -1
+    assert memory.view(observation(126., unknown, x=.15, epoch=1), 126.).grid.cells[5] == -1
+
+
 def test_isolated_occupied_cell_expires_to_unknown_instead_of_restoring_older_free_space():
     memory = RoomPerception()
     memory.view(observation(1., [0] * 12, x=0.), 1.)

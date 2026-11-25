@@ -20,6 +20,8 @@ class RoomPerception(object):
     REAR_LIMIT = HALF_LENGTH + .12
     SIDE_LIMIT = HALF_WIDTH + .12
     LIDAR_X = .105
+    REVISIT_DURATION_SEC = 90.
+    REVISIT_TRAVEL_M = .30
 
     def __init__(self):
         self.epoch = self.lattice = self.last_grid = None
@@ -32,6 +34,25 @@ class RoomPerception(object):
         self.pruned_at = -1.
         self.oldest_age = None
         self.reused_cells = 0
+        self.revisited_cells = 0
+        self.revisit = {}
+        self.revisit_until = self.revisit_pose = None
+
+    def retain_revisit(self, view, observations, now):
+        self.view(view, now)
+        if self.lattice is None or not ready(view, now):
+            return 0
+        x, y, resolution = self.lattice
+        for px, py, observed in observations:
+            col = int(round((px - x) / resolution - .5))
+            row = int(round((py - y) / resolution - .5))
+            if (abs(px - (x + (col + .5) * resolution)) < .002
+                    and abs(py - (y + (row + .5) * resolution)) < .002 and observed < now):
+                if self.cells.get((col, row), (0,))[0] == 0 and (col, row) not in self.depth_hazards:
+                    self.revisit[col, row] = observed
+        self.revisit_pose = view.pose
+        self.revisit_until = now + self.REVISIT_DURATION_SEC
+        return len(self.revisit)
 
     def confirmed_depth(self, only_changed=False):
         if self.lattice is not None:
@@ -87,6 +108,7 @@ class RoomPerception(object):
     def view(self, view, now):
         self.oldest_age = None
         self.reused_cells = 0
+        self.revisited_cells = 0
         if not ready(view, now):
             return view
         grid, pose = view.grid, view.pose
@@ -95,6 +117,10 @@ class RoomPerception(object):
             self.epoch = view.epoch
         if self.lattice is None:
             self.lattice = (grid.x, grid.y, grid.resolution)
+        if self.revisit and (now >= self.revisit_until or
+                             math.hypot(pose.x - self.revisit_pose.x,
+                                        pose.y - self.revisit_pose.y) >= self.REVISIT_TRAVEL_M):
+            self.revisit.clear()
         origin_x, origin_y, resolution = self.lattice
         dx, dy = (grid.x - origin_x) / resolution, (grid.y - origin_y) / resolution
         ox, oy = int(round(dx)), int(round(dy))
@@ -132,6 +158,8 @@ class RoomPerception(object):
                 index = row * grid.width + column
                 key = (ox + column, oy + row)
                 value = grid.cells[index]
+                if self.revisit and value > 0:
+                    self.revisit.pop(key, None)
                 remembered = self.cells.get(key)
                 from_depth = evidence is not None and index in evidence.hits
                 if from_depth:
@@ -161,14 +189,18 @@ class RoomPerception(object):
                         self.reused_cells += 1
                         self.oldest_age = depth_age if self.oldest_age is None else max(depth_age, self.oldest_age)
                         continue
-                if remembered is None or value > 0:
+                historical = self.revisit.get(key) if remembered is None and value < 0 and self.revisit else None
+                if (remembered is None and historical is None) or value > 0:
                     continue
-                old_value, acquired, _, confirmed = remembered
-                age = now - acquired
-                retention = self.ISOLATED_OCCUPANCY_AGE_SEC if old_value > 0 and not confirmed else self.MAX_AGE_SEC
-                # Lost evidence returns to the live grid's state. It never restores older free space.
-                if not 0 <= age <= retention:
-                    continue
+                if historical is not None:
+                    old_value, age = 0, now - historical
+                else:
+                    old_value, acquired, _, confirmed = remembered
+                    age = now - acquired
+                    retention = self.ISOLATED_OCCUPANCY_AGE_SEC if old_value > 0 and not confirmed else self.MAX_AGE_SEC
+                    # Lost evidence returns to the live grid's state.
+                    if not 0 <= age <= retention:
+                        continue
                 delta_x = (column + .5 - center_x) * resolution
                 x, y = c * delta_x + s * delta_y, -s * delta_x + c * delta_y
                 if old_value == 0 and (value == 0 or not -self.REAR_LIMIT <= x < blind_limit
@@ -178,5 +210,6 @@ class RoomPerception(object):
                     revised = list(grid.cells)
                 revised[index] = old_value
                 self.reused_cells += 1
+                self.revisited_cells += int(historical is not None)
                 self.oldest_age = age if self.oldest_age is None else max(age, self.oldest_age)
         return view if revised is None else view._replace(grid=grid._replace(cells=tuple(revised)))

@@ -186,9 +186,12 @@ class SpatialMemory(object):
             return []
         result = []
         for action in request.choices:
+            distance = length
             if action in PIVOTS:
-                endpoint = request.anchor._replace(yaw=_wrap(request.anchor.yaw + PIVOTS[action]))
-                endpoint = arc_pose(endpoint, length, 0.)
+                turn = dict(request.pivot_turns).get(action, PIVOTS[action])
+                endpoint = request.anchor._replace(yaw=_wrap(request.anchor.yaw + turn))
+                distance = 0. if action in request.observation_turns else length
+                endpoint = arc_pose(endpoint, distance, 0.)
             elif action in curvatures:
                 endpoint = arc_pose(request.anchor, length, curvatures[action])
             else:
@@ -198,6 +201,6 @@ class SpatialMemory(object):
             result.append({'id': '%d-%s' % (request.sequence, action), 'action': action,
                            'map_id': self.map_id, 'revision': self.fixed.revision,
                            'anchor': key[0], 'x': round(point.x, 3), 'y': round(point.y, 3),
-                           'visits': self.visits.get(key, 0), 'distance_m': length,
+                           'visits': self.visits.get(key, 0), 'distance_m': distance,
                            'frontier_cells': self._frontier_cells(grid, endpoint)})
         return result

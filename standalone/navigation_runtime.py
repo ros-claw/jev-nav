@@ -217,7 +217,7 @@ class NavigationRuntime(object):
         if action not in request.choices or not self.navigation.anchor_current(request, view, now):
             return False
         if action.startswith('pivot_'):
-            return self.navigation._pivot_clear(view, request.anchor, action)
+            return self.navigation.pivot_request_clear(request, action, view)
         return (action in self.navigation.curvature and sweep_block(
             view.grid, request.anchor, self.navigation.length, self.navigation.curvature[action], view.pose) is None)
 
