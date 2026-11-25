@@ -5,11 +5,12 @@ import json
 import math
 import os
 
-from navigation import Pose, ready
+from navigation import HALF_LENGTH, HALF_WIDTH, Pose, _relative, ready
 from trail_recovery import recorded_anchor_matches, recorded_scan_matches
 
 
 MAX_HISTORY_SEC = 3600.
+MAX_PIVOT_HISTORY_SEC = 600.
 SECTORS = (-65., -45., -30., -12., 8., 30., 55., 70.)
 
 
@@ -42,6 +43,16 @@ def _finite(value):
     return not (math.isnan(value) or math.isinf(value))
 
 
+def inside_measured_body(pose, x, y, resolution):
+    half = resolution / 2.
+    for dx in (-half, half):
+        for dy in (-half, half):
+            offset = _relative(pose, Pose(x + dx, y + dy, 0.))
+            if abs(offset.x) > HALF_LENGTH - .002 or abs(offset.y) > HALF_WIDTH - .002:
+                return False
+    return True
+
+
 class RoomRevisit(object):
     def __init__(self, state):
         if state['version'] != 1 or state['frame'] != 'odom' or not 0 < len(state['cells']) <= 384:
@@ -64,6 +75,17 @@ class RoomRevisit(object):
             raise ValueError('invalid room revisit evidence')
         if driver_generation(pid) != state['driver_generation']:
             raise ValueError('room revisit driver generation changed')
+        self.body_cells = []
+        body = state.get('measured_body')
+        if body is not None:
+            origin, at, cells = Pose(*body['pose']), body['at'], body['cells']
+            if (not all(_finite(v) for v in origin + (at,)) or not 0 <= self.at - at < MAX_PIVOT_HISTORY_SEC
+                    or math.hypot(origin.x - self.pose.x, origin.y - self.pose.y) > .025
+                    or len(cells) > 64
+                    or any(not (_finite(x) and _finite(y) and inside_measured_body(origin, x, y, self.resolution))
+                           for x, y in cells)):
+                raise ValueError('recorded pivot body does not cover the cells')
+            self.body_cells = [(x, y, at) for x, y in cells]
 
     @classmethod
     def load(cls, path):
@@ -83,5 +105,8 @@ class RoomRevisit(object):
         if not (sum(matched) >= 5 and any(matched[:2]) and any(matched[4:])
                 and recorded_scan_matches(scan, {'closest_rays': self.closest})):
             return []
-        return [(x, y, now - (ros_now - observed)) for x, y, observed in self.cells
-                if 0 <= ros_now - observed < MAX_HISTORY_SEC]
+        observations = [(x, y, now - (ros_now - observed)) for x, y, observed in self.cells
+                        if 0 <= ros_now - observed < MAX_HISTORY_SEC]
+        observations.extend((x, y, now - (ros_now - at)) for x, y, at in self.body_cells
+                            if 0 <= ros_now - at < MAX_PIVOT_HISTORY_SEC)
+        return observations

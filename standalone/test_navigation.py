@@ -1020,3 +1020,22 @@ def test_room_observation_pivot_rechecks_only_the_rotation_and_does_not_repeat_i
     nav.stop('ended')
     again = nav.request(view(1.1, cells=local.grid), 1.1)
     assert again is None or not again.observation_turns
+
+
+def test_pivot_keeps_the_measured_body_at_its_start_when_one_cell_leaves_view():
+    import navigation as tracker
+
+    cells = [0] * 3600
+    cells[29 * 60 + 35] = -1
+    grid_view = Grid(-1.5, -4., .05, 60, 60, tuple(cells))
+    initial = Pose(.40858, -2.55591, .28641)
+    angled = initial._replace(yaw=.37490)
+    nav = Navigation(static_room=True)
+    nav.goal = tracker.Segment(1, 'pivot_left', initial, .25)
+    nav.epoch = 0
+    assert nav.step(view(1., initial, grid_view), 1.).angular > 0.
+    assert tracker.rotation_block(grid_view, angled, .13)[0] == 'unknown'
+    assert nav.step(view(1.05, angled, grid_view), 1.05).angular > 0.
+    cells[29 * 60 + 35] = 100
+    occupied = grid_view._replace(cells=tuple(cells))
+    assert nav.step(view(1.1, angled, occupied), 1.1).reason == 'path_occupied'

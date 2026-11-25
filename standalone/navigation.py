@@ -72,12 +72,15 @@ def _overlap(points, base, grid, column, row):
                     result.append(point)
                 last, before = point, after
             points = result
-    c, s = math.cos(base.yaw), math.sin(base.yaw)
-    for x, y in points:
-        dx, dy = x - base.x, y - base.y
-        if abs(c * dx + s * dy) > HALF_LENGTH + 1e-8 or abs(-s * dx + c * dy) > HALF_WIDTH + 1e-8:
-            return True, True
-    return bool(points), False
+    if not points:
+        return False, False
+    bodies = (base,) if isinstance(base, Pose) else base
+    for body in bodies:
+        c, s = math.cos(body.yaw), math.sin(body.yaw)
+        if all(abs(c * (x - body.x) + s * (y - body.y)) <= HALF_LENGTH + 1e-8
+               and abs(-s * (x - body.x) + c * (y - body.y)) <= HALF_WIDTH + 1e-8 for x, y in points):
+            return True, False
+    return True, True
 
 
 def _corners(pose, front, rear=HALF_LENGTH, half_width=HALF_WIDTH):
@@ -196,6 +199,7 @@ class Navigation(object):
 
     def __init__(self, forward_only=False, speed=SPEED, successor_lead=None, static_room=False):
         self.last_observation_turn = None
+        self._pivot_body = None
         if not 0. < speed <= SPEED:
             raise ValueError('invalid navigation speed')
         self.forward_only, self.max_speed = forward_only, speed
@@ -580,6 +584,8 @@ class Navigation(object):
         relative = _relative(self.goal.origin, view.pose)
         if math.hypot(relative.x, relative.y) > .025:
             return self.stop('path_tracking_lost')
+        if self._pivot_body is None or self._pivot_body[0] is not self.goal:
+            self._pivot_body = self.goal, view.pose
         angle = self.goal.turn
         sign = 1. if angle > 0. else -1.
         remaining = (angle - relative.yaw) * sign
@@ -590,7 +596,8 @@ class Navigation(object):
             if self.goal is not None:
                 return self._track(view, elapsed)
             return Command(0., 0., 'stop', 'goal_reached')
-        self.blocked_cell = rotation_block(view.grid, view.pose, sign * min(.13, remaining + .025))
+        self.blocked_cell = rotation_block(view.grid, view.pose, sign * min(.13, remaining + .025),
+                                           (view.pose, self._pivot_body[1]))
         if self.blocked_cell is not None:
             self.blocked_action = self.goal.action
             if self.blocked_cell[0] == 'occupied':
