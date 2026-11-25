@@ -257,15 +257,14 @@ class NavigationRuntime(object):
 
     def _review_route(self, request, choice, direction, view, now):
         if (self.room_plan is None or self.room_plan[0] != self.review_origin
-                or not ready(view, now) or request.epoch != view.epoch
                 or not 0 <= now - request.at < MAX_RESPONSE_AGE):
             return False
-        if offered_direction(request, direction):
-            self.room_plan = request.sequence, direction
-            return True
         if choice == 'stop':
             self.navigation.stop('model_stop')
             self.room_plan = None
+            return True
+        if ready(view, now) and request.epoch == view.epoch and offered_direction(request, direction):
+            self.room_plan = request.sequence, direction
             return True
         return False
 

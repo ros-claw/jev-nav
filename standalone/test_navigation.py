@@ -817,6 +817,31 @@ def test_runtime_tracks_for_thirty_seconds_through_multiple_delayed_model_choice
         assert runtime.close()
 
 
+def test_room_waits_for_a_new_decision_after_a_stop_received_with_stale_perception():
+    navigation = Navigation(static_room=True)
+    sensors = view(1.)
+    request = select(navigation, 'forward', 1., sensors)
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    try:
+        runtime.room_plan = request.sequence, 'left'
+        runtime.review_origin = request.sequence
+        runtime._result = request, 'stop'
+
+        command, _, decision = runtime.cycle(view(1.10, scan=.60), 1.10)
+        assert command.linear == command.angular == 0.
+        assert decision == (request.sequence, 'stop', True)
+        assert runtime.room_plan is None and navigation.goal is None
+
+        command, new_request, _ = runtime.cycle(view(1.15), 1.15)
+        assert command.linear == command.angular == 0. and new_request is None
+
+        command, new_request, _ = runtime.cycle(view(2.15), 2.15)
+        assert command.linear == command.angular == 0. and new_request is not None
+    finally:
+        assert runtime.close()
+
+
 def test_room_rechecks_route_with_the_model_without_waiting_at_local_segments(monkeypatch):
     import navigation_runtime
     monkeypatch.setattr(navigation_runtime, 'ROOM_ROUTE_REVIEW_SEC', 5.)
