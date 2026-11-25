@@ -6,7 +6,8 @@ import math
 
 
 Pose = namedtuple('Pose', 'x y yaw')
-Grid = namedtuple('Grid', 'x y resolution width height cells')
+Grid = namedtuple('Grid', 'x y resolution width height cells hazard_discs')
+Grid.__new__.__defaults__ = ((),)
 View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready depth_evidence')
 View.__new__.__defaults__ = (None,)
 Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks pivot_turns observation_turns short_segments')
@@ -112,9 +113,33 @@ def _hull(points):
     return half(ordered) + half(reversed(ordered))
 
 
+def _disc_overlaps_polygon(polygon, x, y, radius):
+    """Check a closed disc against a counterclockwise convex sweep hull."""
+    inside = True
+    radius_sq = radius * radius + 1e-12
+    last_x, last_y = polygon[-1]
+    for next_x, next_y in polygon:
+        dx, dy = next_x - last_x, next_y - last_y
+        ox, oy = x - last_x, y - last_y
+        inside = inside and dx * oy - dy * ox >= -1e-12
+        length_sq = dx * dx + dy * dy
+        if length_sq:
+            fraction = min(1., max(0., (ox * dx + oy * dy) / length_sq))
+            ox, oy = ox - fraction * dx, oy - fraction * dy
+        if ox * ox + oy * oy <= radius_sq:
+            return True
+        last_x, last_y = next_x, next_y
+    return inside
+
+
 def _polygon_block(grid, polygon, known_body, occupied_only=False):
     x_min, x_max = min(p[0] for p in polygon), max(p[0] for p in polygon)
     y_min, y_max = min(p[1] for p in polygon), max(p[1] for p in polygon)
+    for x, y, radius in grid.hazard_discs:
+        bound = radius + 1e-9
+        if (x_min - bound <= x <= x_max + bound and y_min - bound <= y <= y_max + bound
+                and _disc_overlaps_polygon(polygon, x, y, radius)):
+            return 'occupied', x, y
 
     def to_index(value, offset):
         return int(math.floor((value - offset) / grid.resolution))

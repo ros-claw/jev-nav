@@ -52,6 +52,7 @@ class SpatialMemory(object):
         self._previous_anchors = set()
         self._persistent_anchors = set()
         self._hazard_odom_anchors = {}
+        self._odom_hazards = None
 
     def update_fix(self, fix, closure=None):
         if (fix is None or fix.map_id != self.map_id or not fix.anchors
@@ -62,6 +63,7 @@ class SpatialMemory(object):
         self.registered = True
         self.fixed = fix
         if fix.revision != self._anchor_revision:
+            self._odom_hazards = None
             anchors = set(fix.anchors)
             self._persistent_anchors = anchors & self._previous_anchors
             self._previous_anchors = anchors
@@ -99,6 +101,7 @@ class SpatialMemory(object):
             if self.hazards.get(key) != record:
                 self.hazards[key] = record
                 self._hazard_odom_anchors[anchor] = _relative(self.fixed.odom_to_map, self.fixed.anchors[anchor])
+                self._odom_hazards = None
                 self.changed = True
 
     def clear_depth(self, measurements):
@@ -113,6 +116,7 @@ class SpatialMemory(object):
                 original = compose(anchor, Pose(hazard.x, hazard.y, 0.))
                 if math.hypot(original.x - point.x, original.y - point.y) <= .005:
                     del self.hazards[key]
+                    self._odom_hazards = None
                     self.changed = True
 
     def _visit_key(self, point):
@@ -131,24 +135,36 @@ class SpatialMemory(object):
         self.changed = True
         return True
 
-    def apply(self, view):
+    def _project_hazards(self):
+        if self._odom_hazards is None:
+            discs = []
+            for record in self.hazards.values():
+                anchor = self._hazard_odom_anchors.get(record.anchor)
+                if anchor is None:
+                    return None
+                # A removed graph node keeps its last projection in this odom epoch.
+                point = compose(anchor, Pose(record.x, record.y, 0.))
+                discs.append((point.x, point.y, record.radius))
+            self._odom_hazards = tuple(discs)
+        return self._odom_hazards
+
+    def apply(self, view, continuous=False):
         if view is None or not view.ready:
             return view
         if self.fixed is None:
             return view._replace(ready=False)
+        discs = self._project_hazards()
+        if discs is None:
+            return view._replace(ready=False)
         grid = view.grid
+        if continuous:
+            return view._replace(grid=grid._replace(hazard_discs=discs))
         cells = None
-        for record in self.hazards.values():
-            anchor = self._hazard_odom_anchors.get(record.anchor)
-            if anchor is None:
-                return view._replace(ready=False)
-            # A removed graph node keeps its last projection in this odom epoch.
-            # A restart or coordinate reset discards these cached positions.
-            point = compose(anchor, Pose(record.x, record.y, 0.))
-            col0 = max(0, int(math.floor((point.x - record.radius - grid.x) / grid.resolution)))
-            row0 = max(0, int(math.floor((point.y - record.radius - grid.y) / grid.resolution)))
-            col1 = min(grid.width - 1, int(math.floor((point.x + record.radius - grid.x) / grid.resolution)))
-            row1 = min(grid.height - 1, int(math.floor((point.y + record.radius - grid.y) / grid.resolution)))
+        for x, y, radius in discs:
+            col0 = max(0, int(math.floor((x - radius - grid.x) / grid.resolution)))
+            row0 = max(0, int(math.floor((y - radius - grid.y) / grid.resolution)))
+            col1 = min(grid.width - 1, int(math.floor((x + radius - grid.x) / grid.resolution)))
+            row1 = min(grid.height - 1, int(math.floor((y + radius - grid.y) / grid.resolution)))
             if col0 > col1 or row0 > row1:
                 continue
             if cells is None:

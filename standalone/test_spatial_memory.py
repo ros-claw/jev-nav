@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from navigation import Grid, Pose, Request, View, sweep_clear
+from navigation import Grid, Pose, Request, View, rotation_block, sweep_block, sweep_clear
 from spatial_memory import MapFix, SpatialMemory
 from spatial_runtime import closure_for_graph
 
@@ -34,6 +34,27 @@ def test_hazard_survives_restart_and_follows_its_corrected_keyframe():
     assert not restored.hazards
     restored.reset_registration()
     assert not restored.apply(view(epoch=1)).ready
+
+
+def test_roaming_checks_the_original_hazard_radius_without_occupied_grid_corners():
+    origin = Pose(0., 0., 0.)
+    memory = SpatialMemory('room')
+    memory.update_fix(MapFix('room', 1, origin, {5: origin}))
+    memory.record_depth([(.26, .15, .025, .02, .05)])
+    source = view()
+    rasterized = memory.apply(source)
+    assert not sweep_clear(rasterized.grid, origin, .04, 0.)
+
+    precise = memory.apply(source, continuous=True)
+    assert precise.grid.cells is source.grid.cells
+    assert sweep_clear(precise.grid, origin, .04, 0.)
+    assert sweep_block(precise.grid, origin, .06, 0., occupied_only=True) == ('occupied', .26, .15)
+
+    memory.record_depth([(.16, .17, .025, .02, .05)])
+    precise = memory.apply(source, continuous=True)
+    assert rotation_block(precise.grid, origin, .13)[0] == 'occupied'
+    memory.clear_depth([(.26, .15, .0, .10), (.16, .17, .0, .10)])
+    assert sweep_clear(memory.apply(source, continuous=True).grid, origin, .12, 0.)
 
 
 def test_visited_cells_are_persisted_and_unchecked_actions_do_not_become_targets():

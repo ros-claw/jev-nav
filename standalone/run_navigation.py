@@ -538,7 +538,8 @@ def main(argv=None):
                 raise ActuationError('room_revisit_evidence_invalid')
         if args.spatial_memory:
             from spatial_runtime import SpatialRuntime
-            spatial = source.spatial = SpatialRuntime(rospy, args.spatial_memory, args.map_id)
+            spatial = source.spatial = SpatialRuntime(rospy, args.spatial_memory, args.map_id,
+                                                     continuous_hazards=args.roam)
         if args.powercontext_url:
             from memory_bridge import MemoryBridge
             history = source.history = MemoryBridge(args.powercontext_url, args.powercontext_scope,

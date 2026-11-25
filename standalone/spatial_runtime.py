@@ -29,7 +29,7 @@ def _planar_pose(point, orientation):
 
 
 class SpatialRuntime(object):
-    def __init__(self, rospy, path, map_id):
+    def __init__(self, rospy, path, map_id, continuous_hazards=False):
         from rtabmap_ros.msg import Info, MapGraph
 
         self.rospy, self.path = rospy, os.path.abspath(path)
@@ -38,6 +38,7 @@ class SpatialRuntime(object):
             with open(self.path) as stream:
                 state = json.load(stream)
         self.memory = SpatialMemory(map_id, state)
+        self.continuous_hazards = continuous_hazards
         self._graph = self._closure = self._epoch = None
         self._view_grid = None
         self._epoch_started = _monotonic()
@@ -109,7 +110,7 @@ class SpatialRuntime(object):
                 if self.memory.changed and now >= self._save_after:
                     self._queue_save()
                     self._save_after = now + 1.
-            projected = self.memory.apply(view)
+            projected = self.memory.apply(view, continuous=self.continuous_hazards)
             if self.memory.fixed is not None and not projected.ready:
                 self.status = 'awaiting_hazard_projection'
             self._view_grid = (view.grid_at, projected.grid)
