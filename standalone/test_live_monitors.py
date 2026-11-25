@@ -781,6 +781,52 @@ def test_navigation_discards_late_authority_and_requires_a_fresh_sample(other_pu
         guard.release()
 
 
+@pytest.mark.parametrize('other_holder', [False, True])
+def test_navigation_discards_late_serial_checks_until_holders_are_fresh(other_holder):
+    clock = Clock()
+    inject = threading.Event()
+    retry = threading.Event()
+    holders_invalidated = threading.Event()
+
+    class DelayedSerialBackend(Backend):
+        def invalidate_holders(self):
+            holders_invalidated.set()
+
+        def sample(self):
+            sample = super(DelayedSerialBackend, self).sample()
+            if inject.is_set():
+                if not holders_invalidated.is_set():
+                    clock.t += .61
+                    if other_holder:
+                        sample['fuser_pids'].append(11140)
+                else:
+                    retry.wait(.8)
+                sample['fuser_at'] = clock.now()
+            return sample
+
+    guard = module().SerialOwnershipMonitor(
+        DelayedSerialBackend(serial_sample()), clock, 11139,
+        '/tmp/candidate/limo_base_node', 'a' * 64,
+        poll_interval=.01, max_age=.6, retry_late_samples=True)
+    try:
+        assert guard.acquire()
+        assert guard.cached_command_deadline() is not None
+        inject.set()
+        reason = 'serial_holder_mismatch' if other_holder else 'sample_deadline_missed'
+        assert diagnostic_wait(guard, reason)['fault_latched'] == other_holder
+        assert guard.cached_command_deadline() is None
+        retry.set()
+        if not other_holder:
+            until = time.time() + .3
+            while guard.cached_command_deadline() is None and time.time() < until:
+                time.sleep(.002)
+            assert guard.cached_command_deadline() is not None
+        assert holders_invalidated.is_set() != other_holder
+    finally:
+        retry.set()
+        guard.release()
+
+
 @pytest.mark.parametrize("error,reason", [(RuntimeError("secret rpc detail"), "rpc_exception"),
                                             (socket.timeout("secret timeout"), "rpc_timeout")])  # noqa: UP041
 def test_diagnostic_reports_rpc_exception_without_details(error, reason):

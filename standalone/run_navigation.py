@@ -580,7 +580,7 @@ def main(argv=None):
             serial_backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
             serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
                                                   args.driver_sha256, max_age=.6, acquire_timeout=1.2,
-                                                  ros_monitor=ros_guard)
+                                                  ros_monitor=ros_guard, retry_late_samples=True)
             actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock,
                                           arc_navigation=args.drive_arcs, room_pivot=args.static_room)
             recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)

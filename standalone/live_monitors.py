@@ -636,27 +636,49 @@ class RosCallerMonitor(_AsyncMonitor):
 class SerialOwnershipMonitor(_AsyncMonitor):
     """Check process identity, visible holders, and the read-only EBUSY probe."""
     def __init__(self, backend, clock, pid, expected_exe, expected_sha256,
-                 poll_interval=0.05, max_age=0.25, acquire_timeout=0.5, ros_monitor=None):
+                 poll_interval=0.05, max_age=0.25, acquire_timeout=0.5, ros_monitor=None,
+                 retry_late_samples=False):
         if (not _valid_pid(pid) or not isinstance(expected_exe, STRINGS) or not expected_exe.startswith("/")
                 or not isinstance(expected_sha256, STRINGS) or len(expected_sha256) != 64
                 or any(ch not in "0123456789abcdef" for ch in expected_sha256)):
             raise ValueError("invalid driver identity")
         if ros_monitor is not None and getattr(ros_monitor, "driver_pid", None) != pid:
             raise ValueError("ROS and serial monitors must identify the same driver")
+        if (type(retry_late_samples) is not bool
+                or retry_late_samples and not callable(getattr(backend, "invalidate_holders", None))):
+            raise ValueError("serial retry requires fresh holder queries")
         _AsyncMonitor.__init__(self, backend, clock, poll_interval, max_age, acquire_timeout)
         self.pid, self.expected_exe, self.expected_sha256 = pid, expected_exe, expected_sha256
         self.ros_monitor = ros_monitor
         self._start_ticks = None
         self._probe_at = None
+        self._retry_late_samples = retry_late_samples
+        self._late_samples_discarded = 0
+
+    def _late_sample(self, value, now):
+        if not self._retry_late_samples or not self._confirmed or self._faulted:
+            _AsyncMonitor._late_sample(self, value, now)
+            return
+        self._command_evidence = None
+        if self._assess(value, now) is None:
+            self._sample = value
+            self._latch_fault(self._diagnose_assessment(value, now))
+            return
+        # An over-budget check cannot renew a command, even with the expected owner.
+        self._sample = self._sample_at = self._sample_mono_at = None
+        self._read_reason = "sample_deadline_missed"
+        self._late_samples_discarded += 1
+        self.backend.invalidate_holders()
 
     def _diagnostic_details(self, sample):
         if not isinstance(sample, dict):
-            return {}
+            return {'late_samples_discarded': self._late_samples_discarded}
         holders = sample.get('fuser_pids')
         return {'visible_holder_count': len(holders) if isinstance(holders, list) else None,
                 'expected_holder_only': holders == [self.pid],
                 'holder_query_complete': sample.get('fuser_complete') is True,
-                'exclusive_open_probe': sample.get('open_errno') == errno.EBUSY}
+                'exclusive_open_probe': sample.get('open_errno') == errno.EBUSY,
+                'late_samples_discarded': self._late_samples_discarded}
 
     def _diagnose_assessment(self, sample, now):
         if not isinstance(sample, dict):
@@ -1000,6 +1022,10 @@ class ProcSerialBackend(object):
 
     def _query_holders(self):
         return self.fuser()
+
+    def invalidate_holders(self):
+        """Require a new descriptor scan on the next sampling iteration."""
+        self._fuser_at = self._fuser_pids = None
 
     def probe(self):
         if self._cancel_event is not None and self._cancel_event.is_set():
