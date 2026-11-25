@@ -147,6 +147,36 @@ def clear_room_reply(payload, choice):
     ]}
 
 
+def test_room_keeps_a_checked_alternate_when_the_preferred_route_has_a_visual_hazard():
+    request = {
+        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
+        "captured_at": 100.0,
+        "laser": {},
+        "base": {},
+        "navigation_choices": ["left", "right", "stop"],
+        "exploration_goal": "circulate_room",
+        "exploration_targets": [
+            {"id": "8-left", "action": "left", "map_id": "room", "revision": 3,
+             "anchor": 8, "x": .1, "y": .4, "visits": 1},
+            {"id": "8-right", "action": "right", "map_id": "room", "revision": 3,
+             "anchor": 8, "x": .1, "y": -.4, "visits": 0},
+        ],
+    }
+
+    def transport(payload, key, timeout):
+        reply = clear_room_reply(payload, "8-left")
+        reply["answers"][0]["probabilities"] = [
+            {"value": "8-left", "probability": .55},
+            {"value": "8-right", "probability": .35},
+            {"value": "stop", "probability": .10},
+        ]
+        reply["answers"][1]["probability"] = .92
+        return reply
+
+    result = module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
+    assert result["ok"] is True and result["target_id"] == "8-right"
+
+
 def test_room_model_selects_a_route_with_a_verified_start():
     laser = {"forward_view": {"rear_valid_rays": 0, "base_hits": {"right": {"nearest_m": 0.20}}},
              "blocked_segments": {"right": "occupied", "left": "unknown"}}

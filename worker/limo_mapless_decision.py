@@ -39,6 +39,31 @@ def _transport(payload, key, timeout):
         return json.loads(response.read(1_000_000))
 
 
+def _visual_route_clear(answer):
+    probability = answer.get("probability")
+    return (answer.get("type") == "predicate" and type(probability) in (int, float)
+            and 0 <= probability < ROOM_VISUAL_HAZARD_THRESHOLD)
+
+
+def _ranked_clear_alternative(primary, eligible):
+    rankings = {}
+    probabilities = primary.get("probabilities")
+    if not isinstance(probabilities, list):
+        return None
+    for entry in probabilities:
+        if not isinstance(entry, dict):
+            return None
+        value, probability = entry.get("value"), entry.get("probability")
+        if (not isinstance(value, str) or value in rankings or type(probability) not in (int, float)
+                or not 0 <= probability <= 1):
+            return None
+        rankings[value] = probability
+    if "stop" not in rankings or any(option not in rankings for option in eligible):
+        return None
+    ranked = [option for option in eligible if rankings[option] > rankings["stop"]]
+    return max(ranked, key=rankings.get) if ranked else None
+
+
 def decide(observation, key, transport=_transport, clock=time.monotonic):
     """Return a timestamped direction from a single coherent observation."""
     rejected = {"choice": "stop", "ok": False}
@@ -254,15 +279,21 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         choice = primary.get("choice")
         if choice not in choices:
             return rejected
-        if choice in scene_questions:
-            assessment = by_name.get(scene_questions[choice], {})
-            probability = assessment.get("probability")
-            if (assessment.get("type") != "predicate" or type(probability) not in (int, float)
-                    or not 0 <= probability < ROOM_VISUAL_HAZARD_THRESHOLD):
+        took_alternative = False
+        if choice in scene_questions and not _visual_route_clear(by_name.get(scene_questions[choice], {})):
+            eligible = [option for option, name in scene_questions.items()
+                        if _visual_route_clear(by_name.get(name, {}))]
+            choice = _ranked_clear_alternative(primary, eligible)
+            if choice is None:
                 return {"choice": "stop", "captured_at": stamp, "ok": True, "visual_hold": True}
+            took_alternative = True
         if choice in mapped:
-            return {"choice": mapped[choice], "target_id": choice, "captured_at": stamp, "ok": True}
-        return {"choice": choice, "captured_at": stamp, "ok": True}
+            result = {"choice": mapped[choice], "target_id": choice, "captured_at": stamp, "ok": True}
+        else:
+            result = {"choice": choice, "captured_at": stamp, "ok": True}
+        if took_alternative:
+            result["visual_alternative"] = True
+        return result
     except urllib.error.HTTPError as error:
         return dict(rejected, error_class="DecisionsHttp{}".format(error.code))
     except (socket.timeout, TimeoutError):
