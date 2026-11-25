@@ -113,70 +113,6 @@ def test_navigation_offers_only_locally_checked_segments():
     assert not reply("left")["ok"]
 
 
-def test_room_waits_if_scene_assessment_flags_the_selected_route():
-    request = {
-        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
-        "captured_at": 100.0,
-        "laser": {},
-        "base": {},
-        "navigation_choices": ["forward", "stop"],
-        "exploration_goal": "circulate_room",
-    }
-
-    def transport(payload, key, timeout):
-        assert payload["questions"][1]["name"] == "scene_0"
-        return {"answers": [
-            {"name": "scene_0", "type": "predicate", "probability": .92},
-            {"name": "next_action", "type": "choice", "choice": "circulate_left"},
-        ]}
-
-    assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0) == {
-        "choice": "stop", "captured_at": 100.0, "ok": True, "visual_hold": True,
-    }
-
-    def incomplete(payload, key, timeout):
-        return {"answers": [{"name": "next_action", "type": "choice", "choice": "circulate_left"}]}
-
-    assert module.decide(request, "secret", transport=incomplete, clock=lambda: 101.0)["visual_hold"]
-
-
-def clear_room_reply(payload, choice):
-    return {"answers": [{"name": "next_action", "type": "choice", "choice": choice}] + [
-        {"name": question["name"], "type": "predicate", "probability": .03}
-        for question in payload["questions"] if question["type"] == "predicate"
-    ]}
-
-
-def test_room_keeps_a_checked_alternate_when_the_preferred_route_has_a_visual_hazard():
-    request = {
-        "image_b64": base64.b64encode(b"\xff\xd8jpeg").decode(),
-        "captured_at": 100.0,
-        "laser": {},
-        "base": {},
-        "navigation_choices": ["left", "right", "stop"],
-        "exploration_goal": "circulate_room",
-        "exploration_targets": [
-            {"id": "8-left", "action": "left", "map_id": "room", "revision": 3,
-             "anchor": 8, "x": .1, "y": .4, "visits": 1},
-            {"id": "8-right", "action": "right", "map_id": "room", "revision": 3,
-             "anchor": 8, "x": .1, "y": -.4, "visits": 0},
-        ],
-    }
-
-    def transport(payload, key, timeout):
-        reply = clear_room_reply(payload, "8-left")
-        reply["answers"][0]["probabilities"] = [
-            {"value": "8-left", "probability": .55},
-            {"value": "8-right", "probability": .35},
-            {"value": "stop", "probability": .10},
-        ]
-        reply["answers"][1]["probability"] = .92
-        return reply
-
-    result = module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
-    assert result["ok"] is True and result["target_id"] == "8-right"
-
-
 def test_room_model_selects_a_route_with_a_verified_start():
     laser = {"forward_view": {"rear_valid_rays": 0, "base_hits": {"right": {"nearest_m": 0.20}}},
              "blocked_segments": {"right": "occupied", "left": "unknown"}}
@@ -191,11 +127,11 @@ def test_room_model_selects_a_route_with_a_verified_start():
 
     def transport(payload, key, timeout):
         assert [item["value"] for item in payload["questions"][0]["choices"]] == [
-            "circulate_left", "circulate_right", "stop"]
+            "circulate_left", "circulate_right"]
         context = payload["input"][0]["content"][2]["data"]
         assert context["checked_start_segments"] == ["forward"]
         assert context["laser"] == laser
-        return clear_room_reply(payload, "circulate_left")
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": "circulate_left"}]}
 
     assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_left"
 
@@ -211,9 +147,7 @@ def test_room_model_can_select_only_the_verified_pivot_side():
     }
 
     def transport(payload, key, timeout):
-        assert [item["value"] for item in payload["questions"][0]["choices"]] == ["circulate_right", "stop"]
-        assert payload["input"][0]["content"][2]["data"]["checked_start_segments"] == ["pivot_right"]
-        return clear_room_reply(payload, "circulate_right")
+        raise AssertionError("an only checked turn does not require a model round trip")
 
     assert module.decide(request, "secret", transport=transport, clock=lambda: 101.0)["choice"] == "circulate_right"
 
@@ -232,11 +166,11 @@ def test_confirmed_map_targets_are_choices_and_recalled_experience_stays_context
     }
 
     def transport(payload, key, timeout):
-        assert [item["value"] for item in payload["questions"][0]["choices"]] == ["8-left", "8-right", "stop"]
+        assert [item["value"] for item in payload["questions"][0]["choices"]] == ["8-left", "8-right"]
         context = payload["input"][0]["content"][2]["data"]
         assert context["exploration_targets"] == request["exploration_targets"]
         side = "8-right" if context.get("historical_context") else "8-left"
-        return clear_room_reply(payload, side)
+        return {"answers": [{"name": "next_action", "type": "choice", "choice": side}]}
 
     def decide():
         return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
