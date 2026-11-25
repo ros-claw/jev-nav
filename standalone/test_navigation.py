@@ -68,6 +68,23 @@ def test_decision_evidence_reports_the_checked_short_start_distance():
     assert 'locally_checked_segment_length_m' not in evidence
 
 
+def test_roaming_local_route_uses_a_checked_exit_before_entering_a_dead_end():
+    navigation = Navigation(static_room=True, short_room_segments=True)
+    runtime = NavigationRuntime(lambda *_: None, lambda *_: None, navigation, static_room=True)
+    try:
+        first = view(1.)
+        assert runtime._room_action(navigation.request(first, 1.), 'left', first) == 'left'
+
+        cells = grid()._replace(hazard_discs=((.38, .11, .04), (.66, -.24, .052)))
+        constrained = view(1.05, cells=cells)
+        request = navigation.request(constrained, 1.05)
+        assert request.choices == ('forward', 'left', 'right', 'stop')
+        assert runtime._room_action(request, 'left', constrained) == 'right'
+        assert navigation.segment_request_clear(request, 'right', constrained)
+    finally:
+        assert runtime.close()
+
+
 def test_goal_keeps_running_across_model_failure_and_uses_odometry_to_complete():
     navigation = Navigation()
     observation = view(1.)
@@ -356,6 +373,7 @@ def test_output_heartbeats_continue_at_zero_when_the_controller_stops_updating()
     class Actuator(object):
         def __init__(self):
             self.commands = []
+            self.unavailable_guards = ()
 
         def publish(self, command):
             self.commands.append((_monotonic(), command))
@@ -372,6 +390,7 @@ def test_output_heartbeats_continue_at_zero_when_the_controller_stops_updating()
         heartbeat.close()
     observed = actuator.commands
     assert any(command.linear > 0. for _, command in observed)
+    assert heartbeat.applied[2] == ()
     expired = [command for at, command in observed if at - start >= .16]
     assert len(expired) >= 2 and all(command.linear == command.angular == 0. for command in expired)
 

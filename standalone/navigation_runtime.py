@@ -6,7 +6,7 @@ import threading
 from collections import namedtuple
 
 from navigation import (ROOM_OBSTACLE_LOOKAHEAD, ROOM_TRACK_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
-                        _relative, observation_deadline, ready, sweep_block)
+                        _relative, observation_deadline, ready, room_continuations, segment_endpoint, sweep_block)
 
 
 ROOM_DIRECTIONS = {'circulate_left': 'left', 'circulate_right': 'right'}
@@ -273,6 +273,19 @@ class NavigationRuntime(object):
         return False
 
     def _room_action(self, request, direction, view):
+        preferred = self._preferred_room_action(request, direction, view)
+        curvature = self.navigation.curvature
+        if not self.navigation.short_room_segments or view is None or preferred not in curvature:
+            return preferred
+        alternatives = [action for action in request.choices if action in curvature and action != preferred]
+        if alternatives:
+            for action in [preferred] + alternatives:
+                endpoint, _ = segment_endpoint(request, action, self.navigation.length, curvature)
+                if next(room_continuations(view.grid, endpoint), None) is not None:
+                    return action
+        return preferred
+
+    def _preferred_room_action(self, request, direction, view):
         blocked = self.navigation.candidate_blocks.get(direction)
         away = 'right' if direction == 'left' else 'left'
         for side in (direction, away):

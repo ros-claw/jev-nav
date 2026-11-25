@@ -627,7 +627,8 @@ def main(argv=None):
             recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000,
                                            odom_queue_size=ROOM_ODOM_QUEUE_SIZE if args.roam else 10)
             from progress_monitor import ProgressMonitor
-            progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
+            progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None,
+                                       track_segment=args.roam)
             if args.roam:
                 roaming = RoomRoamingOutput(make_actuator, clock, recorder.stationary_since)
             else:
@@ -677,8 +678,6 @@ def main(argv=None):
                     timeline.record('run', now, {'stage': 'relay_authority', 'status': transition})
                     view = current_view()
                     now = _monotonic()
-                    if transition == 'bound':
-                        progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
                 if rospy.is_shutdown():
                     break
             if progress is not None and actuator is not None:
@@ -687,20 +686,28 @@ def main(argv=None):
                 now = _monotonic()
                 valid = ready(view, now)
                 previous_progress = progress.diagnostics
-                failure = progress.update(now, evidence, view.pose if valid else None,
-                                          view.epoch if valid else None, source.independent_pose(now))
+                wheel, epoch, segment = (view.pose, view.epoch, None) if valid else (None, None, None)
+                if args.roam:
+                    continuity = source.observation.continuity_snapshot(max_age_sec=.15)
+                    coords = continuity['pose']
+                    wheel = Pose(*coords) if coords is not None else None
+                    epoch = continuity['epoch']
+                    goal = runtime.navigation.goal
+                    segment = goal.sequence if goal is not None else None
+                failure = progress.update(now, evidence, wheel, epoch, source.independent_pose(now), segment)
                 if failure:
                     publish_command(Command(0., 0., 'stop', failure))
                     reason = failure
                 if progress.diagnostics is not previous_progress:
                     measurement = progress.diagnostics
                     timeline.record('run', now, {'stage': 'progress', 'status': 'latched' if failure else 'measured',
-                                                'reason': failure, 'progress_axis': measurement['axis'],
+                                                'reason': failure, 'decision_id': segment,
+                                                'progress_axis': measurement['axis'],
                                                 'expected_progress': measurement['expected'],
                                                 'wheel_progress': measurement['wheel'],
                                                 'independent_progress': measurement['independent']})
                 if failure:
-                    remember_event(now, 'progress_fault', runtime.navigation.sequence, view.pose if valid else None,
+                    remember_event(now, 'progress_fault', runtime.navigation.sequence, wheel,
                                    'The relay was stopped after measured motion reported %s.' % failure,
                                    remember=True, measurements=progress.diagnostics)
                     break
@@ -726,10 +733,13 @@ def main(argv=None):
             if runtime.navigation.blocked_action is not None:
                 fields['blocked_action'] = runtime.navigation.blocked_action
             applied = heartbeat.applied if heartbeat is not None else None
+            guards = actuator.unavailable_guards if actuator is not None else ()
             if applied is not None:
-                relay_at, relay_command = applied
+                relay_at, relay_command, guards = applied
                 fields.update(relay_at=relay_at, relay_linear=relay_command.linear,
                               relay_angular=relay_command.angular, relay_reason=relay_command.reason)
+                if guards:
+                    fields['relay_authority_unavailable'] = '.'.join(guards)
             if room is not None:
                 fields['rear_memory_cells'] = room.reused_cells
                 fields['rear_memory_age_sec'] = room.oldest_age
@@ -756,7 +766,8 @@ def main(argv=None):
                     and (applied is None or applied[1].linear == applied[1].angular == 0.))
             if idle:
                 key = (fields['reason'], fields.get('wait_stage'), fields.get('relay_reason'),
-                       fields.get('block_kind'), fields.get('block_x'), fields.get('block_y'))
+                       fields.get('relay_authority_unavailable'), fields.get('block_kind'),
+                       fields.get('block_x'), fields.get('block_y'))
                 if last_idle_log is None or key != last_idle_log[0] or now - last_idle_log[1] >= 1.:
                     timeline.record('control', now, fields)
                     last_idle_log = key, now
@@ -784,7 +795,6 @@ def main(argv=None):
                     reason = fault
                     timeline.record('run', now, {'stage': 'observation', 'status': 'latched', 'reason': fault})
                     break
-            guards = actuator.unavailable_guards if actuator is not None else ()
             if guards != unavailable_guards or (guards and now - last_authority_check >= .25):
                 unavailable_guards = guards
                 last_authority_check = now

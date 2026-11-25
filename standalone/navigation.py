@@ -52,6 +52,16 @@ def arc_pose(pose, distance, curvature):
                 pose.y + (math.cos(pose.yaw) - math.cos(yaw)) / curvature, _wrap(yaw))
 
 
+def segment_endpoint(request, action, length, curvatures):
+    if action in PIVOTS:
+        turn = dict(request.pivot_turns).get(action, PIVOTS[action])
+        anchor = request.anchor._replace(yaw=_wrap(request.anchor.yaw + turn))
+        distance = 0. if action in request.observation_turns else length
+        return arc_pose(anchor, distance, 0.), distance
+    distance = dict(request.short_segments).get(action, length)
+    return arc_pose(request.anchor, distance, curvatures[action]), distance
+
+
 def _relative(origin, pose):
     dx, dy = pose.x - origin.x, pose.y - origin.y
     c, s = math.cos(origin.yaw), math.sin(origin.yaw)
@@ -184,6 +194,13 @@ def sweep_block(grid, pose, distance, curvature, known_body=None, occupied_only=
 
 def sweep_clear(grid, pose, distance, curvature, known_body=None):
     return sweep_block(grid, pose, distance, curvature, known_body) is None
+
+
+def room_continuations(grid, endpoint):
+    """Yield continuations supported at a proposed endpoint by the current grid."""
+    for action in ('forward', 'left', 'right'):
+        if sweep_clear(grid, endpoint, ROOM_LENGTH, ROOM_CURVATURE[action]):
+            yield action
 
 
 def rotation_block(grid, pose, angle, known_body=None):

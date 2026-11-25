@@ -4,7 +4,7 @@ from __future__ import division
 import math
 from collections import namedtuple
 
-from navigation import PIVOTS, ROOM_CURVATURE, ROOM_LENGTH, Pose, _relative, _wrap, arc_pose, sweep_clear
+from navigation import PIVOTS, ROOM_CURVATURE, ROOM_LENGTH, Pose, _relative, _wrap, room_continuations, segment_endpoint
 
 
 MapFix = namedtuple('MapFix', 'map_id revision odom_to_map anchors')
@@ -204,7 +204,7 @@ class SpatialMemory(object):
         for action in request.choices:
             if action not in PIVOTS and action not in curvatures:
                 continue
-            endpoint, distance = self._endpoint(request, action, length, curvatures)
+            endpoint, distance = segment_endpoint(request, action, length, curvatures)
             point = compose(self.fixed.odom_to_map, endpoint)
             key = self._visit_key(point)
             result.append({'id': '%d-%s' % (request.sequence, action), 'action': action,
@@ -215,19 +215,8 @@ class SpatialMemory(object):
         return result
 
     @staticmethod
-    def _endpoint(request, action, length, curvatures):
-        if action in PIVOTS:
-            turn = dict(request.pivot_turns).get(action, PIVOTS[action])
-            anchor = request.anchor._replace(yaw=_wrap(request.anchor.yaw + turn))
-            distance = 0. if action in request.observation_turns else length
-            return arc_pose(anchor, distance, 0.), distance
-        distance = dict(request.short_segments).get(action, length)
-        return arc_pose(request.anchor, distance, curvatures[action]), distance
-
-    @classmethod
-    def preview_follow_on(cls, request, targets, grid):
+    def preview_follow_on(request, targets, grid):
         """Compare possible continuations on this grid for the model's route ranking."""
         for target in targets:
-            endpoint, _ = cls._endpoint(request, target['action'], ROOM_LENGTH, ROOM_CURVATURE)
-            target['checked_follow_on'] = [action for action in ('forward', 'left', 'right')
-                                           if sweep_clear(grid, endpoint, ROOM_LENGTH, ROOM_CURVATURE[action])]
+            endpoint, _ = segment_endpoint(request, target['action'], ROOM_LENGTH, ROOM_CURVATURE)
+            target['checked_follow_on'] = list(room_continuations(grid, endpoint))

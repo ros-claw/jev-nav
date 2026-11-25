@@ -48,7 +48,9 @@ class NavigationHeartbeat(object):
                 command, until = self.latest
                 if until is not None and self.clock.now() >= until:
                     command = self.EXPIRED
-                self.applied = self.clock.now(), self.actuator.publish(command)
+                at = self.clock.now()
+                output = self.actuator.publish(command)
+                self.applied = at, output, self.actuator.unavailable_guards
                 delay = .04
                 if until is not None and (command.linear or command.angular):
                     delay = min(delay, max(0., until - self.clock.now()))

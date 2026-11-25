@@ -1954,7 +1954,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
             return reject("malformed")
 
-    def continuity_snapshot(self):
+    def continuity_snapshot(self, max_age_sec=.1):
         """Read odom, fault and epoch together without I/O or mixed generations."""
         with self.lock:
             now = _monotonic()
@@ -1962,7 +1962,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
             stamp = odom.get("stamp") if isinstance(odom, dict) else None
             pose = None
             if (not self.clock_guard.faulted and not self.odom_guard.faulted
-                    and _finite(stamp) and 0 <= now - stamp <= 0.1):
+                    and _finite(stamp) and 0 <= now - stamp <= max_age_sec):
                 pose = odom.get("pose")
             return {"epoch": self.epoch, "pose": pose, "odom_at": stamp, "checked_at": now,
                     "clock_fault": self.clock_guard.fault_reason,

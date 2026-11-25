@@ -40,7 +40,9 @@ The roaming controller wakes on fresh grids and checks delayed odometry for cont
 
 Roaming checks registered map hazards as discs with their stored uncertainty radii. The swept chassis must clear the discs as well as occupied and unobserved areas in the live grid. This avoids the extra clearance loss from rounding map hazards out to whole grid cells.
 
-Model requests carry the actual checked lengths of short starts. For a registered map target they also include possible follow-on segments on the current grid. The model can use those to prefer starts with room to continue, and the tracker checks a continuation again against the observations at the new pose.
+Model requests carry the actual checked lengths of short starts. For a registered map target they also include possible follow-on segments on the current grid. The local successor selector uses that same check when there are several starts. It keeps the accepted direction when there is a checked continuation and can choose a checked alternative when that direction has none. The tracker checks motion again at the measured pose.
+
+The roaming progress monitor accumulates delivered motion intervals within each segment. Zero commands contribute no expected movement. A short interruption or missing sample does not erase already measured exposure from that segment. Wheel progress comes from fresh odometry independently of the planning grid. The timeline identifies which authority guards withheld a relay command.
 
 The room profile checks 12 cm segments and looks farther for occupied cells when selecting a detour. A point turn is available when the straight route encounters an obstacle, the complete rotational sweep is observed, and a checked forward exit is available. The room relay caps rotation to 0.05 rad/s and enforces the same command and driver watchdogs during a point turn.
 
