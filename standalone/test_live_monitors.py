@@ -731,6 +731,35 @@ def test_diagnostic_distinguishes_inflight_sample_timeout_and_cached_age():
         guard.release()
 
 
+def test_navigation_retries_a_late_ros_check_before_binding_without_motion_authority():
+    clock = Clock()
+
+    class DelayedStartupGraph(Backend):
+        def __init__(self):
+            Backend.__init__(self, None)
+            self.reads = 0
+
+        def invalidate_graph(self):
+            pass
+
+        def sample(self):
+            self.reads += 1
+            if self.reads == 1:
+                clock.t += .31
+            sample = ros_sample(clock)
+            sample['watchdog']['data'] = sample['watchdog']['data'].rsplit(' ', 1)[0] + ' %.6f' % clock.now()
+            return sample
+
+    guard = module().RosCallerMonitor(DelayedStartupGraph(), clock, 11139, poll_interval=.01,
+                                      max_age=.3, retry_late_samples=True)
+    try:
+        assert guard.acquire()
+        assert guard.diagnostic()['late_samples_discarded'] == 1
+        assert guard.cached_command_deadline() is None
+    finally:
+        guard.release()
+
+
 @pytest.mark.parametrize('other_publisher', [False, True])
 def test_navigation_discards_late_authority_and_requires_a_fresh_sample(other_publisher):
     clock = Clock()

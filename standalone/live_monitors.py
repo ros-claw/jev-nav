@@ -412,15 +412,15 @@ class RosCallerMonitor(_AsyncMonitor):
         self._late_samples_discarded = 0
 
     def _late_sample(self, value, now):
-        if not self._retry_late_samples or not self._confirmed or self._faulted:
+        if not self._retry_late_samples or self._faulted:
             _AsyncMonitor._late_sample(self, value, now)
             return
         self._command_evidence = None
-        if self._assess(value, now) is None:
+        if self._confirmed and self._assess(value, now) is None:
             self._sample = value
             self._latch_fault(self._diagnose_assessment(value, now))
             return
-        # The identity checks passed, but only a fresh graph can restore authority.
+        # A fresh graph is required for initial binding as well as renewed authority.
         self._sample = self._sample_at = self._sample_mono_at = None
         self._read_reason = "sample_deadline_missed"
         self._late_samples_discarded += 1
