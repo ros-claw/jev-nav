@@ -428,12 +428,16 @@ class _Shared(object):
                 self.intent_deadline = intent_deadline
 
     def command_for_publish(self, clock):
-        """Check the command deadline under the same lock as the command."""
+        """Check the latest command and both deadlines under the same lock."""
         with self.lock:
             now = clock()
             if not _number(now):
                 if self.fault is None:
                     self.fault = 'clock_invalid'
+                self.command = (0.0, 0.0)
+            elif self.armed and (self.command_at is None or not 0 <= now - self.command_at < HEARTBEAT_SEC):
+                if self.fault is None:
+                    self.fault = 'heartbeat'
                 self.command = (0.0, 0.0)
             elif self.intent_deadline is not None and now >= self.intent_deadline:
                 if self.fault is None:
@@ -479,7 +483,7 @@ def _ros_worker(shared, parent_pid):
         stable_since = None
         while True:
             now = _monotonic()
-            fault, ready, armed, command, command_at, _, shutdown_at = shared.snapshot()
+            fault, ready, armed, _, _, _, shutdown_at = shared.snapshot()
             if shutdown_at is not None and now - shutdown_at >= SHUTDOWN_ZEROS_SEC:
                 break
             if os.getppid() != parent_pid:
@@ -490,16 +494,12 @@ def _ros_worker(shared, parent_pid):
                     shared.stop('ros_shutdown')
                     fault = 'ros_shutdown'
                 connected = publisher.get_num_connections() > 0
-                now = _monotonic()
                 if ready and not connected:
                     shared.stop('connection_lost')
                     fault = 'connection_lost'
                 if ready and not status.ready(_monotonic):
                     shared.stop('driver_status')
                     fault = 'driver_status'
-                if armed and (command_at is None or not 0 <= now - command_at < HEARTBEAT_SEC):
-                    shared.stop('heartbeat')
-                    fault = 'heartbeat'
                 latest_fault, latest_command, latest_shutdown = shared.command_for_publish(_monotonic)
                 if (fault is not None or latest_fault is not None or not ready or not armed or
                         shutdown_at is not None or latest_shutdown is not None):

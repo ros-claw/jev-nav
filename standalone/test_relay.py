@@ -199,6 +199,16 @@ class GateTests(unittest.TestCase):
 
 
 class WorkerProgressTests(unittest.TestCase):
+    def test_publication_validates_the_latest_command_heartbeat(self):
+        shared = relay._Shared()
+        shared.arm(10.)
+        shared.set_command((.008, 0.), 10.)
+        shared.set_command((.014, 0.), 10.18)
+        self.assertEqual(shared.command_for_publish(lambda: 10.25)[:2], (None, (.014, 0.)))
+        self.assertEqual(shared.command_for_publish(lambda: 10.39)[:2], ('heartbeat', (0., 0.)))
+        shared.set_command((.014, 0.), 10.40)
+        self.assertEqual(shared.command_for_publish(lambda: 10.41)[:2], ('heartbeat', (0., 0.)))
+
     def test_ros_worker_checks_intent_expiry_at_publication_time(self):
         shared = relay._Shared()
         shared.set_command((0.02, 0.0), 10.0, 10.06)
