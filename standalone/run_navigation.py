@@ -38,6 +38,20 @@ def brighten_low_light(image):
     return cv2.LUT(image, table)
 
 
+def navigation_laser_evidence(request, static_room):
+    laser = {'planning_successor': request.predecessor is not None,
+             'blocked_segments': {action: reason for action, reason, _, _ in request.blocks}}
+    if request.short_segments:
+        laser['checked_start_distances_m'] = dict(request.short_segments)
+    else:
+        laser['locally_checked_segment_length_m'] = ROOM_LENGTH if static_room else LENGTH
+    if request.pivot_turns:
+        laser['checked_pivot_angles_rad'] = dict(request.pivot_turns)
+    if request.observation_turns:
+        laser['observation_only_pivots'] = list(request.observation_turns)
+    return laser
+
+
 class RosNavigationInput(object):
     def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False,
                  independent_odom_topic=None, roam=False):
@@ -236,6 +250,7 @@ class RosNavigationInput(object):
 
         if not request.choices:
             return None
+        targets = self.spatial.context(request) if self.spatial is not None else None
         image = self.decision_image(cancelled)
         if image is None or cancelled():
             return None
@@ -258,13 +273,7 @@ class RosNavigationInput(object):
         scan = self.decision_scan(stamp, clocks)
         self.decision_scan_counts['with_forward_view' if scan is not None else 'without_forward_view'] += 1
         jpeg = CvJpegEncoder(observation.bridge, transform=brighten_low_light)(image)
-        laser = {'locally_checked_segment_length_m': ROOM_LENGTH if self.static_room else LENGTH,
-                 'planning_successor': request.predecessor is not None,
-                 'blocked_segments': {action: reason for action, reason, _, _ in request.blocks}}
-        if request.pivot_turns:
-            laser['checked_pivot_angles_rad'] = dict(request.pivot_turns)
-        if request.observation_turns:
-            laser['observation_only_pivots'] = list(request.observation_turns)
+        laser = navigation_laser_evidence(request, self.static_room)
         if scan is not None:
             laser['forward_view'] = scan
         evidence = {'image_b64': base64.b64encode(jpeg).decode('ascii'), 'captured_at': stamp,
@@ -273,8 +282,8 @@ class RosNavigationInput(object):
                     'operator_clear_front': self.operator_clear_front}
         if self.static_room:
             evidence['exploration_goal'] = 'circulate_room'
-        if self.spatial is not None:
-            evidence['exploration_targets'] = self.spatial.context(request)
+        if targets is not None:
+            evidence['exploration_targets'] = targets
         if self.history is not None:
             targets = evidence.get('exploration_targets', [])
             places = ' '.join('room %s anchor %d' % (t['map_id'], t['anchor']) for t in targets)

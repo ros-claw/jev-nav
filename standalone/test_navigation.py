@@ -57,6 +57,17 @@ def test_free_roam_checks_a_shorter_segment_with_braking_space_when_full_starts_
     assert Navigation(static_room=True, short_room_segments=True).request(view(2., cells=tight_wall), 2.) is None
 
 
+def test_decision_evidence_reports_the_checked_short_start_distance():
+    from navigation import Request
+    from run_navigation import navigation_laser_evidence
+
+    request = Request(1, 1., 0, Pose(0., 0., 0.), ('forward', 'stop'), None, (),
+                      short_segments=(('forward', .05),))
+    evidence = navigation_laser_evidence(request, static_room=True)
+    assert evidence['checked_start_distances_m'] == {'forward': .05}
+    assert 'locally_checked_segment_length_m' not in evidence
+
+
 def test_goal_keeps_running_across_model_failure_and_uses_odometry_to_complete():
     navigation = Navigation()
     observation = view(1.)

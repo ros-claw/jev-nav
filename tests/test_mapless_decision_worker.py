@@ -176,6 +176,12 @@ def test_confirmed_map_targets_are_choices_and_recalled_experience_stays_context
         return module.decide(request, "secret", transport=transport, clock=lambda: 101.0)
 
     assert decide()["target_id"] == "8-left"
+    request["exploration_targets"][0]["checked_follow_on"] = []
+    request["exploration_targets"][1]["checked_follow_on"] = ["forward", "right"]
+    assert decide()["ok"]
+    request["exploration_targets"][1]["checked_follow_on"] = ["not_a_route"]
+    assert not decide()["ok"]
+    request["exploration_targets"][1]["checked_follow_on"] = ["forward", "right"]
     request["historical_context"] = "Room anchor 8. The left approach previously stalled."
     assert decide()["target_id"] == "8-right" and decide()["choice"] == "right"
     request["exploration_targets"][1]["action"] = "forward"

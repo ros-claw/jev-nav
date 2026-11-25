@@ -101,6 +101,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         "will first use a checked forward segment, if there is one, to gather coverage. "
                         "A checked pivot turns in place before continuing along an observed corridor. "
                         "The offered starts passed a local swept-body check over the measured segment. "
+                        "When provided, checked_start_distances_m gives the distance for each short start. "
                         "Prefer the direction that will provide more open space after that start. Use people, "
                         "furniture, and cables beyond the checked distance to choose a direction for subsequent "
                         "segments. The local controller rechecks each segment as the scene changes. Compare measured "
@@ -122,9 +123,10 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                 target_fields = {"id", "action", "map_id", "revision", "anchor", "x", "y", "visits"}
                 for target in targets:
                     if (not isinstance(target, dict) or not target_fields <= set(target)
-                            or set(target) - target_fields - {"distance_m", "frontier_cells"}):
+                            or set(target) - target_fields - {"distance_m", "frontier_cells", "checked_follow_on"}):
                         return rejected
                     target_id, action = target["id"], target["action"]
+                    follow_on = target.get("checked_follow_on", [])
                     if (not isinstance(target_id, str) or action not in available[:-1] or target_id in mapped
                             or action in mapped.values() or not re.fullmatch(r"[0-9]+-" + re.escape(action), target_id)
                             or not isinstance(target["map_id"], str)
@@ -136,7 +138,10 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                             or type(target.get("frontier_cells", 0)) is not int
                             or not 0 <= target.get("frontier_cells", 0) <= 1000
                             or type(target.get("distance_m", 0)) not in (int, float)
-                            or not 0 <= target.get("distance_m", 0) <= 2):
+                            or not 0 <= target.get("distance_m", 0) <= 2
+                            or not isinstance(follow_on, list) or len(follow_on) > 3
+                            or any(action not in ("forward", "left", "right") for action in follow_on)
+                            or len(set(follow_on)) != len(follow_on)):
                         return rejected
                     mapped[target_id] = action
                 if mapped:
@@ -145,7 +150,9 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                         choices = list(mapped)
                         task += (" Select the ID of a checked map target. Prefer a promising less visited "
                                  "exit with good current coverage. Visits describe exploration history. "
-                                 "Frontier cells suggest where new observations might be collected.")
+                                 "Frontier cells suggest where new observations might be collected. "
+                                 "When alternatives exist, favor a start with checked_follow_on options on the "
+                                 "current grid. The robot rechecks those options after taking the start.")
                 historical = observation.get("historical_context")
                 if isinstance(historical, str) and 0 < len(historical.encode("utf-8")) <= 6000:
                     context["historical_context"] = historical

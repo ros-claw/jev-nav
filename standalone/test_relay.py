@@ -436,11 +436,11 @@ class SubprocessTests(unittest.TestCase):
             if time.time() >= end:
                 break
 
-    def await_line(self, index, prefix, timeout=2.0):
+    def await_line(self, index, prefix, timeout=2.0, start_at=0):
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.pump(0.05)
-            for line in self.lines[index]:
+            for line in self.lines[index][start_at:]:
                 if line.startswith(prefix):
                     return line
             if self.proc.poll() is not None:
@@ -601,7 +601,10 @@ class SubprocessTests(unittest.TestCase):
         self.assertTrue(all(x == 'CMD 0.0000 0.0000' for x in self.lines[2]))
         self.send(1, .014, .01)
         self.await_line(2, 'CMD 0.0140 0.0100')
+        motion_index = self.lines[2].index('CMD 0.0140 0.0100')
         self.await_line(1, 'FAULT heartbeat')
+        # Fault status and the worker's zero publication travel through independent pipes.
+        self.await_line(2, 'CMD 0.0000 0.0000', timeout=.3, start_at=motion_index + 1)
         self.assertEqual(self.lines[2][-1], 'CMD 0.0000 0.0000')
 
     def test_no_driver_status_never_becomes_ready(self):

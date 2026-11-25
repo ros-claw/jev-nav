@@ -82,6 +82,25 @@ def test_only_same_acquisition_loop_closure_can_register_an_existing_map():
     assert closure_for_graph(graph, (5., 405000000000, 7), 5.1) is None
 
 
+def test_room_target_previews_follow_on_from_the_checked_endpoint():
+    from navigation import ROOM_CURVATURE, ROOM_LENGTH
+
+    origin = Pose(0., 0., 0.)
+    memory = SpatialMemory('room')
+    memory.update_fix(MapFix('room', 1, origin, {5: origin}))
+    request = Request(8, 1., 0, origin, ('forward', 'stop'), None, (),
+                      short_segments=(('forward', .05),))
+    targets = memory.targets(request, ROOM_LENGTH, ROOM_CURVATURE)
+    assert targets[0]['distance_m'] == .05
+    memory.preview_follow_on(request, targets, view().grid)
+    assert targets[0]['checked_follow_on'] == ['forward', 'left', 'right']
+
+    forward_wall = view().grid._replace(hazard_discs=((.33, 0., .05),))
+    assert sweep_clear(forward_wall, origin, .05, 0.)
+    memory.preview_follow_on(request, targets, forward_wall)
+    assert targets[0]['checked_follow_on'] == []
+
+
 def test_new_hazards_prefer_a_keyframe_that_persists_across_graph_revisions():
     origin, near = Pose(0., 0., 0.), Pose(.26, 0., 0.)
     memory = SpatialMemory('room')

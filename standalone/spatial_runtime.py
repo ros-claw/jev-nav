@@ -121,8 +121,11 @@ class SpatialRuntime(object):
             if request.epoch != self._epoch or self._view_grid is None:
                 return []
             at, grid = self._view_grid
-            return self.memory.targets(request, ROOM_LENGTH, ROOM_CURVATURE,
-                                       grid if abs(at - request.at) < .20 else None)
+            grid = grid if abs(at - request.at) < .20 else None
+            targets = self.memory.targets(request, ROOM_LENGTH, ROOM_CURVATURE, grid)
+        if self.continuous_hazards and grid is not None:
+            self.memory.preview_follow_on(request, targets, grid)
+        return targets
 
     def location(self, pose):
         with self.lock:
