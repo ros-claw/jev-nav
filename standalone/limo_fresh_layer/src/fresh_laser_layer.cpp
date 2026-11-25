@@ -196,19 +196,16 @@ class FreshDepthLayer : public costmap_2d::ObstacleLayer {
   }
 
   const std::vector<DepthCell>& depthHits(costmap_2d::Costmap2D& master, const ros::Time& stamp) {
-    if (stamp == hits_stamp_ && master.getOriginX() == hits_x_ && master.getOriginY() == hits_y_
-        && master.getSizeInCellsX() == hits_width_ && master.getSizeInCellsY() == hits_height_) return hits_;
-    hits_stamp_ = stamp;
-    hits_x_ = master.getOriginX();
-    hits_y_ = master.getOriginY();
-    hits_width_ = master.getSizeInCellsX();
-    hits_height_ = master.getSizeInCellsY();
+    // Equal acquisition stamps do not prove that the buffered cloud, its
+    // observation parameters, or the depth layer's marked cells are equal.
+    // Derive the evidence from the current observation and geometry each time.
     hits_.clear();
     if (depth_observation_.size() != 1) return hits_;
     const auto& observation = depth_observation_.front();
     const auto& cloud = *observation.cloud_;
     if (cloud.header.stamp != stamp || cloud.data.empty()) return hits_;
-    std::vector<int> positions(static_cast<size_t>(hits_width_) * hits_height_, -1);
+    const unsigned int width = master.getSizeInCellsX();
+    std::vector<int> positions(static_cast<size_t>(width) * master.getSizeInCellsY(), -1);
     const double range_sq = observation.obstacle_range_ * observation.obstacle_range_;
     sensor_msgs::PointCloud2ConstIterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
     for (; x != x.end(); ++x, ++y, ++z) {
@@ -219,7 +216,7 @@ class FreshDepthLayer : public costmap_2d::ObstacleLayer {
       unsigned int col, row, layer_col, layer_row;
       if (!master.worldToMap(*x, *y, col, row) || !worldToMap(*x, *y, layer_col, layer_row)
           || getCost(layer_col, layer_row) != costmap_2d::LETHAL_OBSTACLE) continue;
-      const unsigned int index = row * hits_width_ + col;
+      const unsigned int index = row * width + col;
       int& slot = positions[index];
       if (slot < 0) {
         slot = static_cast<int>(hits_.size());
@@ -241,9 +238,6 @@ class FreshDepthLayer : public costmap_2d::ObstacleLayer {
   ros::Time accepted_depth_stamp_;
   std::vector<costmap_2d::Observation> depth_observation_;
   std::vector<DepthCell> hits_;
-  ros::Time hits_stamp_;
-  double hits_x_ = 0., hits_y_ = 0.;
-  unsigned int hits_width_ = 0, hits_height_ = 0;
 };
 
 // Must be the last layer: publishes the complete grid and sensor stamps
