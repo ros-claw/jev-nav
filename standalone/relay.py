@@ -84,6 +84,8 @@ MAX_NAV_LINEAR = .02
 _MAX_NAV_LINEAR_DECIMAL = Decimal('0.02')
 MAX_ARC_CURVATURE = 2.1  # The controller checks swept paths up to 2 rad/m.
 _MAX_ARC_CURVATURE_DECIMAL = Decimal('2.1')
+MAX_ROOM_PIVOT_RATE = .07
+_MAX_ROOM_PIVOT_RATE_DECIMAL = Decimal('0.07')
 
 
 class _JSONFloat(float):
@@ -120,7 +122,7 @@ def safe_velocity(linear, angular, forward_navigation=False, arc_navigation=Fals
         return exact_angular == 0
     if exact_linear == 0:
         if room_pivot:
-            limit = Decimal('.05') if isinstance(exact_angular, Decimal) else .05
+            limit = _MAX_ROOM_PIVOT_RATE_DECIMAL if isinstance(exact_angular, Decimal) else MAX_ROOM_PIVOT_RATE
             return -limit <= exact_angular <= limit
         return exact_angular == 0
     if isinstance(exact_linear, Decimal) or isinstance(exact_angular, Decimal):

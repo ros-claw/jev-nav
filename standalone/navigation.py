@@ -30,6 +30,8 @@ PIVOTS = {'pivot_left': .70, 'pivot_right': -.70}
 ROOM_CORNER_TURNS = (.70, 1.40, 2.10, 2.45)
 ROOM_SHALLOW_TURNS = (.45, .25)
 ROOM_OBSERVATION_TURN = .25
+ROOM_SHORT_OBSERVATION_TURNS = (.16, .10)
+ROAM_PIVOT_RATE = .07
 SPEED = .02
 ROOM_START_SPEED = .014
 MAX_RESPONSE_AGE = 8.
@@ -394,11 +396,17 @@ class Navigation(object):
         side = _relative(anchor, Pose(obstacle[1], obstacle[2], anchor.yaw)).y
         directions = ('pivot_left',) if side < -.025 else ('pivot_right',) if side > .025 else (
             'pivot_left', 'pivot_right')
+        magnitudes = (ROOM_OBSERVATION_TURN,)
+        if self.short_room_segments:
+            magnitudes += ROOM_SHORT_OBSERVATION_TURNS
         for action in directions:
-            angle = math.copysign(ROOM_OBSERVATION_TURN, PIVOTS[action])
-            if (not self._pivot_failed_near(action, anchor)
-                    and rotation_block(view.grid, anchor, angle, view.pose) is None):
-                pivots.append((action, angle))
+            if self._pivot_failed_near(action, anchor):
+                continue
+            for magnitude in magnitudes:
+                angle = math.copysign(magnitude, PIVOTS[action])
+                if rotation_block(view.grid, anchor, angle, view.pose) is None:
+                    pivots.append((action, angle))
+                    break
         return tuple(pivots), tuple(action for action, _ in pivots)
 
     def prepare_pivot(self, view, now, direction, request=None, allow_wide=False):
@@ -698,4 +706,5 @@ class Navigation(object):
         if self._path_reacquiring(view):
             return Command(0., 0., 'stop', 'path_reacquiring')
         self.paused = False
-        return Command(0., sign * min(.05, remaining * 1.5), self.goal.action, 'tracking')
+        rate = ROAM_PIVOT_RATE if self.short_room_segments else .05
+        return Command(0., sign * min(rate, remaining * 1.5), self.goal.action, 'tracking')

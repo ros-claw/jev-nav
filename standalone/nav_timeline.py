@@ -37,6 +37,7 @@ _FIELDS = frozenset(('sensor_acquired_at', 'sensor_received_at', 'perception_sta
                      'map_status', 'map_revision', 'wait_stage', 'block_kind', 'block_x', 'block_y',
                      'evidence_id', 'history_status', 'memory_artifact', 'memory_revision', 'target_id',
                      'progress_axis', 'expected_progress', 'wheel_progress', 'independent_progress',
+                     'combined_yaw_windows', 'retained_hazards',
                      'raw_front_count', 'raw_valid_count',
                      'fused_front_count', 'fused_valid_count'))
 

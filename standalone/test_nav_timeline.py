@@ -75,3 +75,16 @@ def test_timeline_can_record_explicit_unknown_and_clock_domain(tmpdir):
     assert log.record('sensor', 10., {'clock_domain': 'ros_bag_time', 'invalid_count': 3,
                                       'unobserved_space': True, 'sampled_candidate': True})
     assert log.close(1.)
+
+
+def test_timeline_writes_revisit_obstacles_and_combined_turn_progress(tmpdir):
+    path = str(tmpdir.join('events.jsonl'))
+    log = Timeline(path, 'run-1')
+    try:
+        assert log.record('run', 1., {'stage': 'room_revisit', 'retained_hazards': 281})
+        assert log.record('run', 2., {'stage': 'progress', 'combined_yaw_windows': True})
+    finally:
+        complete = log.close(1.)
+    with open(path) as stream:
+        first, second = [json.loads(line) for line in stream]
+    assert complete and first['retained_hazards'] == 281 and second['combined_yaw_windows'] is True

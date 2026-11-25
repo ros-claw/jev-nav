@@ -755,6 +755,17 @@ def test_room_pivot_hands_off_to_checked_forward_without_a_zero_setpoint():
     assert cmd.action == 'forward' and cmd.linear > 0.
 
 
+def test_roaming_pivot_uses_more_turn_rate_only_while_the_sweep_and_remaining_angle_allow():
+    nav = Navigation(static_room=True, short_room_segments=True)
+    cells = grid({(.47, 0.): 100})
+    assert nav.prepare_pivot(view(1., cells=cells), 1., 'left') == 'pivot_left'
+    assert nav.step(view(1.05, cells=cells), 1.05).angular == pytest.approx(.07)
+    closing = view(1.10, Pose(0., 0., .675), cells)
+    assert nav.step(closing, 1.10).angular == pytest.approx(.0375)
+    stale = view(1.15, closing.pose, cells, depth=.9)
+    assert nav.step(stale, 1.15).angular == 0.
+
+
 def test_room_stationary_pivot_can_find_an_exit_beyond_the_fixed_turn():
     side = 120
     coordinates = [-3. + (index + .5) * .05 for index in range(side)]
@@ -1196,19 +1207,20 @@ def test_room_offers_a_checked_pivot_over_arcs_that_lead_to_a_measured_obstacle(
     assert request.pivot_turns == (('pivot_left', .25),)
 
 
-def test_room_observation_pivot_rechecks_only_the_rotation_and_does_not_repeat_in_place(monkeypatch):
+@pytest.mark.parametrize('clear_turn', [.25, .10])
+def test_room_observation_pivot_rechecks_only_the_rotation_and_does_not_repeat_in_place(monkeypatch, clear_turn):
     import navigation as tracker
 
-    nav = Navigation(static_room=True)
+    nav = Navigation(static_room=True, short_room_segments=True)
     monkeypatch.setattr(nav, '_pivot_clear', lambda *args: False)
     monkeypatch.setattr(tracker, 'rotation_block',
-                        lambda cells, origin, angle, body=None: None if angle == .25 else ('unknown', 0., 0.))
+                        lambda cells, origin, angle, body=None: None if angle == clear_turn else ('unknown', 0., 0.))
     local = view(1., cells=grid({(.35, -.05): 100, (.30, .30): -1}))
     request = nav.request(local, 1.)
     assert request.observation_turns == ('pivot_left',)
     assert request.choices == ('pivot_left', 'stop')
     assert nav.accept(request, 'pivot_left', local, 1.)
-    assert nav.goal.turn == .25
+    assert nav.goal.turn == clear_turn
     nav.stop('ended')
     again = nav.request(view(1.1, cells=local.grid), 1.1)
     assert again is None or not again.observation_turns

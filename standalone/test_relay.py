@@ -52,11 +52,11 @@ class GateTests(unittest.TestCase):
             self.assertFalse(gate.accept(dict(frame, linear=velocities[0], angular=velocities[1]), 10.))
 
     def test_room_pivot_is_bounded_and_kept_out_of_the_standard_arc_profile(self):
-        frame = dict(sequence=0, stamp=10., linear=0., angular=.05)
+        frame = dict(sequence=0, stamp=10., linear=0., angular=.07)
         self.assertFalse(relay.RelayGate(10., arc_navigation=True).accept(frame, 10.))
         self.assertTrue(relay.RelayGate(10., arc_navigation=True, room_pivot=True).accept(frame, 10.))
         self.assertFalse(relay.RelayGate(10., arc_navigation=True, room_pivot=True).accept(
-            dict(frame, angular=.051), 10.))
+            dict(frame, angular=.0701), 10.))
 
     def test_arc_navigation_rejects_pivot_reverse_and_excess_curvature(self):
         for linear, angular in (('0', '0.01'), ('0', '1e-10000000'), ('-0.014', '0'), ('0.02', '0.043'),
