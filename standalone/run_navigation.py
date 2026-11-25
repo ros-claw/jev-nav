@@ -729,7 +729,8 @@ def main(argv=None):
                                                 'progress_axis': measurement['axis'],
                                                 'expected_progress': measurement['expected'],
                                                 'wheel_progress': measurement['wheel'],
-                                                'independent_progress': measurement['independent']})
+                                                'independent_progress': measurement['independent'],
+                                                'combined_yaw_windows': measurement.get('combined_yaw_windows', False)})
                 if failure:
                     remember_event(now, 'progress_fault', runtime.navigation.sequence, wheel,
                                    'The relay was stopped after measured motion reported %s.' % failure,

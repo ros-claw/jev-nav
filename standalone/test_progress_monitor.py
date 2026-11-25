@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 from navigation import Pose
 from progress_monitor import ProgressMonitor
 
@@ -94,3 +96,20 @@ def test_room_retains_measured_exposure_through_a_missing_pose_without_counting_
     assert monitor.expected == expected
     assert monitor.update(3.3, [], pose, 1, segment=5) is None
     assert monitor.expected == 0.
+
+
+@pytest.mark.parametrize('second_increment,failed_window', [(0., 2), (.0244, 3)])
+def test_room_pivot_combines_a_slow_turning_window_once_after_measured_progress(second_increment, failed_window):
+    monitor = ProgressMonitor(track_segment=True)
+    origin = Pose(0., 0., 0.)
+    monitor.update(0., [], origin, 0, segment=2)
+    increments = (.0541, second_increment, .0244)
+    for step in range(181):
+        first, offset = divmod(step, 60)
+        yaw = sum(increments[:first]) + (increments[first] * offset / 60. if offset else 0.)
+        at = (step + 1) * .05
+        reason = monitor.update(at, [(at, 0., .05)], origin._replace(yaw=yaw), 0, segment=2)
+        if step == 60 * failed_window:
+            assert reason == 'no_progress'
+            break
+        assert reason is None
