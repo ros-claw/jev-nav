@@ -56,6 +56,7 @@ class RosNavigationInput(object):
         self.revisit = None
         self.revisit_registered = 0
         self.last_context = None
+        self.last_visual_hold = None
         self.grid_updates = collections.Counter()
         self.decision_errors = collections.Counter()
         self.decision_scan_counts = collections.Counter()
@@ -265,6 +266,8 @@ class RosNavigationInput(object):
         result = run_decision_process(['/usr/bin/python3', os.path.join(WORKER, 'limo_mapless_decision.py')],
                                       evidence, cancelled, _monotonic, diagnostics=True)
         if result and result.get('ok') is True and result.get('captured_at') == stamp:
+            if result.get('visual_hold') is True and result.get('choice') == 'stop':
+                self.last_visual_hold = request.sequence
             if result.get('target_id'):
                 for target in evidence.get('exploration_targets', []):
                     if target['id'] == result['target_id'] and target['action'] == result.get('choice'):
@@ -732,6 +735,8 @@ def main(argv=None):
             if decision is not None:
                 decision_fields = {'decision_id': decision[0], 'selected_action': decision[1],
                                    'status': 'accepted' if decision[2] else 'rejected'}
+                if source.last_visual_hold == decision[0]:
+                    decision_fields['veto_reason'] = 'visual_route_hold'
                 if runtime.selected_target_id is not None:
                     decision_fields['target_id'] = runtime.selected_target_id
                     decision_fields['stage'] = runtime.selected_target_stage

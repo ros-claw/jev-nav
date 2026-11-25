@@ -14,6 +14,7 @@ import urllib.request
 
 MAX_IMAGE_BYTES = 2_000_000
 MAX_AGE_SEC = 8.0
+ROOM_VISUAL_HAZARD_THRESHOLD = .40
 CHOICES = ("forward", "left", "right", "stop")
 ROOM_STARTS = CHOICES + ("pivot_left", "pivot_right")
 DESCRIPTIONS = {
@@ -69,6 +70,7 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
         has_history = False
         context = {"laser": observation["laser"], "base": observation["base"]}
         descriptions = DESCRIPTIONS
+        scene_questions = {}
         task = "A differential-drive robot is exploring indoors. Choose a promising direction using the camera and current sensor data."
         if "navigation_choices" in observation:
             available = observation["navigation_choices"]
@@ -214,20 +216,50 @@ def decide(observation, key, transport=_transport, clock=time.monotonic):
                 }
             ],
         }
+        if circulate:
+            for index, option in enumerate(choices[:-1]):
+                name = "scene_{}".format(index)
+                scene_questions[option] = name
+                action = mapped.get(option)
+                if action in ("forward", "left", "right"):
+                    motion = {"forward": "the corridor straight ahead",
+                              "left": "the shallow forward-left arc",
+                              "right": "the shallow forward-right arc"}[action]
+                elif action in ("pivot_left", "pivot_right"):
+                    motion = "the immediate footprint of the in-place {} turn".format(action.split("_")[1])
+                else:
+                    motion = "any possible checked start in checked_start_segments for this circulation preference"
+                payload["questions"].append({
+                    "type": "predicate",
+                    "name": name,
+                    "instructions": (
+                        "From the low-mounted camera, is there a person or a loose floor hazard in or close "
+                        "to {}? Inspect the floor and gaps under furniture. Shoes, legs, and a partially "
+                        "occluded body are evidence of a person. A chair can hide part of a person's path. "
+                        "Consider nearby people who could step into the route and visible cables lying "
+                        "across it. Use the supplied sensor distances and the relative direction of the "
+                        "motion to judge proximity."
+                    ).format(motion),
+                })
         response = transport(payload, key, 5.0)
         finished = clock()
         if not started <= finished < stamp + MAX_AGE_SEC:
             return rejected
         answers = response["answers"]
-        if (
-            len(answers) != 1
-            or answers[0].get("name") != "next_action"
-            or answers[0].get("type") != "choice"
-        ):
+        by_name = {answer["name"]: answer for answer in answers}
+        primary = by_name.get("next_action", {})
+        if (len(by_name) != len(answers) or not circulate and len(answers) != 1
+                or primary.get("type") != "choice"):
             return rejected
-        choice = answers[0].get("choice")
+        choice = primary.get("choice")
         if choice not in choices:
             return rejected
+        if choice in scene_questions:
+            assessment = by_name.get(scene_questions[choice], {})
+            probability = assessment.get("probability")
+            if (assessment.get("type") != "predicate" or type(probability) not in (int, float)
+                    or not 0 <= probability < ROOM_VISUAL_HAZARD_THRESHOLD):
+                return {"choice": "stop", "captured_at": stamp, "ok": True, "visual_hold": True}
         if choice in mapped:
             return {"choice": mapped[choice], "target_id": choice, "captured_at": stamp, "ok": True}
         return {"choice": choice, "captured_at": stamp, "ok": True}
