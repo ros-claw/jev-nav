@@ -59,3 +59,31 @@ def test_only_same_acquisition_loop_closure_can_register_an_existing_map():
     assert closure_for_graph(graph, (5.02, 405020000000, 7), 4.) is None
     assert closure_for_graph(graph, (5., 405000000000, 7), 4.) == 7
     assert closure_for_graph(graph, (5., 405000000000, 7), 5.1) is None
+
+
+def test_new_hazards_prefer_a_keyframe_that_persists_across_graph_revisions():
+    origin, near = Pose(0., 0., 0.), Pose(.26, 0., 0.)
+    memory = SpatialMemory('room')
+    memory.update_fix(MapFix('room', 1, origin, {5: origin, 9: near}))
+    memory.update_fix(MapFix('room', 2, origin, {5: origin, 10: near}))
+    memory.record_depth([(.24, 0., .025, .02, .05)])
+    assert {hazard.anchor for hazard in memory.hazards.values()} == {5}
+    memory.update_fix(MapFix('room', 3, origin, {5: origin, 11: near}))
+    effective = memory.apply(view())
+    assert effective.ready and not sweep_clear(effective.grid, effective.pose, .12, 0.)
+
+
+def test_a_missing_keyframe_keeps_its_last_projected_hazard_only_in_the_same_odometry_epoch():
+    origin = Pose(0., 0., 0.)
+    memory = SpatialMemory('room')
+    memory.update_fix(MapFix('room', 1, origin, {5: origin}))
+    memory.record_depth([(.24, 0., .025, .02, .05)])
+    memory.update_fix(MapFix('room', 2, Pose(1., 0., 0.), {7: Pose(1., 0., 0.)}))
+    effective = memory.apply(view())
+    assert effective.ready and not sweep_clear(effective.grid, effective.pose, .12, 0.)
+    memory.update_fix(MapFix('room', 3, Pose(1., 0., 0.), {7: Pose(1., 0., 0.), 5: Pose(1., .4, 0.)}))
+    effective = memory.apply(view())
+    assert sweep_clear(effective.grid, effective.pose, .12, 0.)
+    memory.reset_registration()
+    assert not memory.update_fix(MapFix('room', 4, origin, {7: origin}), closure=7)
+    assert not memory.apply(view(epoch=1)).ready

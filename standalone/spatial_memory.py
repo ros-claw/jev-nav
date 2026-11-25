@@ -48,15 +48,27 @@ class SpatialMemory(object):
         self.registered = not self.old_anchors
         self.fixed = None
         self.last_visit = None
+        self._anchor_revision = None
+        self._previous_anchors = set()
+        self._persistent_anchors = set()
+        self._hazard_odom_anchors = {}
 
     def update_fix(self, fix, closure=None):
         if (fix is None or fix.map_id != self.map_id or not fix.anchors
-                or not self.old_anchors.issubset(fix.anchors)):
+                or not self.registered and (closure not in self.old_anchors
+                                            or not self.old_anchors.issubset(fix.anchors))):
             self.fixed = None
             return False
-        self.registered = self.registered or closure in self.old_anchors
-        self.fixed = fix if self.registered else None
-        return self.fixed is not None
+        self.registered = True
+        self.fixed = fix
+        if fix.revision != self._anchor_revision:
+            anchors = set(fix.anchors)
+            self._persistent_anchors = anchors & self._previous_anchors
+            self._previous_anchors = anchors
+            self._anchor_revision = fix.revision
+            for anchor in {record.anchor for record in self.hazards.values()} & anchors:
+                self._hazard_odom_anchors[anchor] = _relative(fix.odom_to_map, fix.anchors[anchor])
+        return True
 
     def snapshot(self):
         return {'version': 1, 'map_id': self.map_id, 'hazards': list(self.hazards.values()),
@@ -64,7 +76,10 @@ class SpatialMemory(object):
 
     def _anchor(self, pose):
         anchors = self.fixed.anchors
-        return min(anchors, key=lambda n: (pose.x - anchors[n].x) ** 2 + (pose.y - anchors[n].y) ** 2)
+        # The newest RTAB-Map observation can vanish in the next MapGraph
+        # without ever becoming a lasting keyframe.
+        eligible = self._persistent_anchors or (min(anchors),)
+        return min(eligible, key=lambda n: (pose.x - anchors[n].x) ** 2 + (pose.y - anchors[n].y) ** 2)
 
     @staticmethod
     def _hazard_key(record):
@@ -83,6 +98,7 @@ class SpatialMemory(object):
             key = self._hazard_key(record)
             if self.hazards.get(key) != record:
                 self.hazards[key] = record
+                self._hazard_odom_anchors[anchor] = _relative(self.fixed.odom_to_map, self.fixed.anchors[anchor])
                 self.changed = True
 
     def clear_depth(self, measurements):
@@ -91,9 +107,10 @@ class SpatialMemory(object):
         for x, y, low, high in measurements:
             point = compose(self.fixed.odom_to_map, Pose(x, y, 0.))
             for key, hazard in list(self.hazards.items()):
-                if not low <= hazard.low_z <= hazard.high_z <= high:
+                anchor = self.fixed.anchors.get(hazard.anchor)
+                if anchor is None or not low <= hazard.low_z <= hazard.high_z <= high:
                     continue
-                original = compose(self.fixed.anchors[hazard.anchor], Pose(hazard.x, hazard.y, 0.))
+                original = compose(anchor, Pose(hazard.x, hazard.y, 0.))
                 if math.hypot(original.x - point.x, original.y - point.y) <= .005:
                     del self.hazards[key]
                     self.changed = True
@@ -122,10 +139,12 @@ class SpatialMemory(object):
         grid = view.grid
         cells = None
         for record in self.hazards.values():
-            anchor = self.fixed.anchors.get(record.anchor)
+            anchor = self._hazard_odom_anchors.get(record.anchor)
             if anchor is None:
                 return view._replace(ready=False)
-            point = _relative(self.fixed.odom_to_map, compose(anchor, Pose(record.x, record.y, 0.)))
+            # A removed graph node keeps its last projection in this odom epoch.
+            # A restart or coordinate reset discards these cached positions.
+            point = compose(anchor, Pose(record.x, record.y, 0.))
             col0 = max(0, int(math.floor((point.x - record.radius - grid.x) / grid.resolution)))
             row0 = max(0, int(math.floor((point.y - record.radius - grid.y) / grid.resolution)))
             col1 = min(grid.width - 1, int(math.floor((point.x + record.radius - grid.x) / grid.resolution)))

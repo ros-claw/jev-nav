@@ -110,6 +110,8 @@ class SpatialRuntime(object):
                     self._queue_save()
                     self._save_after = now + 1.
             projected = self.memory.apply(view)
+            if self.memory.fixed is not None and not projected.ready:
+                self.status = 'awaiting_hazard_projection'
             self._view_grid = (view.grid_at, projected.grid)
             return projected
 
