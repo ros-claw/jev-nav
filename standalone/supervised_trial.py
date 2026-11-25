@@ -262,12 +262,39 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
                     selected.append((at, linear, angular))
         return list(reversed(selected))
 
+    def stationary_since(self, after, now):
+        """Require distinct recent stopped poses received after a relay closed."""
+        with self.lock:
+            if not self.odometry:
+                return False
+            latest = self.odometry[-1]
+            if not 0 <= now - latest[0] < .15:
+                return False
+            newer = None
+            for row in reversed(self.odometry):
+                if row[0] <= after or latest[0] - row[0] > .35:
+                    break
+                yaw = math.atan2(math.sin(row[4] - latest[4]), math.cos(row[4] - latest[4]))
+                if (abs(row[3]) >= .003 or abs(row[5]) >= .01 or abs(yaw) > .012
+                        or math.hypot(row[1] - latest[1], row[2] - latest[2]) > .003):
+                    return False
+                if newer is not None and (not 0 < newer[0] - row[0] < .12 or row[6] >= newer[6]
+                                          or row[7] >= newer[7]):
+                    return False
+                if latest[0] - row[0] >= .15:
+                    return True
+                newer = row
+        return False
+
     def trial_summary(self, caller, started, ended):
         with self.lock:
             return summarize_trial_observations([item[:4] for item in self.odometry], list(self.commands),
                                                 caller, started, ended)
 
-    def trial_trajectory(self, caller, started, ended):
+    def trial_trajectory(self, caller, started, ended, prior_callers=()):
+        callers = set(prior_callers)
+        if caller is not None:
+            callers.add(caller)
         with self.lock:
             return {
                 'clock': 'host_monotonic_receipt',
@@ -276,7 +303,7 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
                 'odom': [item for item in self.odometry if started <= item[0] <= ended],
                 'command_columns': ['at', 'forward_mps', 'yaw_radps'],
                 'commands': [item[:3] for item in self.commands
-                             if caller is not None and caller == item[3] and started <= item[0] <= ended],
+                             if item[3] in callers and started <= item[0] <= ended],
             }
 
 

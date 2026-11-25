@@ -32,11 +32,18 @@ def recording_topics(namespace, extra):
     return list(dict.fromkeys(topics)), cameras
 
 
-def bag_command(directory, topics):
+def bag_command(directory, topics, rolling_budget_mib=None):
+    split_mib = 64
+    retention = []
+    if rolling_budget_mib is not None:
+        split_mib = min(split_mib, rolling_budget_mib // 4)
+        # Reserve one segment for the active bag and another for split/index overhead.
+        max_splits = rolling_budget_mib // split_mib - 2
+        retention = ['--max-splits', str(max_splits)]
     # rosrun execs the writer so its exit is the writer's, including bag finalization.
-    return ['rosrun', 'rosbag', 'record', '--lz4', '--split', '--size', '64', '--buffsize', '32',
+    return ['rosrun', 'rosbag', 'record', '--lz4', '--split', '--size', str(split_mib), '--buffsize', '32',
             '--min-space', '{}M'.format(MIN_FREE // MIB), '--tcpnodelay',
-            '-O', str(directory / 'sensors')] + topics
+            '-O', str(directory / 'sensors')] + retention + topics
 
 
 def bag_bytes(directory):
@@ -102,6 +109,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', required=True, type=Path)
     parser.add_argument('--budget-mib', default=512, type=int)
+    parser.add_argument('--rolling', action='store_true', help='rotate bag segments during a --roam session')
     parser.add_argument('--extra-topic', action='append', default=[])
     parser.add_argument('--map-database', type=Path, help='start RTAB-Map on the same private odometry TF stream')
     parser.add_argument('navigation', nargs=argparse.REMAINDER)
@@ -110,6 +118,8 @@ def main():
             or not 16 <= args.budget_mib <= 2048
             or any(not topic.startswith('/') for topic in args.extra_topic)):
         parser.error('use recorder options, then -- and navigation arguments')
+    if args.rolling and '--roam' not in args.navigation[1:]:
+        parser.error('--rolling requires --roam in the navigation arguments after --')
     if not args.output_root.is_dir():
         parser.error('output root must already exist')
     if args.map_database is not None and not args.map_database.parent.is_dir():
@@ -129,6 +139,7 @@ def main():
     manifest = {'namespace': namespace, 'revision': revision, 'working_tree_dirty': working_tree_dirty,
                 'phase': 'starting',
                 'recording_start': clock_anchor(), 'topics': topics, 'budget_mib': args.budget_mib,
+                'rolling': args.rolling,
                 'camera_samples_hz': {destination: float(rate) for _, rate, destination in cameras}}
     save_manifest(directory, manifest)
     bag = navigation = mapper = None
@@ -143,7 +154,8 @@ def main():
         signal.signal(event, interrupt)
     reason = None
     try:
-        bag = launch(directory, 'rosbag', bag_command(directory, topics))
+        rolling_budget = args.budget_mib if args.rolling else None
+        bag = launch(directory, 'rosbag', bag_command(directory, topics, rolling_budget_mib=rolling_budget))
         for index, (source, rate, destination) in enumerate(cameras):
             samplers.append(launch(directory, 'camera-{}'.format(index),
                                    ['rosrun', 'topic_tools', 'throttle', 'messages', source, rate, destination]))
@@ -193,6 +205,8 @@ def main():
         stop(bag, 8.)
         for sampler in samplers:
             stop(sampler, 2.)
+        if interrupted and reason is None:
+            reason = 'interrupted'
         bags = sorted(directory.glob('sensors_*.bag'))
         finalized = bool(bags) and not list(directory.glob('sensors_*.bag.active'))
         manifest.update(phase='finished', recording_end=clock_anchor(), recording_stop=reason,

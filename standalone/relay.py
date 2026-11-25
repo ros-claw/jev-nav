@@ -198,11 +198,15 @@ class RelayGate(object):
                  self.sequence < frame['sequence'] <= 9223372036854775807 and
                  _number(now) and _number(frame.get('stamp')))
         if valid:
-            valid = (0 <= now - self.last_at < HEARTBEAT_SEC and
-                     0 <= now - frame['stamp'] < HEARTBEAT_SEC and
+            age, gap = now - frame['stamp'], now - self.last_at
+            valid = (0 <= gap and 0 <= age and
                      (self.last_stamp is None or frame['stamp'] > self.last_stamp) and
                      safe_velocity(frame['linear'], frame['angular'], self.continuous_navigation,
                                    self.arc_navigation, self.reverse_navigation, self.room_pivot, self.trail_pivot))
+            if valid and (gap >= HEARTBEAT_SEC or age >= HEARTBEAT_SEC):
+                self.stop(('heartbeat' if gap >= HEARTBEAT_SEC else 'stale_frame')
+                          if self.room_pivot else 'invalid_frame')
+                return False
         if valid and self.require_intent_deadline:
             expiry = frame['expires_at']
             valid = (_number(expiry) and frame['stamp'] < expiry <= frame['stamp'] + HEARTBEAT_SEC

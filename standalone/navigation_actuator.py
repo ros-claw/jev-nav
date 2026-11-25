@@ -4,7 +4,7 @@ from __future__ import division
 import json
 import threading
 
-from navigation import Command, observation_deadline
+from navigation import Command, observation_deadline, ready
 from relay import NAVIGATION_STARTUP_TIMEOUT_SEC, safe_velocity
 
 
@@ -62,6 +62,88 @@ class NavigationHeartbeat(object):
         self._closed.set()
         self._wake.set()
         self._worker.join(.4)
+
+
+class RoomRoamingOutput(object):
+    """Rebind a timed-out room relay after fresh stationary wheel observations."""
+    TIMING_FAULTS = (b'FAULT heartbeat\n', b'FAULT stale_frame\n')
+    BIND_DELAYS = ('sample_deadline_missed', 'cache_expired', 'background_sample_timeout')
+    HOLD = Command(0., 0., 'stop', 'relay_recovering')
+
+    def __init__(self, factory, clock, stationary_since, heartbeat_factory=NavigationHeartbeat):
+        self.factory, self.clock = factory, clock
+        self.stationary_since, self.heartbeat_factory = stationary_since, heartbeat_factory
+        self.actuator = self.last_actuator = self.heartbeat = None
+        self.since = clock.now()
+        self.callers = set()
+        self.recoveries = 0
+
+    def update(self, view, now):
+        if self.heartbeat is not None:
+            fault = self.heartbeat.fault
+            if fault is None:
+                return None
+            if self.actuator.stop_line not in self.TIMING_FAULTS:
+                raise fault
+            self.close()
+            self.recoveries += 1
+            self.since = self.clock.now()
+            return 'retired'
+        if not ready(view, now) or not self.stationary_since(self.since, now):
+            return None
+        self.last_actuator = candidate = self.factory()
+        try:
+            candidate.open()
+        except BaseException as error:
+            try:
+                retry = self._binding_delayed(candidate, error)
+            finally:
+                self._close_actuator(candidate)
+            if not retry:
+                raise
+            self.since = self.clock.now()
+            return 'binding_delayed'
+        self.actuator = candidate
+        self.callers.add(candidate.caller)
+        self.heartbeat = self.heartbeat_factory(candidate, self.clock)
+        self.heartbeat.start()
+        return 'bound'
+
+    def _binding_delayed(self, candidate, error):
+        if not isinstance(error, ActuationError):
+            return False
+        if candidate.stop_line in self.TIMING_FAULTS:
+            return True
+        if str(error) not in ('command_authority_unavailable', 'navigation_relay_binding_failed'):
+            return False
+        reports = [guard.diagnostic() for guard in (candidate.ros_guard, candidate.serial_guard)]
+        return (all(not report['fault_latched'] and report['reason'] in self.BIND_DELAYS +
+                    ('ok', 'not_started', 'sample_unavailable') for report in reports)
+                and any(report['reason'] in self.BIND_DELAYS for report in reports))
+
+    def submit(self, command, view, now):
+        if self.heartbeat is None:
+            return self.HOLD
+        try:
+            return self.heartbeat.submit(command, view, now)
+        except (ActuationError, IOError, OSError):
+            # update() resolves the fault on the next cycle before any rebind.
+            return self.HOLD
+
+    @staticmethod
+    def _close_actuator(actuator):
+        actuator.close()
+        if actuator.transport.process is not None and actuator.transport.exited is not True:
+            raise ActuationError('navigation_previous_relay_still_running')
+
+    def close(self):
+        if self.actuator is not None:
+            try:
+                if self.heartbeat is not None:
+                    self.heartbeat.close()
+            finally:
+                self._close_actuator(self.actuator)
+                self.actuator = self.heartbeat = None
 
 
 class NavigationActuator(object):

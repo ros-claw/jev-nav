@@ -15,7 +15,7 @@ import time
 import uuid
 
 from navigation import PIVOTS, Command, Grid, LENGTH, ROOM_LENGTH, Navigation, Pose, View, ready
-from navigation_actuator import ActuationError, NavigationActuator, NavigationHeartbeat
+from navigation_actuator import ActuationError, NavigationActuator, NavigationHeartbeat, RoomRoamingOutput
 from navigation_runtime import MappedChoice, NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
 from relay import _monotonic
@@ -295,6 +295,7 @@ def parse_args(argv=None):
     output.add_argument('--drive-forward', action='store_true', help='use the supervised forward hardware output')
     output.add_argument('--drive-arcs', action='store_true', help='execute currently observed forward and arc paths')
     parser.add_argument('--static-room', action='store_true', help='use nearby rear history in a supervised static room')
+    parser.add_argument('--roam', action='store_true', help='keep the room planner running until shutdown')
     parser.add_argument('--operator-clear-front', action='store_true', help='record the current supervised site report')
     parser.add_argument('--independent-odom-topic', help='qualified visual or scan odometry for physical progress')
     parser.add_argument('--spatial-memory', help='atomic per-map spatial-memory JSON file')
@@ -306,7 +307,7 @@ def parse_args(argv=None):
     parser.add_argument('--driver-exe')
     parser.add_argument('--driver-sha256')
     parser.add_argument('--speed-mps', type=float)
-    parser.add_argument('--max-travel-m', type=float, default=.40)
+    parser.add_argument('--max-travel-m', type=float)
     args = parser.parse_args(argv)
     if args.session_namespace is not None and not re.match(r'\Alimo_native_probe_[a-f0-9]{12}\Z',
                                                           args.session_namespace):
@@ -316,8 +317,13 @@ def parse_args(argv=None):
         args.speed_mps = .014 if args.drive else .02
     if args.seconds is not None and not 0. < args.seconds < float('inf'):
         parser.error('seconds must be positive and finite')
-    if not 0 < args.speed_mps <= .02 or not .05 <= args.max_travel_m <= (12. if args.static_room else .50):
+    if args.max_travel_m is None and not args.roam:
+        args.max_travel_m = .40
+    if (not 0 < args.speed_mps <= .02 or args.max_travel_m is not None
+            and not .05 <= args.max_travel_m <= (12. if args.static_room else .50)):
         parser.error('invalid supervised motion bounds')
+    if args.roam and not (args.drive_arcs and args.static_room):
+        parser.error('--roam requires --drive-arcs and --static-room')
     if args.static_room and args.drive_forward:
         parser.error('static room exploration uses the arc or private preview output')
     if args.room_revisit and not (args.static_room and args.decisions):
@@ -328,10 +334,11 @@ def parse_args(argv=None):
     if bool(args.powercontext_url) != bool(args.powercontext_scope) or args.powercontext_url and (
             not args.decisions or not args.static_room):
         parser.error('PowerContext origin and scope require --decisions and --static-room')
-    if args.drive and (not args.decisions or args.seconds is None or args.driver_pid is None or args.driver_pid <= 1
+    if args.drive and (not args.decisions or not args.roam and args.seconds is None
+                       or args.driver_pid is None or args.driver_pid <= 1
                        or not args.driver_exe or not os.path.isabs(args.driver_exe)
                        or not re.match(r'\A[a-f0-9]{64}\Z', args.driver_sha256 or '')):
-        parser.error('hardware operation requires Decisions, a finite run and driver identity')
+        parser.error('hardware operation requires Decisions, driver identity and a finite run or --roam')
     if args.operator_clear_front != args.drive_forward:
         parser.error('the operator clear-front report is required for --drive-forward only')
     return args
@@ -482,7 +489,7 @@ def main(argv=None):
                  'depth_layer_type:=limo_fresh_layer/FreshDepthLayer'])
     children = []
     runtime = timeline = source = actuator = recorder = None
-    heartbeat = view = None
+    heartbeat = view = roaming = None
     progress = spatial = history = None
     counts = collections.Counter()
     ready_ticks = 0
@@ -494,6 +501,7 @@ def main(argv=None):
     unavailable_guards = ()
     authority_states = {}
     last_authority_check = 0.
+    last_idle_log = None
     authority_diagnostics = {}
     arc_traces = {}
     early_detours = 0
@@ -579,36 +587,45 @@ def main(argv=None):
 
             # Warm the live sensor pipeline before claiming the chassis. This
             # also keeps depth-nodelet initialization out of relay startup.
-            warm_until = _monotonic() + 30.
-            while not ready(current_view(), _monotonic()):
-                if rospy.is_shutdown() or _monotonic() >= warm_until:
-                    cause = (spatial.status if spatial is not None and spatial.status != 'registered'
-                             else 'perception_not_ready')
-                    raise ActuationError('navigation_' + cause)
-                time.sleep(.05)
             clock = RealClock()
-            ros_guard = make_ros_monitor(clock, args.driver_pid,
-                                         os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'),
-                                         retry_late_samples=True)
-            serial_backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
-            serial_guard = SerialOwnershipMonitor(serial_backend, clock, args.driver_pid, args.driver_exe,
-                                                  args.driver_sha256, max_age=.6, acquire_timeout=1.2,
-                                                  ros_monitor=ros_guard, retry_late_samples=True)
-            actuator = NavigationActuator(RelayProcessTransport(clock), ros_guard, serial_guard, clock,
+
+            def make_actuator():
+                ros = make_ros_monitor(clock, args.driver_pid,
+                                       os.environ.get('ROS_MASTER_URI', 'http://localhost:11311'),
+                                       retry_late_samples=True)
+                backend = ProcFdSerialBackend(clock, args.driver_pid, '/dev/ttyTHS1')
+                serial = SerialOwnershipMonitor(backend, clock, args.driver_pid, args.driver_exe,
+                                                args.driver_sha256, max_age=.6, acquire_timeout=1.2,
+                                                ros_monitor=ros, retry_late_samples=True)
+                return NavigationActuator(RelayProcessTransport(clock), ros, serial, clock,
                                           arc_navigation=args.drive_arcs, room_pivot=args.static_room)
+
             recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)
-            actuator.open()
             from progress_monitor import ProgressMonitor
             progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
-            if room is not None:
-                heartbeat = NavigationHeartbeat(actuator, clock)
-                heartbeat.start()
+            if args.roam:
+                roaming = RoomRoamingOutput(make_actuator, clock, recorder.stationary_since)
+            else:
+                warm_until = _monotonic() + 30.
+                while not ready(current_view(), _monotonic()):
+                    if rospy.is_shutdown() or _monotonic() >= warm_until:
+                        cause = (spatial.status if spatial is not None and spatial.status != 'registered'
+                                 else 'perception_not_ready')
+                        raise ActuationError('navigation_' + cause)
+                    time.sleep(.05)
+                actuator = make_actuator()
+                actuator.open()
+                if room is not None:
+                    heartbeat = NavigationHeartbeat(actuator, clock)
+                    heartbeat.start()
 
         def publish_room(command):
+            if roaming is not None:
+                return roaming.submit(command, view, _monotonic())
             return heartbeat.submit(command, view, _monotonic())
 
         publish_command = actuator.publish if actuator is not None else publish
-        if heartbeat is not None:
+        if heartbeat is not None or roaming is not None:
             publish_command = publish_room
         navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps,
                                 successor_lead=.075 if room is not None else None, static_room=args.static_room)
@@ -625,7 +642,19 @@ def main(argv=None):
                     raise ActuationError('navigation_perception_process_exited')
             view = current_view()
             now = _monotonic()
-            if progress is not None:
+            if roaming is not None:
+                transition = roaming.update(view, now)
+                actuator, heartbeat = roaming.actuator, roaming.heartbeat
+                if transition is not None:
+                    now = _monotonic()
+                    timeline.record('run', now, {'stage': 'relay_authority', 'status': transition})
+                    view = current_view()
+                    now = _monotonic()
+                    if transition == 'bound':
+                        progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
+                if rospy.is_shutdown():
+                    break
+            if progress is not None and actuator is not None:
                 evidence = recorder.commands_after(actuator.caller, progress.command_at)
                 # Callbacks may have received a newer command after the frame was read.
                 now = _monotonic()
@@ -650,7 +679,7 @@ def main(argv=None):
                     break
             if args.drive and view is not None and last_pose is not None:
                 travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
-                if travelled >= args.max_travel_m:
+                if args.max_travel_m is not None and travelled >= args.max_travel_m:
                     reason = 'travel_limit'
                     break
             command, request, decision = runtime.cycle(view, now)
@@ -694,7 +723,17 @@ def main(argv=None):
                     trace = arc_traces.setdefault(fields['decision_id'], {
                         'action': command.action, 'started_at': now, 'start_yaw_rad': view.pose.yaw})
                     trace.update(last_at=now, last_yaw_rad=view.pose.yaw)
-            timeline.record('control', now, fields)
+            idle = (args.roam and command.linear == command.angular == 0.
+                    and (applied is None or applied[1].linear == applied[1].angular == 0.))
+            if idle:
+                key = (fields['reason'], fields.get('wait_stage'), fields.get('relay_reason'),
+                       fields.get('block_kind'), fields.get('block_x'), fields.get('block_y'))
+                if last_idle_log is None or key != last_idle_log[0] or now - last_idle_log[1] >= 1.:
+                    timeline.record('control', now, fields)
+                    last_idle_log = key, now
+            else:
+                timeline.record('control', now, fields)
+                last_idle_log = None
             if runtime.early_detour is not None:
                 previous, (_, x, y) = runtime.early_detour
                 early_detours += 1
@@ -709,7 +748,7 @@ def main(argv=None):
                 remember_event(now, 'occupied_detour', runtime.navigation.sequence, view.pose,
                                'A %s path became occupied. The local controller checked and selected %s.'
                                % (previous, alternate))
-            if command.reason in ('perception_unavailable', 'clock_or_odometry_reset'):
+            if not ready(view, now) or command.reason == 'clock_or_odometry_reset':
                 diagnostics = source.observation.diagnostic_status()
                 fault = diagnostics['clock_fault'] or diagnostics['odom_fault'] or runtime.navigation.fault
                 if fault:
@@ -720,7 +759,8 @@ def main(argv=None):
             if guards != unavailable_guards or (guards and now - last_authority_check >= .25):
                 unavailable_guards = guards
                 last_authority_check = now
-                for stage, guard in (('ros_authority', ros_guard), ('serial_authority', serial_guard)):
+                for stage, guard in (('ros_authority', actuator.ros_guard if actuator is not None else None),
+                                     ('serial_authority', actuator.serial_guard if actuator is not None else None)):
                     if stage in unavailable_guards:
                         report = guard.diagnostic()
                         reason_code = report['reason'] if report['reason'] != 'ok' else 'command_deadline_unavailable'
@@ -782,11 +822,20 @@ def main(argv=None):
         if timeline is not None:
             timeline.record('stop', ended, {'reason': reason})
         try:
-            if actuator is not None:
+            if roaming is not None:
+                actuator = roaming.last_actuator
+                try:
+                    if actuator is not None:
+                        authority_diagnostics.update(ros=actuator.ros_guard.diagnostic(),
+                                                     serial=actuator.serial_guard.diagnostic())
+                finally:
+                    roaming.close()
+            elif actuator is not None:
                 try:
                     if heartbeat is not None:
                         heartbeat.close()
-                    authority_diagnostics.update(ros=ros_guard.diagnostic(), serial=serial_guard.diagnostic())
+                    authority_diagnostics.update(ros=actuator.ros_guard.diagnostic(),
+                                                 serial=actuator.serial_guard.diagnostic())
                 finally:
                     actuator.close()
         finally:
@@ -832,15 +881,22 @@ def main(argv=None):
               'odometry_displacement_m': math.hypot(last_pose.x - first_pose.x, last_pose.y - first_pose.y)
               if first_pose is not None else None}
     if actuator is not None:
-        trajectory = recorder.trial_trajectory(actuator.caller, started, _monotonic())
+        trajectory = recorder.trial_trajectory(actuator.caller, started, _monotonic(),
+                                               roaming.callers if roaming is not None else ())
         result.update(relay_caller=actuator.caller, relay_fault=actuator.stop_line,
                       relay_exited=actuator.transport.exited, path_m=travelled,
                       authority_diagnostics=authority_diagnostics,
                       observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
         if room is not None:
             result['room_loop'] = summarize_room_loop(trajectory, arc_traces)
+    if roaming is not None:
+        result.update(relay_recoveries=roaming.recoveries, relay_callers=sorted(roaming.callers))
     print(json.dumps(result, allow_nan=False))
     complete = ready_ticks and timeline_closed and model_joined and (progress is None or progress.fault is None)
+    if args.roam:
+        closed = actuator is None or actuator.transport.process is None or actuator.transport.exited is True
+        return 0 if closed and timeline_closed and model_joined and reason in (
+            'session_ended', 'interrupted', 'travel_limit') else 2
     if args.drive:
         complete = complete and actuator is not None and actuator.transport.exited and travelled >= .20
     if args.drive_arcs and room is not None and complete:
