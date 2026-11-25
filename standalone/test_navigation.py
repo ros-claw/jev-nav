@@ -975,6 +975,31 @@ def test_initial_mapped_forward_can_continue_with_locally_checked_successors():
         assert runtime.close()
 
 
+def test_a_mismatched_old_room_view_leaves_current_local_perception_ready():
+    from run_navigation import RosNavigationInput
+
+    class Unregistered(object):
+        attempts = 0
+
+        def registered_cells(self, view, scan, now, ros_now):
+            self.attempts += 1
+            return []
+
+    source = RosNavigationInput.__new__(RosNavigationInput)
+    source.revisit, source.revisit_scan = Unregistered(), None
+    source.latest_scan = object()
+    source.rospy = type('Ros', (), {'Time': type('Time', (), {
+        'now': staticmethod(lambda: type('Stamp', (), {'to_sec': lambda self: 100.})()),
+    })})()
+    local = view(1.)
+    assert source.register_revisit(None, local, 1.) is local
+    assert source.register_revisit(None, local, 1.01) is local
+    assert source.revisit.attempts == 1
+    source.latest_scan = object()
+    assert source.register_revisit(None, local, 1.02) is local
+    assert source.revisit.attempts == 2
+
+
 def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_sequences(monkeypatch):
     import explore
     from run_navigation import RosNavigationInput

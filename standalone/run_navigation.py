@@ -54,6 +54,7 @@ class RosNavigationInput(object):
         self.spatial = None
         self.history = None
         self.revisit = None
+        self.revisit_scan = None
         self.revisit_registered = 0
         self.last_context = None
         self.grid_updates = collections.Counter()
@@ -200,15 +201,16 @@ class RosNavigationInput(object):
                     Pose(*odom['pose']), grid, ready, evidence)
 
     def register_revisit(self, room, view, now):
-        if self.revisit is None or view is None:
+        scan = self.latest_scan
+        if self.revisit is None or not ready(view, now) or scan is None or scan is self.revisit_scan:
             return view
-        cells = self.revisit.registered_cells(view, self.latest_scan, now, self.rospy.Time.now().to_sec())
+        self.revisit_scan = scan
+        cells = self.revisit.registered_cells(view, scan, now, self.rospy.Time.now().to_sec())
         if cells:
             self.revisit_registered = room.retain_revisit(view, cells, now)
             if self.revisit_registered:
                 self.revisit = None
-                return view
-        return view._replace(ready=False)
+        return view
 
     def choose(self, request, cancelled):
         from explore import WORKER, base_state, run_decision_process, sample_clocks, source_time
@@ -573,8 +575,7 @@ def main(argv=None):
             warm_until = _monotonic() + 30.
             while not ready(current_view(), _monotonic()):
                 if rospy.is_shutdown() or _monotonic() >= warm_until:
-                    cause = ('room_revisit_unregistered' if source.revisit is not None else
-                             spatial.status if spatial is not None and spatial.status != 'registered'
+                    cause = (spatial.status if spatial is not None and spatial.status != 'registered'
                              else 'perception_not_ready')
                     raise ActuationError('navigation_' + cause)
                 time.sleep(.05)
