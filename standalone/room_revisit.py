@@ -6,10 +6,11 @@ import math
 import os
 
 from navigation import HALF_LENGTH, HALF_WIDTH, Pose, _relative, ready
+from room_perception import RoomPerception
 from trail_recovery import recorded_anchor_matches, recorded_scan_matches
 
 
-MAX_HISTORY_SEC = 3600.
+MAX_HISTORY_SEC = RoomPerception.REVISIT_HISTORY_SEC
 MAX_PIVOT_HISTORY_SEC = 600.
 SECTORS = (-65., -45., -30., -12., 8., 30., 55., 70.)
 
@@ -107,6 +108,7 @@ class RoomRevisit(object):
             return []
         observations = [(x, y, now - (ros_now - observed)) for x, y, observed in self.cells
                         if 0 <= ros_now - observed < MAX_HISTORY_SEC]
-        observations.extend((x, y, now - (ros_now - at)) for x, y, at in self.body_cells
+        observations.extend((x, y, now - (ros_now - at), now - (ros_now - at) + MAX_PIVOT_HISTORY_SEC)
+                            for x, y, at in self.body_cells
                             if 0 <= ros_now - at < MAX_PIVOT_HISTORY_SEC)
         return observations

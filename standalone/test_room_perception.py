@@ -47,6 +47,16 @@ def test_registered_revisit_only_fills_blind_unknown_and_live_hits_invalidate_it
     assert memory.view(observation(126., unknown, x=.15, epoch=1), 126.).grid.cells[5] == -1
 
 
+def test_registered_revisit_remains_local_until_the_chassis_leaves_the_area():
+    memory = RoomPerception()
+    unknown = [-1] * 12
+    start = observation(120., unknown, x=.15)
+    assert memory.retain_revisit(start, [(.025, 0., 25.)], 120.)
+    assert memory.view(observation(215., unknown, x=.15), 215.).grid.cells[5] == 0
+    memory.view(observation(216., unknown, x=.47), 216.)
+    assert memory.view(observation(217., unknown, x=.15), 217.).grid.cells[5] == -1
+
+
 def test_isolated_occupied_cell_expires_to_unknown_instead_of_restoring_older_free_space():
     memory = RoomPerception()
     memory.view(observation(1., [0] * 12, x=0.), 1.)
