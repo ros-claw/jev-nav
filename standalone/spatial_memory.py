@@ -193,7 +193,8 @@ class SpatialMemory(object):
                 distance = 0. if action in request.observation_turns else length
                 endpoint = arc_pose(endpoint, distance, 0.)
             elif action in curvatures:
-                endpoint = arc_pose(request.anchor, length, curvatures[action])
+                distance = dict(request.short_segments).get(action, length)
+                endpoint = arc_pose(request.anchor, distance, curvatures[action])
             else:
                 continue
             point = compose(self.fixed.odom_to_map, endpoint)

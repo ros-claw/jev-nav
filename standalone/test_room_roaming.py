@@ -88,6 +88,8 @@ def test_rebinding_needs_distinct_recent_stationary_wheel_samples():
 
     recorder = ObservationRecorder.__new__(ObservationRecorder)
     recorder.lock = threading.Lock()
+    recorder.clock = type('Clock', (), {'now': lambda self: 1.21})()
+    recorder.wall_time = lambda: 50.21
     recorder.odometry = deque([
         (1.01, 1., 2., 0., .4, 0., 50.01, 101),
         (1.07, 1., 2., 0., .4, 0., 50.07, 102),
@@ -95,6 +97,9 @@ def test_rebinding_needs_distinct_recent_stationary_wheel_samples():
         (1.19, 1., 2., 0., .4, 0., 50.19, 104),
     ])
     assert recorder.stationary_since(1., 1.21)
+    recorder.wall_time = lambda: 50.36
+    assert not recorder.stationary_since(1., 1.21)
+    recorder.wall_time = lambda: 50.21
     assert not recorder.stationary_since(1., 1.4)
     assert not recorder.stationary_since(1.10, 1.21)
     recorder.odometry[-1] = (1.19, 1.01, 2., .006, .4, 0., 50.19, 104)
@@ -114,6 +119,29 @@ def test_room_roam_remains_opt_in_and_allows_explicit_trial_bounds():
     assert rehearsal.seconds == 60. and rehearsal.max_travel_m == .30
     with pytest.raises(SystemExit):
         parse_args(['--timeline', '/tmp/trace', '--roam'])
+
+
+def test_room_loop_wakes_for_the_latest_grid_without_losing_a_racing_update():
+    from run_navigation import RosNavigationInput
+
+    source = RosNavigationInput.__new__(RosNavigationInput)
+    previous = source.latest_grid = object()
+    waited = []
+
+    class Wake(object):
+        def clear(self):
+            source.latest_grid = replacement[0]
+
+        def wait(self, seconds):
+            waited.append(seconds)
+
+    replacement = [previous]
+    source.grid_changed = Wake()
+    source.wait_for_grid(previous, .05)
+    assert waited == [.05]
+    replacement[0] = object()
+    source.wait_for_grid(previous, .05)
+    assert waited == [.05]
 
 
 @pytest.mark.parametrize('stamp,arrival,reason', [

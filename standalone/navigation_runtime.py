@@ -171,6 +171,11 @@ class NavigationRuntime(object):
                     self._blocked_replacement = None
                 else:
                     self._blocked_replacement = geometry
+                    if settling_pivot and self.navigation.short_room_segments:
+                        command = self.navigation.stop('pivot_replan')
+                        self.room_plan = self.review_origin = self._detour = None
+                        self._last_grid = None
+                        replacing = False
         published = self.publish(command)
         if published is not None:
             command = published
@@ -218,8 +223,7 @@ class NavigationRuntime(object):
             return False
         if action.startswith('pivot_'):
             return self.navigation.pivot_request_clear(request, action, view)
-        return (action in self.navigation.curvature and sweep_block(
-            view.grid, request.anchor, self.navigation.length, self.navigation.curvature[action], view.pose) is None)
+        return action in self.navigation.curvature and self.navigation.segment_request_clear(request, action, view)
 
     def wait_stage(self, decision):
         if self.navigation.goal is not None:

@@ -211,13 +211,14 @@ def make_ros_monitor(clock, driver_pid, master_uri, retry_late_samples=False):
 
 class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
     """Subscribe only; never publish a command."""
-    def __init__(self, clock, capacity=2000):
+    def __init__(self, clock, capacity=2000, odom_queue_size=10):
         import rospy
         from geometry_msgs.msg import Twist
         from nav_msgs.msg import Odometry
         self.clock, self.lock = clock, threading.Lock()
+        self.wall_time = lambda: rospy.Time.now().to_sec()
         self.odometry, self.commands = collections.deque(maxlen=capacity), collections.deque(maxlen=capacity)
-        self.subscribers = [rospy.Subscriber('/odom', Odometry, self._odom, queue_size=10),
+        self.subscribers = [rospy.Subscriber('/odom', Odometry, self._odom, queue_size=odom_queue_size),
                             rospy.Subscriber('/cmd_vel', Twist, self._command, queue_size=10)]
 
     def _odom(self, message):
@@ -263,25 +264,32 @@ class ObservationRecorder(object):  # noqa: UP004 - ROS Melodic Python 2
         return list(reversed(selected))
 
     def stationary_since(self, after, now):
-        """Require distinct recent stopped poses received after a relay closed."""
+        """Require distinct recent stopped poses acquired after a relay closed."""
+        from explore import sample_clocks, source_time
+
+        clocks = sample_clocks(self.clock.now, self.wall_time)
+        if clocks is None:
+            return False
         with self.lock:
             if not self.odometry:
                 return False
             latest = self.odometry[-1]
-            if not 0 <= now - latest[0] < .15:
+            latest_source = source_time(clocks[0], clocks[1], latest[6], .15)
+            if latest_source is None or not 0 <= now - latest[0] < .15:
                 return False
             newer = None
             for row in reversed(self.odometry):
-                if row[0] <= after or latest[0] - row[0] > .35:
+                source = source_time(clocks[0], clocks[1], row[6], .35)
+                if source is None or source <= after or row[0] <= after:
                     break
                 yaw = math.atan2(math.sin(row[4] - latest[4]), math.cos(row[4] - latest[4]))
                 if (abs(row[3]) >= .003 or abs(row[5]) >= .01 or abs(yaw) > .012
                         or math.hypot(row[1] - latest[1], row[2] - latest[2]) > .003):
                     return False
-                if newer is not None and (not 0 < newer[0] - row[0] < .12 or row[6] >= newer[6]
+                if newer is not None and (not 0 < newer[0] - row[0] < .12 or not 0 < newer[6] - row[6] < .12
                                           or row[7] >= newer[7]):
                     return False
-                if latest[0] - row[0] >= .15:
+                if latest_source - source >= .15:
                     return True
                 newer = row
         return False

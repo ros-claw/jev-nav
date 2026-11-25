@@ -9,13 +9,17 @@ Pose = namedtuple('Pose', 'x y yaw')
 Grid = namedtuple('Grid', 'x y resolution width height cells')
 View = namedtuple('View', 'grid_at scan_at depth_at odom_at status_at epoch pose grid ready depth_evidence')
 View.__new__.__defaults__ = (None,)
-Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks pivot_turns observation_turns')
-Request.__new__.__defaults__ = ((), ())
+Request = namedtuple('Request', 'sequence at epoch anchor choices predecessor blocks pivot_turns observation_turns short_segments')
+Request.__new__.__defaults__ = ((), (), ())
 Command = namedtuple('Command', 'linear angular action reason')
-Segment = namedtuple('Segment', 'sequence action origin turn')
+Segment = namedtuple('Segment', 'sequence action origin turn length')
+Segment.__new__.__defaults__ = (None,)
 
 LENGTH = .24
 ROOM_LENGTH = .12
+ROOM_SHORT_SEGMENTS = (.08, .05, .035)
+ROOM_TRACK_SWEEP = .10
+ROOM_TRACK_RESERVE = .03
 ROOM_OBSTACLE_LOOKAHEAD = .60
 ROOM_TRACK_LOOKAHEAD = .36
 FORWARD_SUCCESSOR_LEAD = .15
@@ -192,19 +196,21 @@ def _remaining(goal, pose, length, curvature):
     local = _relative(goal.origin, pose)
     distance = (math.atan2(curvature * local.x, 1. - curvature * local.y) / curvature
                 if curvature else local.x)
-    return length - distance
+    return (goal.length or length) - distance
 
 
 class Navigation(object):
     """Single-writer task state. Feed immutable observations and finished choices."""
 
-    def __init__(self, forward_only=False, speed=SPEED, successor_lead=None, static_room=False):
+    def __init__(self, forward_only=False, speed=SPEED, successor_lead=None, static_room=False,
+                 short_room_segments=False):
         self.last_observation_turn = None
         self._pivot_body = None
         if not 0. < speed <= SPEED:
             raise ValueError('invalid navigation speed')
         self.forward_only, self.max_speed = forward_only, speed
         self.static_room = static_room
+        self.short_room_segments = static_room and short_room_segments
         self.length = ROOM_LENGTH if static_room else LENGTH
         self.curvature = ROOM_CURVATURE if static_room else CURVATURE
         self.successor_lead = successor_lead or (FORWARD_SUCCESSOR_LEAD if forward_only else .09)
@@ -270,7 +276,7 @@ class Navigation(object):
                 # The predecessor's original heading may differ slightly.
                 anchor = arc_pose(view.pose, max(0., remaining), 0.)
             else:
-                anchor = arc_pose(self.goal.origin, self.length, self.curvature[self.goal.action])
+                anchor = arc_pose(self.goal.origin, self.goal.length or self.length, self.curvature[self.goal.action])
             predecessor = self.goal.sequence
         else:
             anchor, predecessor = view.pose, None
@@ -281,19 +287,36 @@ class Navigation(object):
                 choices.append(action)
             else:
                 self.candidate_blocks[action] = block
-        pivot_turns, observation_turns = (), ()
+        pivot_turns, observation_turns, short_segments = (), (), ()
         if self.static_room and self.goal is None:
             pivot_turns, observation_turns = self._room_turns(view, anchor, choices)
             if pivot_turns:
                 choices = [action for action, _ in pivot_turns]
+        if not choices and self.short_room_segments and predecessor is None:
+            short_segments = tuple((action, distance) for action in actions for distance in
+                                   [self._short_segment(view, anchor, action)] if distance is not None)
+            choices = [action for action, _ in short_segments]
         if not choices:
             return None
         self.sequence += 1
         blocks = tuple((action,) + self.candidate_blocks[action] for action in actions
                        if action in self.candidate_blocks)
         self.pending = Request(self.sequence, now, view.epoch, anchor, tuple(choices) + ('stop',), predecessor,
-                               blocks, pivot_turns, observation_turns)
+                               blocks, pivot_turns, observation_turns, short_segments)
         return self.pending
+
+    def _short_segment(self, view, anchor, action):
+        for distance in ROOM_SHORT_SEGMENTS:
+            if self._segment_clear(view, anchor, action, distance):
+                return distance
+        return None
+
+    def _segment_clear(self, view, anchor, action, shortened):
+        distance = self.length if shortened is None else min(ROOM_TRACK_SWEEP, shortened + ROOM_TRACK_RESERVE)
+        return sweep_clear(view.grid, anchor, distance, self.curvature[action], view.pose)
+
+    def segment_request_clear(self, request, action, view):
+        return self._segment_clear(view, request.anchor, action, dict(request.short_segments).get(action))
 
     def _room_turns(self, view, anchor, choices):
         obstacle = sweep_block(view.grid, anchor, .42, 0., occupied_only=True)
@@ -479,9 +502,9 @@ class Navigation(object):
             if (math.hypot(offset.x, offset.y) > .015 or abs(offset.yaw) > .05
                     or not self.pivot_request_clear(request, choice, view)):
                 return False
-        elif not sweep_clear(view.grid, request.anchor, self.length, self.curvature[choice], view.pose):
+        elif not self.segment_request_clear(request, choice, view):
             return False
-        segment = Segment(request.sequence, choice, request.anchor, turn)
+        segment = Segment(request.sequence, choice, request.anchor, turn, dict(request.short_segments).get(choice))
         if active_predecessor:
             self.successor = segment
         elif self.goal is None and request.predecessor in (None, self.completed):
@@ -513,7 +536,7 @@ class Navigation(object):
 
         remaining = _remaining(self.goal, view.pose, self.length, self.curvature[self.goal.action])
         if remaining <= STOP_DISTANCE:
-            end = arc_pose(self.goal.origin, self.length, self.curvature[self.goal.action])
+            end = arc_pose(self.goal.origin, self.goal.length or self.length, self.curvature[self.goal.action])
             if math.hypot(end.x - view.pose.x, end.y - view.pose.y) > .03:
                 return self.stop('path_tracking_lost')
             self.completed = self.goal.sequence
@@ -527,24 +550,26 @@ class Navigation(object):
 
     def _track(self, view, elapsed, room_direction=None):
         curvature = self.curvature[self.goal.action]
+        length = self.goal.length or self.length
         remaining = _remaining(self.goal, view.pose, self.length, curvature)
-        on_path = arc_pose(self.goal.origin, max(0., self.length - remaining), curvature)
+        on_path = arc_pose(self.goal.origin, max(0., length - remaining), curvature)
         error = _relative(on_path, view.pose)
         lateral_limit, yaw_limit = (.02, .05) if self.forward_only else (.04, .22)
         if abs(error.y) > lateral_limit or abs(error.yaw) > yaw_limit:
             return self.stop('path_tracking_lost')
         if (self.static_room and remaining < .08 and self.successor is not None
                 and self.successor.action not in PIVOTS):
-            target = arc_pose(self.successor.origin, .08 - max(0., remaining),
+            target_distance = min(.08 - max(0., remaining), self.successor.length or self.length)
+            target = arc_pose(self.successor.origin, target_distance,
                               self.curvature[self.successor.action])
         else:
-            target = arc_pose(self.goal.origin, self.length - max(0., remaining - .08), curvature)
+            target = arc_pose(self.goal.origin, length - max(0., remaining - .08), curvature)
         lookahead = _relative(view.pose, target)
         if lookahead.x <= 0:
             return self.stop('path_tracking_lost')
         steer = (0. if self.forward_only else
                  max(-2., min(2., 2. * lookahead.y / (lookahead.x ** 2 + lookahead.y ** 2))))
-        lookahead_distance = min(.10, remaining + .03)
+        lookahead_distance = min(ROOM_TRACK_SWEEP, remaining + ROOM_TRACK_RESERVE)
         checked = False
         if self.static_room:
             limit = 5. * min(.05, elapsed)

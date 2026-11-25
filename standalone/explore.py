@@ -583,7 +583,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
 
     def __init__(self, depth_projection_config=None, sensor_names=None, depth_projector=None, scan_validator=None,
                  separate_model_camera=False, filter_lidar_margin=False, use_source_deadlines=False,
-                 drop_expired_odometry=False):
+                 drop_expired_odometry=False, odom_continuity_age=0., odom_queue_size=None):
         import rospy
         import tf
         from cv_bridge import CvBridge
@@ -596,6 +596,7 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.lock = threading.Lock()
         self.latest = {}
         self.drop_expired_odometry = drop_expired_odometry
+        self.odom_continuity_age = odom_continuity_age
         self.expired_odometry = 0
         self._sensor_generations = {'scan': 0, 'depth': 0}
         self._sensor_receipts = {name: collections.deque(maxlen=4) for name in self._sensor_generations}
@@ -644,6 +645,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
         self.subscriptions = []
         for name, topic, typ in topics:
             options = {'queue_size': sensor_queue_size(name)}
+            if name == 'odom' and odom_queue_size is not None:
+                options['queue_size'] = odom_queue_size
             if typ is Image:
                 # The measured color and depth messages both fit in 1 MiB.
                 # Keep the single-frame receive queue used by the image topics.
@@ -667,12 +670,19 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                     return
                 header_stamp = message.header.stamp.to_sec()
                 stamp = source_time(ros_now, received, header_stamp, self.limits[name])
+                continuity_only = False
                 if stamp is None:
                     age = ros_now - header_stamp if _finite(header_stamp) and _finite(ros_now) else None
                     if (name == 'odom' and getattr(self, 'drop_expired_odometry', False)
                             and _finite(age) and header_stamp > 0 and age > self.limits[name]):
-                        # The next fresh odometry sample still has to pass the continuity guard.
                         self.expired_odometry += 1
+                        # Delayed odometry can preserve the source sequence and pose chain.
+                        # It must stay out of the current pose and perception history.
+                        stamp = source_time(ros_now, received, header_stamp,
+                                            getattr(self, 'odom_continuity_age', 0.))
+                        continuity_only = True
+                if stamp is None:
+                    if continuity_only:
                         return
                     self.latest.pop(name, None)
                     self.epoch += 1
@@ -711,6 +721,8 @@ class RosObservation(object):  # noqa: UP004 - ROS Melodic Python 2
                         self.odom_history.clear()
                         self.epoch += 1
                         self.epoch_issue = {'reason': 'odom_discontinuity', 'sensor': name}
+                        return
+                    if continuity_only:
                         return
                 previous = self.latest.get(name)
                 if previous is not None and stamp <= previous["stamp"]:

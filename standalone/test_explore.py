@@ -2,6 +2,7 @@
 
 import math
 import threading
+from collections import deque
 
 import numpy as np
 import pytest
@@ -161,6 +162,46 @@ def test_navigation_drops_expired_odometry_without_resetting_a_valid_epoch(monke
     assert observer.epoch == 5 and 'odom' not in observer.latest
 
 
+def test_room_odometry_backlog_checks_continuity_without_rejuvenating_pose(monkeypatch):
+    import explore
+    from observation_guards import ClockGuard, OdomGuard
+
+    def obj(**fields):
+        return type('MessagePart', (), fields)()
+
+    observer = RosObservation.__new__(RosObservation)
+    observer.lock = threading.Lock()
+    observer.clock_guard = ClockGuard(.02)
+    observer.odom_guard = OdomGuard(.12, .1, .002, .003, .3)
+    observer.rospy = obj(Time=obj(now=lambda *_: None))
+    observer.tf = obj(transformations=obj(euler_from_quaternion=lambda *_: (0., 0., 0.)))
+    observer.latest, observer.epoch, observer.limits = {}, 0, {'odom': .25}
+    observer.odom_history = deque()
+    observer.drop_expired_odometry, observer.expired_odometry = True, 0
+    observer.odom_continuity_age = 1.5
+
+    def receive(seq, stamp, arrival, x=0.):
+        monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (arrival, arrival - 50.))
+        observer._receive(obj(header=obj(stamp=obj(to_sec=lambda *_: stamp), seq=seq, frame_id='odom'),
+                              child_frame_id='base_link',
+                              pose=obj(pose=obj(position=obj(x=x, y=0.),
+                                                orientation=obj(x=0., y=0., z=0., w=1.)))), 'odom')
+
+    receive(1, 100., 100.01)
+    first = observer.latest['odom']
+    receive(2, 100.1, 100.78)
+    receive(3, 100.2, 100.79)
+    receive(4, 100.4, 100.80)
+    assert observer.latest['odom'] is first
+    assert [row['message'].header.seq for row in observer.odom_history] == [1]
+    receive(5, 100.6, 100.81)
+    assert not observer.odom_guard.faulted
+    assert observer.latest['odom']['stamp'] == pytest.approx(50.6)
+    receive(6, 100.7, 101.1, x=.20)
+    assert observer.odom_guard.fault_reason == 'odometry_pose_discontinuity'
+    assert 'odom' not in observer.latest
+
+
 def test_delayed_clock_pair_is_discarded_instead_of_false_clock_jump():
     times = iter([10.0, 10.004, 10.1, 10.14])
     first = sample_clocks(lambda: next(times), lambda: 100.0)
@@ -271,12 +312,15 @@ def test_current_sample_rejects_evidence_that_expires_during_check(monkeypatch):
     assert observer.current_valid_until(sample) is None
 
 
-def test_current_sample_rejects_new_scan_odom_drift_or_base_fault():
+def test_current_sample_rejects_new_scan_odom_drift_or_base_fault(monkeypatch):
+    import explore
+
     class Value(object):
         pass
     class Guard(object):
         faulted = False
-    now = _monotonic()
+    now = 100.
+    monkeypatch.setattr(explore, '_monotonic', lambda: now)
     odom, status = Value(), Value()
     odom.twist = Value()
     odom.twist.twist = Value()

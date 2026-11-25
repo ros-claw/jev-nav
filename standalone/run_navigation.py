@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -19,6 +20,8 @@ from navigation_actuator import ActuationError, NavigationActuator, NavigationHe
 from navigation_runtime import MappedChoice, NavigationRuntime
 from native_sensing_probe import _stop_group, _yaw
 from relay import _monotonic
+
+ROOM_ODOM_QUEUE_SIZE = 64
 
 
 def brighten_low_light(image):
@@ -37,7 +40,7 @@ def brighten_low_light(image):
 
 class RosNavigationInput(object):
     def __init__(self, rospy, grid_topic, decisions, operator_clear_front=False, static_room=False,
-                 independent_odom_topic=None):
+                 independent_odom_topic=None, roam=False):
         from explore import RosObservation
         from limo_fresh_layer.msg import FreshGrid
         from sensor_msgs.msg import Image, LaserScan
@@ -45,8 +48,11 @@ class RosNavigationInput(object):
         self.rospy = rospy
         self.operator_clear_front = operator_clear_front
         self.static_room = static_room
-        self.observation = RosObservation(sensor_names=('odom', 'status'), drop_expired_odometry=True)
+        self.observation = RosObservation(sensor_names=('odom', 'status'), drop_expired_odometry=True,
+                                          odom_continuity_age=1.5 if roam else 0.,
+                                          odom_queue_size=ROOM_ODOM_QUEUE_SIZE if roam else None)
         self.latest_grid = None
+        self.grid_changed = threading.Event() if roam else None
         self.last_grid_times = None
         self.color_type = Image
         self.latest_scan = None
@@ -180,10 +186,17 @@ class RosNavigationInput(object):
             evidence = DepthEvidence(message.depth_stamp.to_nsec(), message.header.frame_id, hits, {})
             self.last_grid_times = raw_times
             self.latest_grid = times, Grid(x, y, info.resolution, info.width, info.height, cells), evidence
+            if self.grid_changed is not None:
+                self.grid_changed.set()
             self.grid_updates['ready'] += 1
         except (AttributeError, ArithmeticError, ValueError, TypeError):
             self.grid_updates['invalid_grid'] += 1
             self.latest_grid = None
+
+    def wait_for_grid(self, observed, timeout):
+        self.grid_changed.clear()
+        if self.latest_grid is observed:
+            self.grid_changed.wait(timeout)
 
     def view(self):
         from explore import base_state
@@ -516,7 +529,7 @@ def main(argv=None):
         if rospy.get_param('/use_sim_time', False):
             raise RuntimeError('ROS wall time required for live acquisition')
         source = RosNavigationInput(rospy, costmap, args.decisions, args.operator_clear_front, args.static_room,
-                                    args.independent_odom_topic)
+                                    args.independent_odom_topic, roam=args.roam)
         if args.room_revisit:
             from room_revisit import RoomRevisit
             try:
@@ -600,7 +613,9 @@ def main(argv=None):
                 return NavigationActuator(RelayProcessTransport(clock), ros, serial, clock,
                                           arc_navigation=args.drive_arcs, room_pivot=args.static_room)
 
-            recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000)
+            # rospy shares the transport queue for both in-process odometry subscribers.
+            recorder = ObservationRecorder(clock, capacity=60000 if room is not None else 12000,
+                                           odom_queue_size=ROOM_ODOM_QUEUE_SIZE if args.roam else 10)
             from progress_monitor import ProgressMonitor
             progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None)
             if args.roam:
@@ -628,7 +643,8 @@ def main(argv=None):
         if heartbeat is not None or roaming is not None:
             publish_command = publish_room
         navigation = Navigation(forward_only=args.drive_forward, speed=args.speed_mps,
-                                successor_lead=.075 if room is not None else None, static_room=args.static_room)
+                                successor_lead=.075 if room is not None else None, static_room=args.static_room,
+                                short_room_segments=args.roam)
         runtime = NavigationRuntime(choose, publish_command, navigation,
                                     static_room=args.static_room)
         started = last_process_check = last_block_report = _monotonic()
@@ -640,6 +656,7 @@ def main(argv=None):
                 last_process_check = now
                 if any(child.poll() is not None for child in children):
                     raise ActuationError('navigation_perception_process_exited')
+            observed_grid = source.latest_grid
             view = current_view()
             now = _monotonic()
             if roaming is not None:
@@ -710,6 +727,8 @@ def main(argv=None):
                     fields['rear_revisit_cells'] = room.revisited_cells
             if command.action != 'stop':
                 fields['decision_id'] = runtime.navigation.goal.sequence
+                if runtime.navigation.goal.length is not None:
+                    fields['segment_distance_m'] = runtime.navigation.goal.length
                 if command.action in PIVOTS:
                     fields['turn_target_rad'] = runtime.navigation.goal.turn
             if view is not None:
@@ -777,6 +796,9 @@ def main(argv=None):
                                                   'candidate_id': '.'.join(request.choices),
                                                   'status': 'route_review' if runtime.review_origin is not None
                                                   else 'initial_route'})
+                for action, distance in request.short_segments:
+                    timeline.record('decision', now, {'decision_id': request.sequence, 'stage': 'short_segment',
+                                                      'candidate_id': action, 'segment_distance_m': distance})
             if decision is not None:
                 decision_fields = {'decision_id': decision[0], 'selected_action': decision[1],
                                    'status': 'accepted' if decision[2] else 'rejected'}
@@ -812,7 +834,10 @@ def main(argv=None):
                     timeline.record('perception', now, {'stage': action, 'reason': block_reason, 'x': x, 'y': y})
             remaining = control_sample_delay(sample_started, _monotonic())
             if remaining > 0:
-                time.sleep(remaining)
+                if args.roam:
+                    source.wait_for_grid(observed_grid, remaining)
+                else:
+                    time.sleep(remaining)
     except KeyboardInterrupt:
         reason = 'interrupted'
     except (ActuationError, IOError, OSError) as exc:
@@ -886,7 +911,9 @@ def main(argv=None):
         result.update(relay_caller=actuator.caller, relay_fault=actuator.stop_line,
                       relay_exited=actuator.transport.exited, path_m=travelled,
                       authority_diagnostics=authority_diagnostics,
-                      observed=summarize_navigation_trajectory(trajectory), trajectory=trajectory)
+                      observed=summarize_navigation_trajectory(trajectory))
+        if not args.roam:
+            result['trajectory'] = trajectory
         if room is not None:
             result['room_loop'] = summarize_room_loop(trajectory, arc_traces)
     if roaming is not None:

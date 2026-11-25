@@ -42,6 +42,21 @@ def test_room_starts_at_effective_crawl_only_after_a_current_clear_sweep():
     assert navigation.step(view(1.15, cells=grid({(.22, 0.): 100})), 1.15).linear == 0.
 
 
+def test_free_roam_checks_a_shorter_segment_with_braking_space_when_full_starts_are_blocked():
+    wall = grid({(.255, i * .04): 100 for i in range(-7, 8)})
+    observation = view(1., cells=wall)
+    navigation = Navigation(static_room=True, short_room_segments=True)
+    assert Navigation(static_room=True).request(observation, 1.) is None
+    request = select(navigation, 'forward', 1., observation)
+    distance = dict(request.short_segments)['forward']
+    assert .03 < distance < navigation.length
+    assert navigation.step(view(1.05, cells=wall), 1.05).linear > 0.
+    assert navigation.step(view(1.10, Pose(distance - .005, 0., 0.), wall), 1.10).reason == 'goal_reached'
+
+    tight_wall = grid({(.215, i * .04): 100 for i in range(-7, 8)})
+    assert Navigation(static_room=True, short_room_segments=True).request(view(2., cells=tight_wall), 2.) is None
+
+
 def test_goal_keeps_running_across_model_failure_and_uses_odometry_to_complete():
     navigation = Navigation()
     observation = view(1.)
@@ -967,6 +982,30 @@ def test_unknown_during_a_pivot_allows_a_replacement_only_after_fresh_settled_od
         assert runtime.close()
 
 
+def test_free_roam_replans_a_settled_blocked_pivot_with_the_shorter_safe_options(monkeypatch):
+    import navigation as tracker
+
+    wall = grid({(.255, i * .04): 100 for i in range(-7, 8)})
+    observation = view(1., cells=wall)
+    navigation = Navigation(static_room=True, short_room_segments=True)
+    navigation.epoch = 0
+    navigation.goal = tracker.Segment(1, 'pivot_left', observation.pose, .25)
+    runtime = NavigationRuntime(lambda request, cancelled: None, lambda command: None,
+                                navigation, static_room=True)
+    runtime.room_plan = (1, 'left')
+    monkeypatch.setattr(tracker, 'rotation_block', lambda *args: ('unknown', .15, .10))
+    try:
+        for at in (1., 1.1, 1.2):
+            command, request, _ = runtime.cycle(view(at, cells=wall), at)
+            assert command.reason == 'path_unknown' and request is None
+        command, request, _ = runtime.cycle(view(1.26, cells=wall), 1.26)
+        assert command.reason == 'pivot_replan' and command.linear == command.angular == 0.
+        assert request is not None and dict(request.short_segments)['forward'] > 0.
+        assert navigation.goal is None
+    finally:
+        assert runtime.close()
+
+
 def test_initial_mapped_forward_can_continue_with_locally_checked_successors():
     runtime = NavigationRuntime(lambda request, cancelled: MappedChoice('forward', '%d-forward' % request.sequence),
                                 lambda command: None, Navigation(static_room=True), static_room=True)
@@ -1037,7 +1076,7 @@ def test_ros_grid_keeps_sensor_source_times_and_accepts_independent_transport_se
         return message(to_sec=lambda self: value, to_nsec=lambda self: int(round(value * 1e9)))
 
     source = RosNavigationInput.__new__(RosNavigationInput)
-    source.latest_grid = source.last_grid_times = None
+    source.latest_grid = source.last_grid_times = source.grid_changed = None
     source.grid_updates = collections.Counter()
     source.rospy = message(Time=message(now=lambda self: stamp(101.)))
     monkeypatch.setattr(explore, 'sample_clocks', lambda *_: (101., 11.))

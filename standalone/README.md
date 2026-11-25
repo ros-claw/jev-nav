@@ -36,6 +36,8 @@ For an attended room, `--roam` with `--drive-arcs --static-room` keeps the local
 
 Pair `--roam` with the recorder's `--rolling` mode to rotate compact ROS bags within the specified budget. An interrupt to the foreground recorder shuts down motor output and finalizes the recording.
 
+The roaming controller wakes on fresh grids and checks delayed odometry for continuity before it can use the next fresh pose. After settling from a blocked turn, it checks new routes from the measured pose. If full starts and observation turns are unavailable, it can offer shorter measured segments with the same steering and stopping-clearance checks. The decision targets and timeline include these distances.
+
 The room profile checks 12 cm segments and looks farther for occupied cells when selecting a detour. A point turn is available when the straight route encounters an obstacle, the complete rotational sweep is observed, and a checked forward exit is available. The room relay caps rotation to 0.05 rad/s and enforces the same command and driver watchdogs during a point turn.
 
 The room controller follows through to the next checked segment as it nears a waypoint. While moving, it periodically checks for measured obstacles up to 36 cm along the current route, including the prepared successor. When its immediate sweep is still clear, it can start a checked detour at the measured pose and retain its forward speed. The nearer detour sweep must have live coverage, and the longer sweep must be clear of measured obstacles. The tracker checks the actual steering before publishing. The timeline records these changes as `early_detour` events.
