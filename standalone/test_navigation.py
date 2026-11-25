@@ -975,6 +975,24 @@ def test_initial_mapped_forward_can_continue_with_locally_checked_successors():
         assert runtime.close()
 
 
+def test_a_room_decision_reads_a_single_bounded_color_frame():
+    from run_navigation import RosNavigationInput
+
+    frame, message_type = object(), object()
+    calls = []
+
+    class ROS(object):
+        def wait_for_message(self, topic, kind, timeout):
+            calls.append((topic, kind, timeout))
+            return frame
+
+    source = RosNavigationInput.__new__(RosNavigationInput)
+    source.rospy, source.color_type = ROS(), message_type
+    assert source.decision_image(lambda: False) is frame
+    assert source.decision_image(lambda: True) is None
+    assert calls == [('/camera/color/image_raw', message_type, .22)]
+
+
 def test_a_mismatched_old_room_view_leaves_current_local_perception_ready():
     from run_navigation import RosNavigationInput
 

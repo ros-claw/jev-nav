@@ -48,7 +48,7 @@ class RosNavigationInput(object):
         self.observation = RosObservation(sensor_names=('odom', 'status'), drop_expired_odometry=True)
         self.latest_grid = None
         self.last_grid_times = None
-        self.latest_color = None
+        self.color_type = Image
         self.latest_scan = None
         self.latest_independent = None
         self.spatial = None
@@ -71,12 +71,17 @@ class RosNavigationInput(object):
             import tf2_ros
             self.sensor_tf = tf2_ros.Buffer()
             self.sensor_tf_listener = tf2_ros.TransformListener(self.sensor_tf)
-            self.subscriptions.append(rospy.Subscriber('/camera/color/image_raw', Image, self._color,
-                                                        queue_size=1, buff_size=1024 * 1024))
             self.subscriptions.append(rospy.Subscriber('/scan', LaserScan, self._scan, queue_size=1))
 
-    def _color(self, message):
-        self.latest_color = message
+    def decision_image(self, cancelled):
+        """Read color on demand without deserializing video in the control process."""
+        if cancelled():
+            return None
+        try:
+            return self.rospy.wait_for_message('/camera/color/image_raw', self.color_type, timeout=.22)
+        except self.rospy.ROSException:
+            self.decision_errors['ColorFrameUnavailable'] += 1
+            return None
 
     def _scan(self, message):
         self.latest_scan = message
@@ -216,8 +221,10 @@ class RosNavigationInput(object):
         from explore import WORKER, base_state, run_decision_process, sample_clocks, source_time
         from live_trial_adapter import CvJpegEncoder
 
-        image = self.latest_color
-        if image is None or not request.choices or cancelled():
+        if not request.choices:
+            return None
+        image = self.decision_image(cancelled)
+        if image is None or cancelled():
             return None
         clocks = sample_clocks(_monotonic, lambda: self.rospy.Time.now().to_sec())
         if clocks is None or image.header.frame_id.lstrip('/') != 'camera_color_optical_frame':
