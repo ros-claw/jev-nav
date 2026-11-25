@@ -444,6 +444,11 @@ def summarize_room_loop(trajectory, arc_traces):
     return report
 
 
+def control_sample_delay(sample_started, now):
+    """Keep a late iteration from carrying an extra idle slot into the next one."""
+    return max(0., .05 - (now - sample_started))
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -601,9 +606,9 @@ def main(argv=None):
                                 successor_lead=.075 if room is not None else None, static_room=args.static_room)
         runtime = NavigationRuntime(choose, publish_command, navigation,
                                     static_room=args.static_room)
-        started = slot = last_process_check = last_block_report = _monotonic()
+        started = last_process_check = last_block_report = _monotonic()
         while not rospy.is_shutdown():
-            now = _monotonic()
+            sample_started = now = _monotonic()
             if args.seconds is not None and now - started >= args.seconds:
                 break
             if now - last_process_check >= .5:
@@ -757,12 +762,9 @@ def main(argv=None):
                     blocks['tracking'] = runtime.navigation.blocked_cell
                 for action, (block_reason, x, y) in blocks.items():
                     timeline.record('perception', now, {'stage': action, 'reason': block_reason, 'x': x, 'y': y})
-            slot += .05
-            remaining = slot - _monotonic()
+            remaining = control_sample_delay(sample_started, _monotonic())
             if remaining > 0:
                 time.sleep(remaining)
-            else:
-                slot += (1 + int(-remaining / .05)) * .05
     except KeyboardInterrupt:
         reason = 'interrupted'
     except (ActuationError, IOError, OSError) as exc:

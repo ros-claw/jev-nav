@@ -163,6 +163,13 @@ def test_forward_successor_has_time_to_retry_before_the_first_segment_ends(timed
     assert navigation.goal.sequence == request.sequence
 
 
+def test_a_late_control_sample_does_not_create_a_second_gap():
+    from run_navigation import control_sample_delay
+
+    assert control_sample_delay(0., .061) == 0.
+    assert control_sample_delay(.061, .081) == pytest.approx(.030)
+
+
 def test_navigation_trajectory_counts_motion_after_a_pause():
     from run_navigation import summarize_navigation_trajectory
     commands = [(1., .014, 0.), (1.05, .014, 0.), (1.1, 0., 0.),
