@@ -26,6 +26,7 @@ ROOM_CORNER_TURNS = (.70, 1.40, 2.10, 2.45)
 ROOM_SHALLOW_TURNS = (.45, .25)
 ROOM_OBSERVATION_TURN = .25
 SPEED = .02
+ROOM_START_SPEED = .014
 MAX_RESPONSE_AGE = 8.
 HALF_LENGTH, HALF_WIDTH = .16, .11
 STOP_DISTANCE = .01
@@ -384,7 +385,7 @@ class Navigation(object):
                     steer, block = curvature, None  # The full nominal arc already passed from this pose.
                 if block is None:
                     self._start_detour(view.pose, action)
-                    self.speed = min(self.max_speed, speed + .04 * min(.05, elapsed))
+                    self.speed = self._next_speed(self.max_speed, speed, elapsed)
                     self.steer = steer
                     return Command(self.speed, self.speed * steer, action, 'unknown_detour')
             self.candidate_blocks[action] = block
@@ -575,9 +576,16 @@ class Navigation(object):
             return Command(0., 0., 'stop', 'path_reacquiring')
         self.paused = False
         speed = self.max_speed if self.successor is not None else min(self.max_speed, math.sqrt(.08 * remaining))
-        self.speed = min(speed, self.speed + .04 * min(.05, elapsed))
+        self.speed = self._next_speed(speed, self.speed, elapsed)
         self.steer = steer
         return Command(self.speed, self.speed * steer, self.goal.action, 'tracking')
+
+    def _next_speed(self, target, previous, elapsed):
+        speed = previous + .04 * min(.05, elapsed)
+        if self.static_room and previous == 0. and elapsed > 0.:
+            # Lower startup setpoints rarely produce wheel motion on the LIMO.
+            speed = max(speed, ROOM_START_SPEED)
+        return min(target, speed)
 
     def _pivot(self, view, elapsed):
         self.steer = 0.

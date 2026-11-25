@@ -34,6 +34,14 @@ def select(navigation, key, at, observation):
     return request
 
 
+def test_room_starts_at_effective_crawl_only_after_a_current_clear_sweep():
+    navigation = Navigation(static_room=True)
+    select(navigation, 'forward', 1., view(1.))
+    assert navigation.step(view(1.05), 1.05).linear == pytest.approx(.014)
+    assert navigation.step(view(1.10, scan=.65), 1.10).linear == 0.
+    assert navigation.step(view(1.15, cells=grid({(.22, 0.): 100})), 1.15).linear == 0.
+
+
 def test_goal_keeps_running_across_model_failure_and_uses_odometry_to_complete():
     navigation = Navigation()
     observation = view(1.)
