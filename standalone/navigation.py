@@ -266,6 +266,7 @@ class Navigation(object):
         self.blocked_cell = self.blocked_action = None
         self.candidate_blocks = {}
         self._blocked_corner = None
+        self._failed_pivots = {}
         self._recovering_unknown = False
         self._path_clear_since = None
 
@@ -276,6 +277,18 @@ class Navigation(object):
         self._path_clear_since = None
         self.speed = self.steer = 0.
         return Command(0., 0., 'stop', reason)
+
+    def retire_stalled_pivot(self, pose):
+        goal = self.goal
+        self._failed_pivots[goal.action] = pose
+        if self.last_observation_turn == goal.origin:
+            self.last_observation_turn = None
+        self._blocked_corner = None
+        self.stop('yaw_no_progress')
+
+    def _pivot_failed_near(self, action, anchor):
+        previous = self._failed_pivots.get(action)
+        return previous is not None and math.hypot(anchor.x - previous.x, anchor.y - previous.y) <= ROOM_LENGTH
 
     def _pause(self, reason):
         self.speed = self.steer = 0.
@@ -383,7 +396,8 @@ class Navigation(object):
             'pivot_left', 'pivot_right')
         for action in directions:
             angle = math.copysign(ROOM_OBSERVATION_TURN, PIVOTS[action])
-            if rotation_block(view.grid, anchor, angle, view.pose) is None:
+            if (not self._pivot_failed_near(action, anchor)
+                    and rotation_block(view.grid, anchor, angle, view.pose) is None):
                 pivots.append((action, angle))
         return tuple(pivots), tuple(action for action, _ in pivots)
 
@@ -505,6 +519,8 @@ class Navigation(object):
         self._path_clear_since = None
 
     def _pivot_clear(self, view, anchor, action, turn=None):
+        if self._pivot_failed_near(action, anchor):
+            return False
         angle = PIVOTS[action] if turn is None else turn
         turned = anchor._replace(yaw=_wrap(anchor.yaw + angle))
         return (sweep_clear(view.grid, turned, self.length, 0., view.pose)
@@ -514,7 +530,8 @@ class Navigation(object):
     def pivot_request_clear(self, request, action, view):
         angle = dict(request.pivot_turns).get(action, PIVOTS[action])
         if action in request.observation_turns:
-            return rotation_block(view.grid, request.anchor, angle, view.pose) is None
+            return (not self._pivot_failed_near(action, request.anchor)
+                    and rotation_block(view.grid, request.anchor, angle, view.pose) is None)
         return self._pivot_clear(view, request.anchor, action, angle)
 
     def anchor_current(self, request, view, now):

@@ -5,7 +5,7 @@ import math
 import threading
 from collections import namedtuple
 
-from navigation import (ROOM_OBSTACLE_LOOKAHEAD, ROOM_TRACK_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
+from navigation import (PIVOTS, ROOM_OBSTACLE_LOOKAHEAD, ROOM_TRACK_LOOKAHEAD, Command, MAX_RESPONSE_AGE, Navigation,
                         _relative, observation_deadline, ready, room_continuations, segment_endpoint, sweep_block)
 
 
@@ -25,7 +25,7 @@ def offered_direction(request, direction):
 
 
 class NavigationRuntime(object):
-    def __init__(self, decide, publish, navigation=None, static_room=False):
+    def __init__(self, decide, publish, navigation=None, static_room=False, stationary_since=None):
         self.navigation = Navigation() if navigation is None else navigation
         self.decide, self.publish = decide, publish
         self._wake = threading.Event()
@@ -49,6 +49,8 @@ class NavigationRuntime(object):
         self.selected_target_id = None
         self.selected_target_stage = None
         self._settling = None
+        self._stationary_since = stationary_since
+        self._yaw_stall_at = None
         self._worker = threading.Thread(target=self._work, name='navigation-decisions')
         self._worker.daemon = True
         self._worker.start()
@@ -66,6 +68,19 @@ class NavigationRuntime(object):
                 choice = None
             self._result = (request, choice)
 
+    def recover_yaw_stall(self, pose, epoch, now):
+        """Retire a failed room pivot and require a fresh, stopped start."""
+        nav = self.navigation
+        if (self._stationary_since is None or nav.fault or pose is None or nav.epoch != epoch
+                or nav.goal is None or nav.goal.action not in PIVOTS):
+            return False
+        nav.retire_stalled_pivot(pose)
+        self.room_plan = self.review_origin = self._detour = self._settling = None
+        self._last_grid = self._blocked_replacement = None
+        self._next_request = now
+        self._yaw_stall_at = now
+        return True
+
     def cycle(self, view, now):
         """Called by one periodic controller. Returns decision and motion telemetry."""
         result = self._result
@@ -77,6 +92,18 @@ class NavigationRuntime(object):
         self.detour_continuation = False
         self.selected_target_id = None
         self.selected_target_stage = None
+        if self._yaw_stall_at is not None:
+            after = self._yaw_stall_at
+            if (view is not None and view.epoch != self.navigation.epoch):
+                command = self.navigation.step(view, now)
+                self.publish(command)
+                return command, None, None
+            if (not ready(view, now) or min(view.grid_at, view.scan_at, view.depth_at, view.odom_at) <= after
+                    or not self._stationary_since(after, now)):
+                command = Command(0., 0., 'stop', 'settling_after_yaw_stall')
+                self.publish(command)
+                return command, None, None
+            self._yaw_stall_at = None
         if result is not None:
             request, choice = result
             mapped = choice if isinstance(choice, MappedChoice) else None

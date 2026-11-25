@@ -199,6 +199,35 @@ def test_serial_monitor_can_accommodate_slow_fuser_without_relaxing_ros_monitor(
         mod.RosCallerMonitor(Backend(None), clock, driver_pid=11139, max_age=0.31)
 
 
+@pytest.mark.parametrize('sample_time,expected_wait', [(0.03, .02), (.08, .005)])
+def test_background_monitor_schedules_from_sample_start_without_busy_spinning(monkeypatch, sample_time,
+                                                                                 expected_wait):
+    mod, clock = module(), Clock()
+    mono = [10.]
+    waits = []
+    monkeypatch.setattr(mod, '_monotonic', lambda: mono[0])
+
+    class TimedBackend(Backend):
+        def sample(self):
+            mono[0] += sample_time
+            clock.t += sample_time
+            return self.data
+
+    monitor = mod._AsyncMonitor(TimedBackend(None), clock, .05, .25, .2)
+
+    class Wake(object):
+        def wait(self, delay):
+            waits.append(delay)
+            monitor._stop.set()
+
+        def clear(self):
+            pass
+
+    monitor._wake = Wake()
+    monitor._loop()
+    assert waits == pytest.approx([expected_wait])
+
+
 def test_proc_serial_holder_query_detects_a_second_process_on_a_private_pty():
     master, slave = pty.openpty()
     child = None

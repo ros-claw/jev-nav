@@ -124,8 +124,9 @@ class _AsyncMonitor(object):
             while not self._stop.is_set():
                 stage = "clock"
                 started = self.clock.now()
+                sample_started_mono = _monotonic()
                 with self._lock:
-                    self._sampling_started_mono = _monotonic()
+                    self._sampling_started_mono = sample_started_mono
                 stage = "sample"
                 value = self.backend.sample()
                 stage = "clock"
@@ -159,7 +160,8 @@ class _AsyncMonitor(object):
                                     self._read_reason = "ok"
                                     self._publish_command_deadline(now, mono_now)
                     self._updated.set()
-                self._wake.wait(self.poll_interval)
+                remaining = self.poll_interval - (_monotonic() - sample_started_mono)
+                self._wake.wait(max(.005, remaining))
                 self._wake.clear()
         except BaseException:
             with self._lock:

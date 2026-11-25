@@ -85,6 +85,44 @@ def test_roaming_local_route_uses_a_checked_exit_before_entering_a_dead_end():
         assert runtime.close()
 
 
+def test_roaming_stalled_pivot_waits_for_a_new_stationary_view_and_offers_a_different_move():
+    from navigation import Segment
+
+    nav = Navigation(static_room=True, short_room_segments=True)
+    observation = view(1.)
+    nav.epoch = observation.epoch
+    nav.goal = Segment(4, 'pivot_right', observation.pose, -.7)
+    settled = [False]
+    emitted = []
+    runtime = NavigationRuntime(lambda *_: 'forward', emitted.append, nav, static_room=True,
+                                stationary_since=lambda after, now: after == 1.05 and settled[0])
+    runtime.room_plan = (4, 'right')
+    try:
+        assert runtime.recover_yaw_stall(observation.pose, 0, 1.05)
+        assert nav.goal is None and runtime.room_plan is None
+        command, offer, _ = runtime.cycle(view(1.2), 1.2)
+        assert command.reason == 'settling_after_yaw_stall' and offer is None
+        settled[0] = True
+        command, offer, _ = runtime.cycle(view(1.21, scan=1.04), 1.21)
+        assert command.reason == 'settling_after_yaw_stall' and offer is None
+        command, offer, _ = runtime.cycle(view(1.22), 1.22)
+        assert command.linear == command.angular == 0.
+        assert offer is not None and 'forward' in offer.choices
+        assert not nav._pivot_clear(view(1.22), observation.pose, 'pivot_right')
+        assert nav._pivot_clear(view(1.22), observation.pose, 'pivot_left')
+        clear = view(1.24, Pose(.2, 0., 0.))
+        assert nav._pivot_clear(clear, clear.pose, 'pivot_right')
+        assert all(c.linear == c.angular == 0. for c in emitted)
+        until = time.time() + 1.
+        while runtime._result is None and time.time() < until:
+            time.sleep(.001)
+        command, _, accepted = runtime.cycle(view(1.25), 1.25)
+        assert accepted == (offer.sequence, 'forward', True)
+        assert command.action == 'forward' and command.linear > 0.
+    finally:
+        assert runtime.close()
+
+
 def test_goal_keeps_running_across_model_failure_and_uses_odometry_to_complete():
     navigation = Navigation()
     observation = view(1.)

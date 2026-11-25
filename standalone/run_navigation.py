@@ -527,6 +527,7 @@ def main(argv=None):
     authority_diagnostics = {}
     arc_traces = {}
     early_detours = 0
+    yaw_stall_recoveries = 0
     travelled = 0.
     reason = 'session_ended'
     started = ended = _monotonic()
@@ -657,7 +658,8 @@ def main(argv=None):
                                 successor_lead=.075 if room is not None else None, static_room=args.static_room,
                                 short_room_segments=args.roam)
         runtime = NavigationRuntime(choose, publish_command, navigation,
-                                    static_room=args.static_room)
+                                    static_room=args.static_room,
+                                    stationary_since=recorder.stationary_since if args.roam else None)
         started = last_process_check = last_block_report = _monotonic()
         while not rospy.is_shutdown():
             sample_started = now = _monotonic()
@@ -695,12 +697,16 @@ def main(argv=None):
                     goal = runtime.navigation.goal
                     segment = goal.sequence if goal is not None else None
                 failure = progress.update(now, evidence, wheel, epoch, source.independent_pose(now), segment)
+                recovering_yaw = False
                 if failure:
                     publish_command(Command(0., 0., 'stop', failure))
-                    reason = failure
+                    recovering_yaw = (args.roam and failure == 'no_progress'
+                                      and progress.diagnostics['axis'] == 'yaw'
+                                      and runtime.recover_yaw_stall(wheel, epoch, now))
                 if progress.diagnostics is not previous_progress:
                     measurement = progress.diagnostics
-                    timeline.record('run', now, {'stage': 'progress', 'status': 'latched' if failure else 'measured',
+                    status = 'replanning' if recovering_yaw else 'latched' if failure else 'measured'
+                    timeline.record('run', now, {'stage': 'progress', 'status': status,
                                                 'reason': failure, 'decision_id': segment,
                                                 'progress_axis': measurement['axis'],
                                                 'expected_progress': measurement['expected'],
@@ -710,7 +716,12 @@ def main(argv=None):
                     remember_event(now, 'progress_fault', runtime.navigation.sequence, wheel,
                                    'The relay was stopped after measured motion reported %s.' % failure,
                                    remember=True, measurements=progress.diagnostics)
-                    break
+                    if not recovering_yaw:
+                        reason = failure
+                        break
+                    yaw_stall_recoveries += 1
+                    progress = ProgressMonitor(require_independent=args.independent_odom_topic is not None,
+                                               track_segment=True)
             if args.drive and view is not None and last_pose is not None:
                 travelled += math.hypot(view.pose.x - last_pose.x, view.pose.y - last_pose.y)
                 if args.max_travel_m is not None and travelled >= args.max_travel_m:
@@ -937,7 +948,8 @@ def main(argv=None):
         if room is not None:
             result['room_loop'] = summarize_room_loop(trajectory, arc_traces)
     if roaming is not None:
-        result.update(relay_recoveries=roaming.recoveries, relay_callers=sorted(roaming.callers))
+        result.update(relay_recoveries=roaming.recoveries, relay_callers=sorted(roaming.callers),
+                      yaw_stall_recoveries=yaw_stall_recoveries)
     print(json.dumps(result, allow_nan=False))
     complete = ready_ticks and timeline_closed and model_joined and (progress is None or progress.fault is None)
     if args.roam:
